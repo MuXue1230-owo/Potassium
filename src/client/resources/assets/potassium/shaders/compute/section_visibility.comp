@@ -126,18 +126,19 @@ uint regionCounterIndex(uint regionIndex, uint counterOffset) {
 	return (regionIndex * COUNTERS_PER_REGION) + counterOffset;
 }
 
-void writeCommand(uint slot, uint count, uint firstIndex, uint baseVertex) {
+void writeCommand(uint slot, uint count, uint firstIndex, uint baseVertex, uint baseInstance) {
 	uint commandWordIndex = slot * COMMAND_WORD_STRIDE;
 	commandWords[commandWordIndex] = count;
 	commandWords[commandWordIndex + 1u] = 1u;
 	commandWords[commandWordIndex + 2u] = firstIndex;
 	commandWords[commandWordIndex + 3u] = baseVertex;
-	commandWords[commandWordIndex + 4u] = 0u;
+	commandWords[commandWordIndex + 4u] = baseInstance;
 }
 
 void emitLocalCommands(SectionCommandInput section, uint regionIndex, uint commandBase, uint visibleFaces) {
 	uint baseElement = section.drawInfo.x;
 	uint baseVertex = section.drawInfo.y;
+	uint sectionSceneId = section.regionInfo.y;
 
 	for (uint facing = 0u; facing < FACING_COUNT; facing++) {
 		uint vertexCount = getVertexCount(section, facing);
@@ -145,7 +146,7 @@ void emitLocalCommands(SectionCommandInput section, uint regionIndex, uint comma
 
 		if (((visibleFaces >> facing) & 1u) != 0u) {
 			uint slot = commandBase + atomicAdd(counterValues[regionCounterIndex(regionIndex, REGION_COMMAND_COUNT_OFFSET)], 1u);
-			writeCommand(slot, elementCount, baseElement, baseVertex);
+			writeCommand(slot, elementCount, baseElement, baseVertex, sectionSceneId);
 		}
 
 		baseVertex += vertexCount;
@@ -156,6 +157,7 @@ void emitLocalCommands(SectionCommandInput section, uint regionIndex, uint comma
 void emitSharedCommands(SectionCommandInput section, uint regionIndex, uint commandBase, uint visibleFaces) {
 	uint baseElement = section.drawInfo.x;
 	uint currentBaseVertex = section.drawInfo.y;
+	uint sectionSceneId = section.regionInfo.y;
 	uint visibleRunVertexCount = 0u;
 	bool previousVisible = false;
 
@@ -179,7 +181,7 @@ void emitSharedCommands(SectionCommandInput section, uint regionIndex, uint comm
 
 				uint elementCount = (visibleRunVertexCount >> 2u) * 6u;
 				uint slot = commandBase + atomicAdd(counterValues[regionCounterIndex(regionIndex, REGION_COMMAND_COUNT_OFFSET)], 1u);
-				writeCommand(slot, elementCount, baseElement, currentBaseVertex);
+				writeCommand(slot, elementCount, baseElement, currentBaseVertex, sectionSceneId);
 				currentBaseVertex += visibleRunVertexCount;
 				visibleRunVertexCount = 0u;
 			}

@@ -1,9 +1,11 @@
 package com.potassium.client.compat.sodium;
 
 import com.potassium.client.PotassiumClientMod;
+import com.potassium.client.compute.GpuSceneDataStore;
 import com.potassium.client.compute.SectionVisibilityCompute;
 import com.potassium.client.compute.SectionVisibilityCompute.ComputePassResult;
 import com.potassium.client.compute.SectionVisibilityCompute.RegionBatchInput;
+import com.potassium.client.compute.GpuResidentGeometryBookkeeping;
 import com.potassium.client.config.PotassiumConfig;
 import com.potassium.client.config.PotassiumFeatures;
 import com.potassium.client.gl.GLCapabilities;
@@ -11,7 +13,9 @@ import com.potassium.client.render.indirect.IndexedCommandScratchBuffer;
 import com.potassium.client.render.indirect.IndexedIndirectCommandBuffer;
 import com.potassium.client.render.indirect.IndirectBackend;
 import java.nio.ByteBuffer;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
@@ -44,6 +48,7 @@ import net.minecraft.client.resources.language.I18n;
 import org.lwjgl.opengl.ARBIndirectParameters;
 import org.lwjgl.opengl.GL11C;
 import org.lwjgl.opengl.GL15C;
+import org.lwjgl.opengl.GL30C;
 import org.lwjgl.opengl.GL43C;
 import org.lwjgl.opengl.GL46C;
 import org.lwjgl.system.MemoryUtil;
@@ -51,6 +56,7 @@ import org.lwjgl.system.Pointer;
 
 public final class SodiumBridge {
 	private static final int MAX_CONSECUTIVE_OVERRIDE_FAILURES = 8;
+	private static final int GRAPHICS_SCENE_DATA_BINDING = 4;
 	private static final boolean ENABLE_COMPUTE_DEBUG_COMPARISON = false;
 	private static final boolean ENABLE_DRAW_DEBUG_COMPARISON = false;
 	private static final int MAX_COMPUTE_DEBUG_BATCHES_PER_PASS = 8;
@@ -63,6 +69,9 @@ public final class SodiumBridge {
 	private static final int FACING_COUNT = ModelQuadFacing.COUNT;
 	private static final int ALL_FACES_MASK = ModelQuadFacing.ALL;
 	private static final boolean USE_GPU_INDIRECT_COUNT = true;
+	private static final int[] LOCAL_SECTION_CHUNK_X = new int[RenderRegion.REGION_WIDTH * RenderRegion.REGION_HEIGHT * RenderRegion.REGION_LENGTH];
+	private static final int[] LOCAL_SECTION_CHUNK_Y = new int[RenderRegion.REGION_WIDTH * RenderRegion.REGION_HEIGHT * RenderRegion.REGION_LENGTH];
+	private static final int[] LOCAL_SECTION_CHUNK_Z = new int[RenderRegion.REGION_WIDTH * RenderRegion.REGION_HEIGHT * RenderRegion.REGION_LENGTH];
 	private static final float REGION_HALF_WIDTH_BLOCKS = RenderRegion.REGION_WIDTH * 8.0f;
 	private static final float REGION_HALF_HEIGHT_BLOCKS = RenderRegion.REGION_HEIGHT * 8.0f;
 	private static final float REGION_HALF_LENGTH_BLOCKS = RenderRegion.REGION_LENGTH * 8.0f;
@@ -74,6 +83,8 @@ public final class SodiumBridge {
 	private static final int COMMAND_FILL_WORKER_COUNT = computeCommandFillWorkerCount();
 	private static final ExecutorService COMMAND_FILL_EXECUTOR = createCommandFillExecutor();
 	private static final ThreadLocal<RenderPassContext> PASS_CONTEXT_POOL = ThreadLocal.withInitial(RenderPassContext::new);
+	private static final ThreadLocal<IndexedCommandScratchBuffer> CPU_COMMAND_SCRATCH =
+		ThreadLocal.withInitial(() -> new IndexedCommandScratchBuffer(256));
 	private static final GeneratedCommandBatch REGION_FRUSTUM_CULLED_BATCH = GeneratedCommandBatch.skip(1, 1, 0, 0, 0);
 	private static final CompletableFuture<GeneratedCommandBatch> REGION_FRUSTUM_CULLED_FUTURE =
 		CompletableFuture.completedFuture(REGION_FRUSTUM_CULLED_BATCH);
@@ -90,6 +101,14 @@ public final class SodiumBridge {
 	private static int consecutiveOverrideFailureCount;
 
 	private SodiumBridge() {
+	}
+
+	static {
+		for (int localSectionIndex = 0; localSectionIndex < LOCAL_SECTION_CHUNK_X.length; localSectionIndex++) {
+			LOCAL_SECTION_CHUNK_X[localSectionIndex] = LocalSectionIndex.unpackX(localSectionIndex);
+			LOCAL_SECTION_CHUNK_Y[localSectionIndex] = LocalSectionIndex.unpackY(localSectionIndex);
+			LOCAL_SECTION_CHUNK_Z[localSectionIndex] = LocalSectionIndex.unpackZ(localSectionIndex);
+		}
 	}
 
 	public static ChunkRenderer wrapChunkRenderer(ChunkRenderer delegate) {
@@ -119,6 +138,7 @@ public final class SodiumBridge {
 		context.begin(pass, currentViewport);
 		IndexedIndirectCommandBuffer commandBuffer = IndirectBackend.indexedCommandBuffer();
 		commandBuffer.beginFrame();
+		GpuSceneDataStore.bindAsStorage(GRAPHICS_SCENE_DATA_BINDING);
 		context.commandBuffer = commandBuffer;
 		context.computeCullingEnabled = isComputeGeneratedBatchesEnabled() && SectionVisibilityCompute.isEnabled();
 		context.persistentMappingEnabled = commandBuffer.usesPersistentMapping();
@@ -230,8 +250,6 @@ public final class SodiumBridge {
 		if (
 			context == null ||
 			!drawOverrideEnabled ||
-			FORCE_TRANSLATED_BATCH_SUBMISSION ||
-			(renderPass != null && shouldForceTranslatedSubmission(renderPass, fragmentDiscard)) ||
 			(context.pass.isTranslucent() && !isTranslucentBatchOverrideEnabled()) ||
 			region == null ||
 			storage == null ||
@@ -250,6 +268,19 @@ public final class SodiumBridge {
 				rollbackBatch(context, context.pendingPreparedBatch);
 			}
 			context.pendingPreparedBatch = null;
+		}
+
+		if (FORCE_TRANSLATED_BATCH_SUBMISSION || shouldForceTranslatedSubmission(renderPass, fragmentDiscard)) {
+			prepareTranslatedSceneIds(
+				context,
+				region,
+				storage,
+				renderList,
+				cameraTransform,
+				renderPass,
+				fragmentDiscard
+			);
+			return;
 		}
 
 		GeneratedCommandBatch generatedBatch;
@@ -368,7 +399,8 @@ public final class SodiumBridge {
 
 			if (preparedBatch == null) {
 				int firstCommandIndex = context.commandBuffer.commandCount();
-				int commandCount = appendTranslatedIndexedBatch(context.commandBuffer, batch);
+				PreparedTranslatedSceneIds translatedSceneIds = consumePreparedTranslatedSceneIds(context);
+				int commandCount = appendTranslatedIndexedBatch(context.commandBuffer, batch, translatedSceneIds);
 				if (commandCount <= 0) {
 					recordFallback(context, batch, "empty translated batch");
 					return false;
@@ -432,6 +464,7 @@ public final class SodiumBridge {
 
 		context.commandBuffer.upload();
 		context.commandBuffer.endFrame();
+		GL30C.glBindBufferBase(GL43C.GL_SHADER_STORAGE_BUFFER, GRAPHICS_SCENE_DATA_BINDING, 0);
 		DEBUG_STATS.recordPass(context);
 
 		if (context.commandBuffer.commandCount() > 0 || context.culledBatchCount > 0) {
@@ -518,7 +551,6 @@ public final class SodiumBridge {
 			} else {
 				context.asyncWaitedBatchCount++;
 			}
-
 			return future.join();
 		} catch (CompletionException exception) {
 			context.asyncFailedBatchCount++;
@@ -734,7 +766,16 @@ public final class SodiumBridge {
 			return GeneratedCommandBatch.skip(0, 0, 0, 0, 0);
 		}
 
-		IndexedCommandScratchBuffer commandBuffer = new IndexedCommandScratchBuffer(estimateCommandCapacity(renderList));
+		int estimatedCommandCapacity = estimateCommandCapacity(renderList);
+		IndexedCommandScratchBuffer commandBuffer = CPU_COMMAND_SCRATCH.get();
+		commandBuffer.reset(estimatedCommandCapacity);
+		SectionVisibilityCompute.SectionSceneIds sceneIds = SectionVisibilityCompute.resolveSceneIds(
+			region,
+			storage,
+			renderList,
+			preferLocalIndices,
+			renderPass.isTranslucent()
+		);
 		int regionChunkX = region.getChunkX();
 		int regionChunkY = region.getChunkY();
 		int regionChunkZ = region.getChunkZ();
@@ -744,9 +785,9 @@ public final class SodiumBridge {
 		while (iterator.hasNext()) {
 			int localSectionIndex = iterator.nextByteAsInt();
 			long dataPointer = storage.getDataPointer(localSectionIndex);
-			int sectionChunkX = regionChunkX + LocalSectionIndex.unpackX(localSectionIndex);
-			int sectionChunkY = regionChunkY + LocalSectionIndex.unpackY(localSectionIndex);
-			int sectionChunkZ = regionChunkZ + LocalSectionIndex.unpackZ(localSectionIndex);
+			int sectionChunkX = regionChunkX + LOCAL_SECTION_CHUNK_X[localSectionIndex];
+			int sectionChunkY = regionChunkY + LOCAL_SECTION_CHUNK_Y[localSectionIndex];
+			int sectionChunkZ = regionChunkZ + LOCAL_SECTION_CHUNK_Z[localSectionIndex];
 			if (viewport != null) {
 				frustumTestedSectionCount++;
 				if (!isSectionVisible(viewport, sectionChunkX, sectionChunkY, sectionChunkZ)) {
@@ -772,10 +813,11 @@ public final class SodiumBridge {
 				continue;
 			}
 
+			int sectionSceneId = sceneIds.sectionSceneId(localSectionIndex);
 			if (preferLocalIndices && SectionRenderDataUnsafe.isLocalIndex(dataPointer)) {
-				appendLocalIndexedCommands(commandBuffer, dataPointer, visibleFaces);
+				appendLocalIndexedCommands(commandBuffer, dataPointer, visibleFaces, sectionSceneId);
 			} else {
-				appendSharedIndexedCommands(commandBuffer, dataPointer, visibleFaces);
+				appendSharedIndexedCommands(commandBuffer, dataPointer, visibleFaces, sectionSceneId);
 			}
 		}
 
@@ -927,9 +969,9 @@ public final class SodiumBridge {
 			sectionCount++;
 			int localSectionIndex = iterator.nextByteAsInt();
 			long dataPointer = storage.getDataPointer(localSectionIndex);
-			int sectionChunkX = regionChunkX + LocalSectionIndex.unpackX(localSectionIndex);
-			int sectionChunkY = regionChunkY + LocalSectionIndex.unpackY(localSectionIndex);
-			int sectionChunkZ = regionChunkZ + LocalSectionIndex.unpackZ(localSectionIndex);
+			int sectionChunkX = regionChunkX + LOCAL_SECTION_CHUNK_X[localSectionIndex];
+			int sectionChunkY = regionChunkY + LOCAL_SECTION_CHUNK_Y[localSectionIndex];
+			int sectionChunkZ = regionChunkZ + LOCAL_SECTION_CHUNK_Z[localSectionIndex];
 			int visibleFaces = useBlockFaceCulling
 				? DefaultChunkRenderer.getVisibleFaces(
 					cameraTransform.intX,
@@ -1097,7 +1139,7 @@ public final class SodiumBridge {
 
 		ByteBuffer indirectCommands = commandBuffer.readCommands(preparedBatch.firstCommandIndex(), preparedBatch.commandCount());
 		try {
-			List<String> indirectCommandKeys = collectSortedCommandKeys(indirectCommands, preparedBatch.commandCount());
+			List<String> indirectCommandKeys = collectSortedCommandKeys(indirectCommands, preparedBatch.commandCount(), false);
 			List<String> sodiumCommandKeys = collectSortedSodiumCommandKeys(sodiumBatch);
 			for (int commandIndex = 0; commandIndex < indirectCommandKeys.size(); commandIndex++) {
 				String indirectCommandKey = indirectCommandKeys.get(commandIndex);
@@ -1148,6 +1190,10 @@ public final class SodiumBridge {
 	}
 
 	private static List<String> collectSortedCommandKeys(ByteBuffer commands, int commandCount) {
+		return collectSortedCommandKeys(commands, commandCount, true);
+	}
+
+	private static List<String> collectSortedCommandKeys(ByteBuffer commands, int commandCount, boolean includeBaseInstance) {
 		List<String> commandKeys = new ArrayList<>(commandCount);
 		for (int commandIndex = 0; commandIndex < commandCount; commandIndex++) {
 			int commandOffset = commandIndex * IndexedIndirectCommandBuffer.COMMAND_STRIDE_BYTES;
@@ -1156,7 +1202,7 @@ public final class SodiumBridge {
 				":" + commands.getInt(commandOffset + Integer.BYTES) +
 				":" + commands.getInt(commandOffset + (Integer.BYTES * 2)) +
 				":" + commands.getInt(commandOffset + (Integer.BYTES * 3)) +
-				":" + commands.getInt(commandOffset + (Integer.BYTES * 4))
+				":" + (includeBaseInstance ? commands.getInt(commandOffset + (Integer.BYTES * 4)) : 0)
 			);
 		}
 		commandKeys.sort(String::compareTo);
@@ -1181,7 +1227,11 @@ public final class SodiumBridge {
 		return commandKeys;
 	}
 
-	private static int appendTranslatedIndexedBatch(IndexedIndirectCommandBuffer commandBuffer, MultiDrawBatch batch) {
+	private static int appendTranslatedIndexedBatch(
+		IndexedIndirectCommandBuffer commandBuffer,
+		MultiDrawBatch batch,
+		PreparedTranslatedSceneIds translatedSceneIds
+	) {
 		int initialCommandCount = commandBuffer.commandCount();
 
 		for (int i = 0; i < batch.size; i++) {
@@ -1195,8 +1245,9 @@ public final class SodiumBridge {
 			int firstIndex = Math.toIntExact(elementPointer / Integer.BYTES);
 			int elementCount = MemoryUtil.memGetInt(batch.pElementCount + ((long) i * Integer.BYTES));
 			int baseVertex = MemoryUtil.memGetInt(batch.pBaseVertex + ((long) i * Integer.BYTES));
+			int baseInstance = i < translatedSceneIds.commandCount() ? translatedSceneIds.sceneIds()[i] : 0;
 
-			commandBuffer.addDrawElementsCommand(elementCount, 1, firstIndex, baseVertex, 0);
+			commandBuffer.addDrawElementsCommand(elementCount, 1, firstIndex, baseVertex, baseInstance);
 		}
 
 		return commandBuffer.commandCount() - initialCommandCount;
@@ -1208,6 +1259,7 @@ public final class SodiumBridge {
 		MultiDrawBatch batch,
 		RenderPassContext context
 	) {
+		PreparedTranslatedSceneIds translatedSceneIds = consumePreparedTranslatedSceneIds(context);
 		if (commandList == null || tessellation == null) {
 			recordFallback(context, batch, "missing draw state");
 			return false;
@@ -1215,7 +1267,7 @@ public final class SodiumBridge {
 
 		int firstCommandIndex = context.commandBuffer.commandCount();
 		try {
-			int commandCount = appendTranslatedIndexedBatch(context.commandBuffer, batch);
+			int commandCount = appendTranslatedIndexedBatch(context.commandBuffer, batch, translatedSceneIds);
 			if (commandCount <= 0) {
 				recordFallback(context, batch, "empty translated batch");
 				return false;
@@ -1259,6 +1311,11 @@ public final class SodiumBridge {
 		PreparedBatch preparedBatch = context.pendingPreparedBatch;
 		context.pendingPreparedBatch = null;
 		return preparedBatch;
+	}
+
+	private static PreparedTranslatedSceneIds consumePreparedTranslatedSceneIds(RenderPassContext context) {
+		PreparedTranslatedSceneIds preparedSceneIds = context.preparedTranslatedSceneIds.pollFirst();
+		return preparedSceneIds != null ? preparedSceneIds : PreparedTranslatedSceneIds.EMPTY;
 	}
 
 	private static void recordMirroredBatch(RenderPassContext context, PreparedBatch preparedBatch) {
@@ -1314,7 +1371,12 @@ public final class SodiumBridge {
 		}
 	}
 
-	private static void appendLocalIndexedCommands(IndexedCommandScratchBuffer commandBuffer, long dataPointer, int visibleFaces) {
+	private static void appendLocalIndexedCommands(
+		IndexedCommandScratchBuffer commandBuffer,
+		long dataPointer,
+		int visibleFaces,
+		int sectionSceneId
+	) {
 		long baseElement = SectionRenderDataUnsafe.getBaseElement(dataPointer);
 		long baseVertex = SectionRenderDataUnsafe.getBaseVertex(dataPointer);
 
@@ -1327,7 +1389,7 @@ public final class SodiumBridge {
 					1,
 					Math.toIntExact(baseElement),
 					Math.toIntExact(baseVertex),
-					0
+					sectionSceneId
 				);
 			}
 
@@ -1336,7 +1398,12 @@ public final class SodiumBridge {
 		}
 	}
 
-	private static void appendSharedIndexedCommands(IndexedCommandScratchBuffer commandBuffer, long dataPointer, int visibleFaces) {
+	private static void appendSharedIndexedCommands(
+		IndexedCommandScratchBuffer commandBuffer,
+		long dataPointer,
+		int visibleFaces,
+		int sectionSceneId
+	) {
 		long baseElement = SectionRenderDataUnsafe.getBaseElement(dataPointer);
 		long facingList = SectionRenderDataUnsafe.getFacingList(dataPointer);
 		long visibleRunVertexCount = 0L;
@@ -1367,7 +1434,7 @@ public final class SodiumBridge {
 						1,
 						Math.toIntExact(baseElement),
 						Math.toIntExact(currentBaseVertex),
-						0
+						sectionSceneId
 					);
 					currentBaseVertex += visibleRunVertexCount;
 					visibleRunVertexCount = 0L;
@@ -1425,6 +1492,118 @@ public final class SodiumBridge {
 
 	private static boolean isSectionVisible(Viewport viewport, int sectionChunkX, int sectionChunkY, int sectionChunkZ) {
 		return viewport.isBoxVisible(sectionChunkX, sectionChunkY, sectionChunkZ);
+	}
+
+	private static void prepareTranslatedSceneIds(
+		RenderPassContext context,
+		RenderRegion region,
+		SectionRenderDataStorage storage,
+		ChunkRenderList renderList,
+		CameraTransform cameraTransform,
+		TerrainRenderPass renderPass,
+		boolean fragmentDiscard
+	) {
+		boolean useBlockFaceCulling = SodiumClientMod.options().performance.useBlockFaceCulling;
+		boolean preferLocalIndices = renderPass.isTranslucent() && fragmentDiscard;
+		SectionVisibilityCompute.SectionSceneIds sceneIds = SectionVisibilityCompute.resolveSceneIds(
+			region,
+			storage,
+			renderList,
+			preferLocalIndices,
+			renderPass.isTranslucent()
+		);
+		ByteIterator iterator = renderList.sectionsWithGeometryIterator(renderPass.isTranslucent());
+		if (iterator == null) {
+			context.preparedTranslatedSceneIds.addLast(PreparedTranslatedSceneIds.EMPTY);
+			return;
+		}
+
+		int[] commandSceneIds = new int[Math.max(estimateCommandCapacity(renderList), 1)];
+		int commandCount = 0;
+		int regionChunkX = region.getChunkX();
+		int regionChunkY = region.getChunkY();
+		int regionChunkZ = region.getChunkZ();
+
+		while (iterator.hasNext()) {
+			int localSectionIndex = iterator.nextByteAsInt();
+			long dataPointer = storage.getDataPointer(localSectionIndex);
+			int sectionChunkX = regionChunkX + LOCAL_SECTION_CHUNK_X[localSectionIndex];
+			int sectionChunkY = regionChunkY + LOCAL_SECTION_CHUNK_Y[localSectionIndex];
+			int sectionChunkZ = regionChunkZ + LOCAL_SECTION_CHUNK_Z[localSectionIndex];
+			int visibleFaces = useBlockFaceCulling
+				? DefaultChunkRenderer.getVisibleFaces(
+					cameraTransform.intX,
+					cameraTransform.intY,
+					cameraTransform.intZ,
+					sectionChunkX,
+					sectionChunkY,
+					sectionChunkZ
+				)
+				: ALL_FACES_MASK;
+			visibleFaces &= SectionRenderDataUnsafe.getSliceMask(dataPointer);
+			if (visibleFaces == 0) {
+				continue;
+			}
+
+			int sectionSceneId = sceneIds.sectionSceneId(localSectionIndex);
+			if (preferLocalIndices && SectionRenderDataUnsafe.isLocalIndex(dataPointer)) {
+				commandCount = appendLocalSceneIds(commandSceneIds, commandCount, visibleFaces, sectionSceneId);
+			} else {
+				commandCount = appendSharedSceneIds(commandSceneIds, commandCount, dataPointer, visibleFaces, sectionSceneId);
+			}
+		}
+
+		context.preparedTranslatedSceneIds.addLast(
+			commandCount == 0
+				? PreparedTranslatedSceneIds.EMPTY
+				: new PreparedTranslatedSceneIds(Arrays.copyOf(commandSceneIds, commandCount), commandCount)
+		);
+	}
+
+	private static int appendLocalSceneIds(int[] commandSceneIds, int commandCount, int visibleFaces, int sectionSceneId) {
+		for (int facing = 0; facing < FACING_COUNT; facing++) {
+			if (((visibleFaces >>> facing) & 1) != 0) {
+				commandSceneIds[commandCount++] = sectionSceneId;
+			}
+		}
+
+		return commandCount;
+	}
+
+	private static int appendSharedSceneIds(
+		int[] commandSceneIds,
+		int commandCount,
+		long dataPointer,
+		int visibleFaces,
+		int sectionSceneId
+	) {
+		long facingList = SectionRenderDataUnsafe.getFacingList(dataPointer);
+		boolean previousVisible = false;
+
+		for (int facing = 0; facing <= FACING_COUNT; facing++) {
+			boolean currentVisible = false;
+			long vertexCount = 0L;
+
+			if (facing < FACING_COUNT) {
+				vertexCount = SectionRenderDataUnsafe.getVertexCount(dataPointer, facing);
+				if (vertexCount != 0L) {
+					long faceOrder = (facingList >>> (facing * 8)) & 0xFFL;
+					currentVisible = ((visibleFaces >>> (int) faceOrder) & 1) != 0;
+				}
+			}
+
+			if (!currentVisible && previousVisible) {
+				if (facing < FACING_COUNT && vertexCount == 0L) {
+					continue;
+				}
+
+				commandSceneIds[commandCount++] = sectionSceneId;
+			}
+
+			previousVisible = currentVisible;
+		}
+
+		return commandCount;
 	}
 
 	private static int estimateCommandCapacity(ChunkRenderList renderList) {
@@ -1501,6 +1680,7 @@ public final class SodiumBridge {
 		private final List<RegionBatchInput> regionInputs = new ArrayList<>();
 		private final Map<RenderRegion, GeneratedCommandBatch> preparedGeneratedBatches = new IdentityHashMap<>();
 		private final Map<RenderRegion, CompletableFuture<GeneratedCommandBatch>> scheduledGeneratedBatches = new IdentityHashMap<>();
+		private final ArrayDeque<PreparedTranslatedSceneIds> preparedTranslatedSceneIds = new ArrayDeque<>();
 		private IndexedIndirectCommandBuffer commandBuffer;
 		private PreparedBatch pendingPreparedBatch;
 		private boolean preparedBatchesScheduled;
@@ -1603,6 +1783,7 @@ public final class SodiumBridge {
 			this.lastFallbackReason = "none";
 			this.preparedGeneratedBatches.clear();
 			this.scheduledGeneratedBatches.clear();
+			this.preparedTranslatedSceneIds.clear();
 		}
 
 		private void finish() {
@@ -1610,6 +1791,7 @@ public final class SodiumBridge {
 			this.commandBuffer = null;
 			this.preparedGeneratedBatches.clear();
 			this.scheduledGeneratedBatches.clear();
+			this.preparedTranslatedSceneIds.clear();
 			this.viewport = null;
 			this.pass = null;
 		}
@@ -1634,6 +1816,13 @@ public final class SodiumBridge {
 		private int lastTranslatedCommandCount;
 		private int lastBufferCapacity;
 		private int lastBufferBytes;
+		private int lastResidentRegionCount;
+		private int lastResidentSectionCount;
+		private int lastResidentLocalIndexSectionCount;
+		private int lastResidentSharedIndexSectionCount;
+		private int lastResidentMetadataBytes;
+		private int lastMaxResidentSceneId;
+		private int lastMaxResidentSectionId;
 		private int lastExecutedBatchCount;
 		private int lastExecutedCommandCount;
 		private int lastCulledBatchCount;
@@ -1696,6 +1885,14 @@ public final class SodiumBridge {
 			this.lastTranslatedCommandCount = context.translatedCommandCount;
 			this.lastBufferCapacity = context.commandBuffer.capacityCommands();
 			this.lastBufferBytes = context.commandBuffer.usedBytes();
+			GpuResidentGeometryBookkeeping.Snapshot residentSnapshot = GpuResidentGeometryBookkeeping.snapshot();
+			this.lastResidentRegionCount = residentSnapshot.residentRegionCount();
+			this.lastResidentSectionCount = residentSnapshot.residentSectionCount();
+			this.lastResidentLocalIndexSectionCount = residentSnapshot.residentLocalIndexSectionCount();
+			this.lastResidentSharedIndexSectionCount = residentSnapshot.residentSharedIndexSectionCount();
+			this.lastResidentMetadataBytes = residentSnapshot.residentMetadataBytes();
+			this.lastMaxResidentSceneId = residentSnapshot.maxSceneId();
+			this.lastMaxResidentSectionId = residentSnapshot.maxSectionId();
 			this.lastExecutedBatchCount = context.executedBatchCount;
 			this.lastExecutedCommandCount = context.executedCommandCount;
 			this.lastCulledBatchCount = context.culledBatchCount;
@@ -1824,6 +2021,10 @@ public final class SodiumBridge {
 				lines.add(tr("potassium.debug.buffer.persistent_mapping", this.lastPersistentMappingEnabled));
 				lines.add(tr("potassium.debug.buffer.indexed_indirect_buffer", this.lastCommandCount, this.lastBufferCapacity));
 				lines.add(tr("potassium.debug.buffer.indexed_command_bytes", this.lastBufferBytes));
+				lines.add(tr("potassium.debug.buffer.resident_regions", this.lastResidentRegionCount, this.lastResidentSectionCount));
+				lines.add(tr("potassium.debug.buffer.resident_index_modes", this.lastResidentLocalIndexSectionCount, this.lastResidentSharedIndexSectionCount));
+				lines.add(tr("potassium.debug.buffer.resident_metadata_bytes", this.lastResidentMetadataBytes));
+				lines.add(tr("potassium.debug.buffer.resident_scene_ids", this.lastMaxResidentSceneId, this.lastMaxResidentSectionId));
 			}
 			if (showFallbackStats) {
 				lines.add(tr("potassium.debug.fallback.override_disable_reason", overrideDisableReason));
@@ -1851,6 +2052,13 @@ public final class SodiumBridge {
 			this.lastTranslatedCommandCount = 0;
 			this.lastBufferCapacity = 0;
 			this.lastBufferBytes = 0;
+			this.lastResidentRegionCount = 0;
+			this.lastResidentSectionCount = 0;
+			this.lastResidentLocalIndexSectionCount = 0;
+			this.lastResidentSharedIndexSectionCount = 0;
+			this.lastResidentMetadataBytes = 0;
+			this.lastMaxResidentSceneId = 0;
+			this.lastMaxResidentSectionId = 0;
 			this.lastExecutedBatchCount = 0;
 			this.lastExecutedCommandCount = 0;
 			this.lastCulledBatchCount = 0;
@@ -1935,6 +2143,10 @@ public final class SodiumBridge {
 		private static PreparedBatch skip(CommandSource source) {
 			return new PreparedBatch(0, 0, 0L, source, true, false, false);
 		}
+	}
+
+	private record PreparedTranslatedSceneIds(int[] sceneIds, int commandCount) {
+		private static final PreparedTranslatedSceneIds EMPTY = new PreparedTranslatedSceneIds(new int[0], 0);
 	}
 
 	private record GeneratedCommandBatch(

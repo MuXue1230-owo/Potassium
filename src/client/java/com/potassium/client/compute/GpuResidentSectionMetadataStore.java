@@ -539,6 +539,10 @@ final class GpuResidentSectionMetadataStore {
 			destination.putFloat(this.templateView.getFloat(metadataOffsetBytes + (CENTER_Y_OFFSET * Float.BYTES)));
 			destination.putFloat(this.templateView.getFloat(metadataOffsetBytes + (CENTER_Z_OFFSET * Float.BYTES)));
 			destination.putFloat(this.templateView.getFloat(metadataOffsetBytes + (BOUNDING_RADIUS_OFFSET * Float.BYTES)));
+			destination.putFloat(1.0f);
+			destination.putFloat(0.0f);
+			destination.putFloat(0.0f);
+			destination.putFloat(0.0f);
 		}
 
 		boolean isDirty() {

@@ -8,6 +8,7 @@ struct PotassiumSceneSection {
     int sectionChunkY;
     int sectionChunkZ;
     vec4 centerAndRadius;
+    vec4 dynamicData;
 };
 
 layout(std430, binding = 4) readonly buffer PotassiumSceneData {

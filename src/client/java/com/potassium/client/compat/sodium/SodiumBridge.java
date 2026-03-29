@@ -262,6 +262,16 @@ public final class SodiumBridge {
 
 		boolean useBlockFaceCulling = SodiumClientMod.options().performance.useBlockFaceCulling;
 		boolean preferLocalIndices = renderPass.isTranslucent() && fragmentDiscard;
+		SectionVisibilityCompute.SectionSceneIds sceneIds = SectionVisibilityCompute.resolveSceneIds(
+			region,
+			storage,
+			renderList,
+			preferLocalIndices,
+			renderPass.isTranslucent()
+		);
+		if (GLCapabilities.hasShaderDrawParameters()) {
+			GpuSceneDataStore.updateSectionVisibility(sceneIds, region, renderList, renderPass.isTranslucent());
+		}
 
 		if (context.pendingPreparedBatch != null) {
 			if (!context.pendingPreparedBatch.skipDraw()) {
@@ -273,6 +283,7 @@ public final class SodiumBridge {
 		if (FORCE_TRANSLATED_BATCH_SUBMISSION || shouldForceTranslatedSubmission(renderPass, fragmentDiscard)) {
 			prepareTranslatedSceneIds(
 				context,
+				sceneIds,
 				region,
 				storage,
 				renderList,
@@ -1496,6 +1507,7 @@ public final class SodiumBridge {
 
 	private static void prepareTranslatedSceneIds(
 		RenderPassContext context,
+		SectionVisibilityCompute.SectionSceneIds sceneIds,
 		RenderRegion region,
 		SectionRenderDataStorage storage,
 		ChunkRenderList renderList,
@@ -1505,13 +1517,6 @@ public final class SodiumBridge {
 	) {
 		boolean useBlockFaceCulling = SodiumClientMod.options().performance.useBlockFaceCulling;
 		boolean preferLocalIndices = renderPass.isTranslucent() && fragmentDiscard;
-		SectionVisibilityCompute.SectionSceneIds sceneIds = SectionVisibilityCompute.resolveSceneIds(
-			region,
-			storage,
-			renderList,
-			preferLocalIndices,
-			renderPass.isTranslucent()
-		);
 		ByteIterator iterator = renderList.sectionsWithGeometryIterator(renderPass.isTranslucent());
 		if (iterator == null) {
 			context.preparedTranslatedSceneIds.addLast(PreparedTranslatedSceneIds.EMPTY);

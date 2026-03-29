@@ -23,10 +23,6 @@ uniform sampler2D u_LightTex;
 uniform int u_CurrentTime;
 uniform float u_FadePeriodInv;
 
-layout(std140) uniform ChunkData {
-    ivec4 u_chunkFades[64];
-};
-
 uvec3 _get_relative_chunk_coord(uint pos) {
     return uvec3(pos) >> uvec3(5u, 0u, 2u) & uvec3(7u, 3u, 7u);
 }
@@ -52,10 +48,11 @@ void main() {
 #ifdef USE_FOG
     v_FragDistance = getFragDistance(position);
 
-    int chunkId = sceneSection.localSectionIndex;
-    int chunkFade = u_chunkFades[chunkId >> 2][chunkId & 3];
-    float fade = clamp(float(u_CurrentTime - chunkFade) * u_FadePeriodInv, 0.0, 1.0);
-    fadeFactor = (chunkFade < 0) ? 1.0 : fade;
+    if (useSceneData) {
+        fadeFactor = sceneSection.dynamicData.x;
+    } else {
+        fadeFactor = 1.0;
+    }
 #endif
 
     gl_Position = u_ProjectionMatrix * u_ModelViewMatrix * vec4(position, 1.0);

@@ -8,6 +8,7 @@
 		"sodium.ChunkRenderListAccessor",
 		"sodium.DefaultChunkRendererBatchMixin",
 		"sodium.DefaultChunkRendererRenderMixin",
+		"sodium.DefaultShaderInterfaceMixin",
 		"sodium.SectionRenderDataStorageMixin",
 		"sodium.ShaderLoaderMixin",
 		"sodium.SodiumDebugEntryMixin",

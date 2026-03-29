@@ -5,8 +5,10 @@
 	"client": [
 		"GlBackendWindowHintsMixin",
 		"WindowContextFallbackMixin",
+		"sodium.ChunkRenderListAccessor",
 		"sodium.DefaultChunkRendererBatchMixin",
 		"sodium.DefaultChunkRendererRenderMixin",
+		"sodium.SectionRenderDataStorageMixin",
 		"sodium.SodiumDebugEntryMixin",
 		"sodium.RenderSectionManagerMixin"
 	],

@@ -1,6 +1,8 @@
 package com.potassium.client.compute;
 
 import com.potassium.client.PotassiumClientMod;
+import com.potassium.client.compat.sodium.ChunkRenderListOrdering;
+import com.potassium.client.compat.sodium.SectionRenderDataStorageVersioned;
 import com.potassium.client.gl.GLCapabilities;
 import com.potassium.client.render.indirect.IndexedIndirectCommandBuffer;
 import java.io.IOException;
@@ -9,6 +11,8 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Map;
+import java.util.WeakHashMap;
 import net.caffeinemc.mods.sodium.client.render.chunk.ChunkRenderMatrices;
 import net.caffeinemc.mods.sodium.client.render.chunk.LocalSectionIndex;
 import net.caffeinemc.mods.sodium.client.render.chunk.data.SectionRenderDataStorage;
@@ -16,7 +20,6 @@ import net.caffeinemc.mods.sodium.client.render.chunk.data.SectionRenderDataUnsa
 import net.caffeinemc.mods.sodium.client.render.chunk.lists.ChunkRenderList;
 import net.caffeinemc.mods.sodium.client.render.chunk.region.RenderRegion;
 import net.caffeinemc.mods.sodium.client.render.viewport.CameraTransform;
-import net.caffeinemc.mods.sodium.client.util.iterator.ByteIterator;
 import org.joml.FrustumIntersection;
 import org.joml.Matrix4f;
 import org.joml.Vector4f;
@@ -39,8 +42,12 @@ public final class SectionVisibilityCompute {
 	private static final int COUNTERS_PER_REGION = 2;
 	private static final int REGION_COMMAND_COUNT_OFFSET = 0;
 	private static final int REGION_VISIBLE_SECTION_COUNT_OFFSET = 1;
+	private static final int REGION_INFO_OFFSET_BYTES = Integer.BYTES * 20;
+	private static final int REGION_INDEX_OFFSET_BYTES = REGION_INFO_OFFSET_BYTES;
+	private static final int REGION_COMMAND_BASE_OFFSET_BYTES = REGION_INFO_OFFSET_BYTES + Integer.BYTES;
 	private static final int FLAG_USE_LOCAL_INDEX = 1;
 	private static final float SECTION_BOUNDING_RADIUS = 14.0f;
+	private static final Map<SectionRenderDataStorage, CachedRegionMetadata> REGION_METADATA_CACHE = new WeakHashMap<>();
 
 	private static boolean enabled;
 	private static String disableReason = "not initialized";
@@ -49,6 +56,7 @@ public final class SectionVisibilityCompute {
 	private static int counterBufferHandle;
 	private static int frustumPlanesLocation = -1;
 	private static int sectionCountLocation = -1;
+	private static int cameraPositionLocation = -1;
 	private static int cameraBlockPositionLocation = -1;
 	private static int useBlockFaceCullingLocation = -1;
 	private static int capacitySections;
@@ -75,6 +83,7 @@ public final class SectionVisibilityCompute {
 			counterBufferHandle = GL45C.glCreateBuffers();
 			frustumPlanesLocation = GL20C.glGetUniformLocation(programHandle, "uFrustumPlanes");
 			sectionCountLocation = GL20C.glGetUniformLocation(programHandle, "uSectionCount");
+			cameraPositionLocation = GL20C.glGetUniformLocation(programHandle, "uCameraPosition");
 			cameraBlockPositionLocation = GL20C.glGetUniformLocation(programHandle, "uCameraBlockPosition");
 			useBlockFaceCullingLocation = GL20C.glGetUniformLocation(programHandle, "uUseBlockFaceCulling");
 			enabled = true;
@@ -147,8 +156,6 @@ public final class SectionVisibilityCompute {
 		int[] testedSectionCounts = new int[regionInputs.size()];
 		int packedSectionCount = packPassMetadata(
 			regionInputs,
-			translucentPass,
-			cameraTransform,
 			preferLocalIndices,
 			testedSectionCounts
 		);
@@ -167,6 +174,12 @@ public final class SectionVisibilityCompute {
 			GL20C.glUseProgram(programHandle);
 			GL20C.glUniform4fv(frustumPlanesLocation, frustumPlanes);
 			GL30C.glUniform1ui(sectionCountLocation, packedSectionCount);
+			GL20C.glUniform3f(
+				cameraPositionLocation,
+				cameraTransform.intX + cameraTransform.fracX,
+				cameraTransform.intY + cameraTransform.fracY,
+				cameraTransform.intZ + cameraTransform.fracZ
+			);
 			GL20C.glUniform3i(
 				cameraBlockPositionLocation,
 				cameraTransform.intX,
@@ -213,8 +226,6 @@ public final class SectionVisibilityCompute {
 
 	private static int packPassMetadata(
 		List<RegionBatchInput> regionInputs,
-		boolean translucentPass,
-		CameraTransform cameraTransform,
 		boolean preferLocalIndices,
 		int[] testedSectionCounts
 	) {
@@ -224,60 +235,80 @@ public final class SectionVisibilityCompute {
 
 		for (int regionOrdinal = 0; regionOrdinal < regionInputs.size(); regionOrdinal++) {
 			RegionBatchInput regionInput = regionInputs.get(regionOrdinal);
-			int regionSectionCount = packRegionMetadata(
-				metadataView,
-				regionInput,
-				regionOrdinal,
-				translucentPass,
-				cameraTransform,
-				preferLocalIndices
-			);
-			testedSectionCounts[regionOrdinal] = regionSectionCount;
-			packedSectionCount += regionSectionCount;
+			CachedRegionMetadata cachedMetadata = getOrBuildCachedMetadata(regionInput, preferLocalIndices);
+			int sectionCount = cachedMetadata.sectionCount();
+			testedSectionCounts[regionOrdinal] = sectionCount;
+			if (sectionCount == 0) {
+				continue;
+			}
+
+			int regionMetadataOffset = metadataView.position();
+			metadataView.put(cachedMetadata.templateBytes());
+			patchRegionInfo(metadataView, regionMetadataOffset, sectionCount, regionOrdinal, regionInput.firstCommandIndex());
+			packedSectionCount += sectionCount;
 		}
 
 		return packedSectionCount;
 	}
 
-	private static int packRegionMetadata(
-		ByteBuffer metadataView,
+	private static CachedRegionMetadata getOrBuildCachedMetadata(RegionBatchInput regionInput, boolean preferLocalIndices) {
+		ChunkRenderList renderList = regionInput.renderList();
+		SectionRenderDataStorage storage = regionInput.storage();
+		if (!(renderList instanceof ChunkRenderListOrdering ordering)) {
+			throw new IllegalStateException("Potassium chunk render list accessor mixin is not applied.");
+		}
+		if (!(storage instanceof SectionRenderDataStorageVersioned versioned)) {
+			throw new IllegalStateException("Potassium section render storage version mixin is not applied.");
+		}
+
+		byte[] sectionsWithGeometry = ordering.potassium$getSectionsWithGeometry();
+		int sectionCount = renderList.getSectionsWithGeometryCount();
+		int storageVersion = versioned.potassium$getStorageVersion();
+		CachedRegionMetadata cachedMetadata = REGION_METADATA_CACHE.get(storage);
+		if (cachedMetadata != null && cachedMetadata.matches(storageVersion, preferLocalIndices, sectionsWithGeometry, sectionCount)) {
+			return cachedMetadata;
+		}
+
+		CachedRegionMetadata rebuiltMetadata = buildCachedMetadata(
+			regionInput,
+			storageVersion,
+			preferLocalIndices,
+			sectionsWithGeometry,
+			sectionCount
+		);
+		REGION_METADATA_CACHE.put(storage, rebuiltMetadata);
+		return rebuiltMetadata;
+	}
+
+	private static CachedRegionMetadata buildCachedMetadata(
 		RegionBatchInput regionInput,
-		int regionOrdinal,
-		boolean translucentPass,
-		CameraTransform cameraTransform,
-		boolean preferLocalIndices
+		int storageVersion,
+		boolean preferLocalIndices,
+		byte[] sectionsWithGeometry,
+		int sectionCount
 	) {
 		RenderRegion region = regionInput.region();
 		SectionRenderDataStorage storage = regionInput.storage();
-		ChunkRenderList renderList = regionInput.renderList();
-		ByteIterator iterator = renderList.sectionsWithGeometryIterator(translucentPass);
-		if (iterator == null) {
-			return 0;
-		}
-
 		int regionChunkX = region.getChunkX();
 		int regionChunkY = region.getChunkY();
 		int regionChunkZ = region.getChunkZ();
-		float cameraX = cameraTransform.intX + cameraTransform.fracX;
-		float cameraY = cameraTransform.intY + cameraTransform.fracY;
-		float cameraZ = cameraTransform.intZ + cameraTransform.fracZ;
-		int testedSections = 0;
+		byte[] sectionOrderSnapshot = new byte[sectionCount];
+		System.arraycopy(sectionsWithGeometry, 0, sectionOrderSnapshot, 0, sectionCount);
+		byte[] templateBytes = new byte[sectionCount * INPUT_STRIDE_BYTES];
+		ByteBuffer metadataView = ByteBuffer.wrap(templateBytes).order(ByteOrder.nativeOrder());
 
-		while (iterator.hasNext()) {
-			int localSectionIndex = iterator.nextByteAsInt();
+		for (int sectionIndex = 0; sectionIndex < sectionCount; sectionIndex++) {
+			int localSectionIndex = Byte.toUnsignedInt(sectionOrderSnapshot[sectionIndex]);
 			long dataPointer = storage.getDataPointer(localSectionIndex);
 			int sectionChunkX = regionChunkX + LocalSectionIndex.unpackX(localSectionIndex);
 			int sectionChunkY = regionChunkY + LocalSectionIndex.unpackY(localSectionIndex);
 			int sectionChunkZ = regionChunkZ + LocalSectionIndex.unpackZ(localSectionIndex);
-			float centerX = ((sectionChunkX << 4) + 8.0f) - cameraX;
-			float centerY = ((sectionChunkY << 4) + 8.0f) - cameraY;
-			float centerZ = ((sectionChunkZ << 4) + 8.0f) - cameraZ;
 			long facingList = SectionRenderDataUnsafe.getFacingList(dataPointer);
 			int flags = preferLocalIndices && SectionRenderDataUnsafe.isLocalIndex(dataPointer) ? FLAG_USE_LOCAL_INDEX : 0;
 
-			metadataView.putFloat(centerX);
-			metadataView.putFloat(centerY);
-			metadataView.putFloat(centerZ);
+			metadataView.putFloat((sectionChunkX << 4) + 8.0f);
+			metadataView.putFloat((sectionChunkY << 4) + 8.0f);
+			metadataView.putFloat((sectionChunkZ << 4) + 8.0f);
 			metadataView.putFloat(SECTION_BOUNDING_RADIUS);
 			metadataView.putInt(sectionChunkX);
 			metadataView.putInt(sectionChunkY);
@@ -295,14 +326,27 @@ public final class SectionVisibilityCompute {
 			metadataView.putInt(checkedInt(SectionRenderDataUnsafe.getVertexCount(dataPointer, 5), "vertexCount[5]"));
 			metadataView.putInt(checkedInt(SectionRenderDataUnsafe.getVertexCount(dataPointer, 6), "vertexCount[6]"));
 			metadataView.putInt(0);
-			metadataView.putInt(regionOrdinal);
-			metadataView.putInt(regionInput.firstCommandIndex());
+			metadataView.putInt(0);
+			metadataView.putInt(0);
 			metadataView.putInt(flags);
 			metadataView.putInt(0);
-			testedSections++;
 		}
 
-		return testedSections;
+		return new CachedRegionMetadata(storageVersion, preferLocalIndices, sectionOrderSnapshot, templateBytes);
+	}
+
+	private static void patchRegionInfo(
+		ByteBuffer metadataView,
+		int regionMetadataOffset,
+		int sectionCount,
+		int regionOrdinal,
+		int firstCommandIndex
+	) {
+		for (int sectionIndex = 0; sectionIndex < sectionCount; sectionIndex++) {
+			int recordOffset = regionMetadataOffset + (sectionIndex * INPUT_STRIDE_BYTES);
+			metadataView.putInt(recordOffset + REGION_INDEX_OFFSET_BYTES, regionOrdinal);
+			metadataView.putInt(recordOffset + REGION_COMMAND_BASE_OFFSET_BYTES, firstCommandIndex);
+		}
 	}
 
 	private static void uploadSectionMetadata(int packedSectionCount) {
@@ -378,6 +422,8 @@ public final class SectionVisibilityCompute {
 			GL15C.glDeleteBuffers(counterBufferHandle);
 			counterBufferHandle = 0;
 		}
+
+		REGION_METADATA_CACHE.clear();
 
 		if (sectionMetadataBuffer != null) {
 			MemoryUtil.memFree(sectionMetadataBuffer);
@@ -494,6 +540,40 @@ public final class SectionVisibilityCompute {
 			}
 
 			return new ComputePassResult(false, false, new int[regionCount], new int[regionCount], new int[regionCount]);
+		}
+	}
+
+	private record CachedRegionMetadata(
+		int storageVersion,
+		boolean preferLocalIndices,
+		byte[] sectionOrderSnapshot,
+		byte[] templateBytes
+	) {
+		private int sectionCount() {
+			return this.sectionOrderSnapshot.length;
+		}
+
+		private boolean matches(
+			int currentStorageVersion,
+			boolean currentPreferLocalIndices,
+			byte[] currentSectionOrder,
+			int currentSectionCount
+		) {
+			if (
+				this.storageVersion != currentStorageVersion ||
+				this.preferLocalIndices != currentPreferLocalIndices ||
+				this.sectionOrderSnapshot.length != currentSectionCount
+			) {
+				return false;
+			}
+
+			for (int sectionIndex = 0; sectionIndex < currentSectionCount; sectionIndex++) {
+				if (this.sectionOrderSnapshot[sectionIndex] != currentSectionOrder[sectionIndex]) {
+					return false;
+				}
+			}
+
+			return true;
 		}
 	}
 }

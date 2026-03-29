@@ -40,11 +40,12 @@ layout(std430, binding = 2) buffer IndirectCommands {
 
 uniform vec4 uFrustumPlanes[6];
 uniform uint uSectionCount;
+uniform vec3 uCameraPosition;
 uniform ivec3 uCameraBlockPosition;
 uniform uint uUseBlockFaceCulling;
 
 bool isSphereVisible(vec4 sphere) {
-	vec3 center = sphere.xyz;
+	vec3 center = sphere.xyz - uCameraPosition;
 	float radius = sphere.w;
 
 	for (int planeIndex = 0; planeIndex < 6; planeIndex++) {

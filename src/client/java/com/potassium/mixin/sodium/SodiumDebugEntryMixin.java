@@ -7,6 +7,7 @@ import java.util.List;
 import net.caffeinemc.mods.sodium.client.gui.SodiumDebugEntry;
 import net.minecraft.ChatFormatting;
 import net.minecraft.client.gui.components.debug.DebugScreenDisplayer;
+import net.minecraft.client.resources.language.I18n;
 import net.minecraft.resources.Identifier;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -38,11 +39,12 @@ public abstract class SodiumDebugEntryMixin {
 			return line;
 		}
 
-		if (line.contains("Potassium Patched")) {
+		String marker = I18n.get("potassium.debug.marker");
+		if (line.contains(marker)) {
 			return line;
 		}
 
-		return line + ChatFormatting.WHITE + " - " + ChatFormatting.RED + "Potassium Patched";
+		return line + ChatFormatting.WHITE + " - " + ChatFormatting.RED + marker;
 	}
 
 	@Inject(method = "display", at = @At("TAIL"))

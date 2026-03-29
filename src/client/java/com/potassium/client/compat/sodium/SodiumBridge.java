@@ -40,6 +40,7 @@ import net.caffeinemc.mods.sodium.client.render.chunk.terrain.TerrainRenderPass;
 import net.caffeinemc.mods.sodium.client.render.viewport.CameraTransform;
 import net.caffeinemc.mods.sodium.client.render.viewport.Viewport;
 import net.caffeinemc.mods.sodium.client.util.iterator.ByteIterator;
+import net.minecraft.client.resources.language.I18n;
 import org.lwjgl.opengl.ARBIndirectParameters;
 import org.lwjgl.opengl.GL11C;
 import org.lwjgl.opengl.GL15C;
@@ -1765,72 +1766,72 @@ public final class SodiumBridge {
 			int consecutiveOverrideFailureCount
 		) {
 			List<String> lines = new ArrayList<>();
-			lines.add("Potassium [Sodium Bridge]");
+			lines.add(tr("potassium.debug.title"));
 			if (showSummary) {
-				lines.add("Bridge installed: " + bridgeInstalled);
-				lines.add("Draw override: " + overrideEnabled);
-				lines.add("Last pass: " + this.lastPass);
-				lines.add("Last pass fully overridden: " + this.lastPassFullyOverridden);
-				lines.add("Completed mirrored passes: " + this.completedPassCount);
+				lines.add(tr("potassium.debug.summary.bridge_installed", bridgeInstalled));
+				lines.add(tr("potassium.debug.summary.draw_override", overrideEnabled));
+				lines.add(tr("potassium.debug.summary.last_pass", this.lastPass));
+				lines.add(tr("potassium.debug.summary.last_pass_fully_overridden", this.lastPassFullyOverridden));
+				lines.add(tr("potassium.debug.summary.completed_passes", this.completedPassCount));
 			}
 			if (showOverrideStats) {
-				lines.add("Override attempts: " + overrideAttemptCount);
-				lines.add("Override successes: " + overrideSuccessCount);
-				lines.add("Override failures: " + overrideFailureCount);
-				lines.add("Consecutive override failures: " + consecutiveOverrideFailureCount);
+				lines.add(tr("potassium.debug.override.attempts", overrideAttemptCount));
+				lines.add(tr("potassium.debug.override.successes", overrideSuccessCount));
+				lines.add(tr("potassium.debug.override.failures", overrideFailureCount));
+				lines.add(tr("potassium.debug.override.consecutive_failures", consecutiveOverrideFailureCount));
 			}
 			if (showGenerationStats) {
-				lines.add("Seen batches: " + this.lastSeenBatchCount);
-				lines.add("Seen commands: " + this.lastSeenCommandCount);
-				lines.add("Mirrored batches: " + this.lastBatchCount);
-				lines.add("Mirrored commands: " + this.lastCommandCount);
-				lines.add("Generated batches: " + this.lastGeneratedBatchCount);
-				lines.add("Generated commands: " + this.lastGeneratedCommandCount);
-				lines.add("Compute generated batches: " + this.lastComputeGeneratedBatchCount);
-				lines.add("Compute generated commands: " + this.lastComputeGeneratedCommandCount);
-				lines.add("Translated batches: " + this.lastTranslatedBatchCount);
-				lines.add("Translated commands: " + this.lastTranslatedCommandCount);
-				lines.add("Scheduled batches: " + this.lastScheduledBatchCount);
-				lines.add("Async ready batches: " + this.lastAsyncReadyBatchCount);
-				lines.add("Async waited batches: " + this.lastAsyncWaitedBatchCount);
-				lines.add("Async failed batches: " + this.lastAsyncFailedBatchCount);
-				lines.add("Sync generated batches: " + this.lastSyncGeneratedBatchCount);
-				lines.add("Potassium batches: " + this.lastExecutedBatchCount);
-				lines.add("Potassium commands: " + this.lastExecutedCommandCount);
+				lines.add(tr("potassium.debug.generation.seen_batches", this.lastSeenBatchCount));
+				lines.add(tr("potassium.debug.generation.seen_commands", this.lastSeenCommandCount));
+				lines.add(tr("potassium.debug.generation.mirrored_batches", this.lastBatchCount));
+				lines.add(tr("potassium.debug.generation.mirrored_commands", this.lastCommandCount));
+				lines.add(tr("potassium.debug.generation.generated_batches", this.lastGeneratedBatchCount));
+				lines.add(tr("potassium.debug.generation.generated_commands", this.lastGeneratedCommandCount));
+				lines.add(tr("potassium.debug.generation.compute_generated_batches", this.lastComputeGeneratedBatchCount));
+				lines.add(tr("potassium.debug.generation.compute_generated_commands", this.lastComputeGeneratedCommandCount));
+				lines.add(tr("potassium.debug.generation.translated_batches", this.lastTranslatedBatchCount));
+				lines.add(tr("potassium.debug.generation.translated_commands", this.lastTranslatedCommandCount));
+				lines.add(tr("potassium.debug.generation.scheduled_batches", this.lastScheduledBatchCount));
+				lines.add(tr("potassium.debug.generation.async_ready_batches", this.lastAsyncReadyBatchCount));
+				lines.add(tr("potassium.debug.generation.async_waited_batches", this.lastAsyncWaitedBatchCount));
+				lines.add(tr("potassium.debug.generation.async_failed_batches", this.lastAsyncFailedBatchCount));
+				lines.add(tr("potassium.debug.generation.sync_generated_batches", this.lastSyncGeneratedBatchCount));
+				lines.add(tr("potassium.debug.generation.potassium_batches", this.lastExecutedBatchCount));
+				lines.add(tr("potassium.debug.generation.potassium_commands", this.lastExecutedCommandCount));
 			}
 			if (showComputeStats) {
-				lines.add("Compute culling: " + this.lastComputeCullingEnabled);
-				lines.add("Opaque compute enabled: " + this.lastOpaqueComputeCullingEnabled);
-				lines.add("Opaque compute dispatches: " + this.lastOpaqueComputeDispatchCount);
-				lines.add("Opaque compute failures: " + this.lastOpaqueComputeFailureCount);
-				lines.add("Opaque compute generated batches: " + this.lastOpaqueComputeGeneratedBatchCount);
-				lines.add("Opaque compute generated commands: " + this.lastOpaqueComputeGeneratedCommandCount);
-				lines.add("Compute dispatches: " + this.lastComputeDispatchCount);
-				lines.add("Compute failures: " + this.lastComputeFailureCount);
+				lines.add(tr("potassium.debug.compute.compute_culling", this.lastComputeCullingEnabled));
+				lines.add(tr("potassium.debug.compute.opaque_enabled", this.lastOpaqueComputeCullingEnabled));
+				lines.add(tr("potassium.debug.compute.opaque_dispatches", this.lastOpaqueComputeDispatchCount));
+				lines.add(tr("potassium.debug.compute.opaque_failures", this.lastOpaqueComputeFailureCount));
+				lines.add(tr("potassium.debug.compute.opaque_generated_batches", this.lastOpaqueComputeGeneratedBatchCount));
+				lines.add(tr("potassium.debug.compute.opaque_generated_commands", this.lastOpaqueComputeGeneratedCommandCount));
+				lines.add(tr("potassium.debug.compute.dispatches", this.lastComputeDispatchCount));
+				lines.add(tr("potassium.debug.compute.failures", this.lastComputeFailureCount));
 			}
 			if (showCullingStats) {
-				lines.add("Visible regions: " + this.lastVisibleRegionCount);
-				lines.add("Generated skip batches: " + this.lastGeneratedSkipBatchCount);
-				lines.add("Culled batches: " + this.lastCulledBatchCount);
-				lines.add("Frustum tested regions: " + this.lastFrustumTestedRegionCount);
-				lines.add("Frustum culled regions: " + this.lastFrustumCulledRegionCount);
-				lines.add("Frustum tested sections: " + this.lastFrustumTestedSectionCount);
-				lines.add("Frustum visible sections: " + this.lastFrustumVisibleSectionCount);
-				lines.add("Frustum culled sections: " + this.lastFrustumCulledSectionCount);
+				lines.add(tr("potassium.debug.culling.visible_regions", this.lastVisibleRegionCount));
+				lines.add(tr("potassium.debug.culling.generated_skip_batches", this.lastGeneratedSkipBatchCount));
+				lines.add(tr("potassium.debug.culling.culled_batches", this.lastCulledBatchCount));
+				lines.add(tr("potassium.debug.culling.frustum_tested_regions", this.lastFrustumTestedRegionCount));
+				lines.add(tr("potassium.debug.culling.frustum_culled_regions", this.lastFrustumCulledRegionCount));
+				lines.add(tr("potassium.debug.culling.frustum_tested_sections", this.lastFrustumTestedSectionCount));
+				lines.add(tr("potassium.debug.culling.frustum_visible_sections", this.lastFrustumVisibleSectionCount));
+				lines.add(tr("potassium.debug.culling.frustum_culled_sections", this.lastFrustumCulledSectionCount));
 			}
 			if (showBufferStats) {
-				lines.add("Command fill workers: " + COMMAND_FILL_WORKER_COUNT);
-				lines.add("Persistent mapping: " + this.lastPersistentMappingEnabled);
-				lines.add("Indexed indirect buffer: " + this.lastCommandCount + "/" + this.lastBufferCapacity + " commands");
-				lines.add("Indexed command bytes: " + this.lastBufferBytes);
+				lines.add(tr("potassium.debug.buffer.command_fill_workers", COMMAND_FILL_WORKER_COUNT));
+				lines.add(tr("potassium.debug.buffer.persistent_mapping", this.lastPersistentMappingEnabled));
+				lines.add(tr("potassium.debug.buffer.indexed_indirect_buffer", this.lastCommandCount, this.lastBufferCapacity));
+				lines.add(tr("potassium.debug.buffer.indexed_command_bytes", this.lastBufferBytes));
 			}
 			if (showFallbackStats) {
-				lines.add("Override disable reason: " + overrideDisableReason);
-				lines.add("Fallback batches: " + this.lastFallbackBatchCount);
-				lines.add("Fallback commands: " + this.lastFallbackCommandCount);
-				lines.add("Last fallback reason: " + this.lastFallbackReason);
-				lines.add("Overridden passes: " + this.overriddenPassCount);
-				lines.add("Fallback passes: " + this.fallbackPassCount);
+				lines.add(tr("potassium.debug.fallback.override_disable_reason", overrideDisableReason));
+				lines.add(tr("potassium.debug.fallback.fallback_batches", this.lastFallbackBatchCount));
+				lines.add(tr("potassium.debug.fallback.fallback_commands", this.lastFallbackCommandCount));
+				lines.add(tr("potassium.debug.fallback.last_fallback_reason", this.lastFallbackReason));
+				lines.add(tr("potassium.debug.fallback.overridden_passes", this.overriddenPassCount));
+				lines.add(tr("potassium.debug.fallback.fallback_passes", this.fallbackPassCount));
 			}
 			return lines;
 		}
@@ -1897,6 +1898,10 @@ public final class SodiumBridge {
 			this.fallbackPassCount = 0L;
 			this.completedPassCount = 0L;
 		}
+	}
+
+	private static String tr(String key, Object... args) {
+		return I18n.get(key, args);
 	}
 
 	private enum CommandSource {

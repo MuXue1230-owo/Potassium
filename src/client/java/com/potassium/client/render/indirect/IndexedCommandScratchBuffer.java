@@ -38,6 +38,15 @@ public final class IndexedCommandScratchBuffer {
 		return this.commandCount;
 	}
 
+	public void reset(int expectedCommandCapacity) {
+		if (expectedCommandCapacity < 0) {
+			throw new IllegalArgumentException("expectedCommandCapacity must be non-negative.");
+		}
+
+		this.commandCount = 0;
+		this.ensureCapacity(Math.max(expectedCommandCapacity, 1));
+	}
+
 	public int usedBytes() {
 		return this.commandCount * IndexedIndirectCommandBuffer.COMMAND_STRIDE_BYTES;
 	}

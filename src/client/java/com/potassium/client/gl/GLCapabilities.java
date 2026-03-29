@@ -22,6 +22,7 @@ public final class GLCapabilities {
 	private static boolean hasIndirectDraw;
 	private static boolean hasIndirectCount;
 	private static boolean hasComputeShader;
+	private static boolean hasShaderDrawParameters;
 	private static boolean hasSSBO;
 	private static boolean hasPersistentMapping;
 	private static boolean hasDSA;
@@ -73,6 +74,7 @@ public final class GLCapabilities {
 		hasIndirectDraw = caps.GL_ARB_multi_draw_indirect || isAtLeast(4, 3);
 		hasIndirectCount = caps.GL_ARB_indirect_parameters || isAtLeast(4, 6);
 		hasComputeShader = caps.GL_ARB_compute_shader || isAtLeast(4, 3);
+		hasShaderDrawParameters = isAtLeast(4, 6);
 		hasSSBO = caps.GL_ARB_shader_storage_buffer_object || isAtLeast(4, 3);
 		hasPersistentMapping = caps.GL_ARB_buffer_storage || isAtLeast(4, 4);
 		hasDSA = caps.GL_ARB_direct_state_access || isAtLeast(4, 5);
@@ -93,6 +95,7 @@ public final class GLCapabilities {
 		PotassiumClientMod.LOGGER.info("Indirect draw: {}", hasIndirectDraw);
 		PotassiumClientMod.LOGGER.info("Indirect count: {}", hasIndirectCount);
 		PotassiumClientMod.LOGGER.info("Compute shader: {}", hasComputeShader);
+		PotassiumClientMod.LOGGER.info("Shader draw parameters: {}", hasShaderDrawParameters);
 		PotassiumClientMod.LOGGER.info("SSBO: {}", hasSSBO);
 		PotassiumClientMod.LOGGER.info("Persistent mapping: {}", hasPersistentMapping);
 		PotassiumClientMod.LOGGER.info("DSA: {}", hasDSA);
@@ -166,6 +169,10 @@ public final class GLCapabilities {
 
 	public static boolean hasComputeShader() {
 		return hasComputeShader;
+	}
+
+	public static boolean hasShaderDrawParameters() {
+		return hasShaderDrawParameters;
 	}
 
 	public static boolean hasIndirectCount() {

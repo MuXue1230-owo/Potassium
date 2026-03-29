@@ -29,7 +29,3 @@ uvec3 _potassium_relative_chunk_coord(int localSectionIndex) {
 vec3 _potassium_draw_translation(PotassiumSceneSection sceneSection) {
     return _potassium_relative_chunk_coord(sceneSection.localSectionIndex) * vec3(16.0);
 }
-
-int _potassium_chunk_fade_index(PotassiumSceneSection sceneSection, uint fallbackDrawId) {
-    return _potassium_use_scene_data() ? sceneSection.localSectionIndex : int(fallbackDrawId);
-}

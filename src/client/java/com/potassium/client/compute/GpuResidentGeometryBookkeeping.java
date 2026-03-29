@@ -1,12 +1,18 @@
 package com.potassium.client.compute;
 
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.IdentityHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.WeakHashMap;
+import net.caffeinemc.mods.sodium.client.render.chunk.region.RenderRegion;
 import net.caffeinemc.mods.sodium.client.render.chunk.data.SectionRenderDataStorage;
 
 public final class GpuResidentGeometryBookkeeping {
 	private static final Map<SectionRenderDataStorage, ResidentRegionRecord> RECORDS = new WeakHashMap<>();
+	private static final Map<GpuResidentSectionMetadataStore.CachedRegionMetadata, PendingUpload> PENDING_UPLOADS =
+		new IdentityHashMap<>();
 	private static long nextGeneration = 1L;
 	private static int nextSceneId = 1;
 	private static int nextSectionId = 1;
@@ -16,6 +22,8 @@ public final class GpuResidentGeometryBookkeeping {
 
 	static synchronized void record(
 		SectionRenderDataStorage storage,
+		RenderRegion region,
+		boolean translucentPass,
 		GpuResidentSectionMetadataStore.CachedRegionMetadata metadata
 	) {
 		ResidentRegionRecord existingRecord = RECORDS.get(storage);
@@ -37,13 +45,15 @@ public final class GpuResidentGeometryBookkeeping {
 			existingRecord.regionSlot() != metadata.regionSlot() ||
 			!Arrays.equals(existingRecord.sectionPresenceBits(), sectionPresenceBits);
 		metadata.assignSceneIds(sceneId, sectionSceneIdsByLocalSection);
-		GpuResidentGeometryStore.syncRegion(metadata, fullSync);
-		metadata.markUploaded();
+		GpuResidentGeometryStore.syncCpuMirror(metadata, fullSync);
+		queuePendingUpload(metadata, fullSync);
 		RECORDS.put(
 			storage,
 			new ResidentRegionRecord(
 				sceneId,
 				nextGeneration++,
+				region,
+				translucentPass,
 				metadata.regionSlot(),
 				metadata.sectionBaseIndex(),
 				metadata.sectionCount(),
@@ -54,6 +64,42 @@ public final class GpuResidentGeometryBookkeeping {
 				sectionPresenceBits
 			)
 		);
+	}
+
+	public static synchronized List<ResidentBatchInput> snapshotResidentRegions(boolean translucentPass) {
+		List<ResidentBatchInput> residentBatchInputs = new ArrayList<>(RECORDS.size());
+		for (Map.Entry<SectionRenderDataStorage, ResidentRegionRecord> entry : RECORDS.entrySet()) {
+			ResidentRegionRecord record = entry.getValue();
+			if (record.translucentPass() != translucentPass || record.region() == null) {
+				continue;
+			}
+
+			residentBatchInputs.add(
+				new ResidentBatchInput(
+					record.region(),
+					entry.getKey(),
+					record.sectionCount(),
+					record.sectionCount() * 7
+				)
+			);
+		}
+		return residentBatchInputs;
+	}
+
+	public static synchronized void flushPendingUploads() {
+		if (PENDING_UPLOADS.isEmpty()) {
+			return;
+		}
+
+		for (Map.Entry<GpuResidentSectionMetadataStore.CachedRegionMetadata, PendingUpload> entry : PENDING_UPLOADS.entrySet()) {
+			GpuResidentSectionMetadataStore.CachedRegionMetadata metadata = entry.getKey();
+			PendingUpload pendingUpload = entry.getValue();
+			GpuResidentGeometryStore.flushPendingUpload(metadata, pendingUpload.fullSync());
+			GpuSceneDataStore.flushPendingUpload(metadata);
+			metadata.markUploaded();
+		}
+
+		PENDING_UPLOADS.clear();
 	}
 
 	public static synchronized Snapshot snapshot() {
@@ -91,11 +137,26 @@ public final class GpuResidentGeometryBookkeeping {
 		nextGeneration = 1L;
 		nextSceneId = 1;
 		nextSectionId = 1;
+		PENDING_UPLOADS.clear();
+	}
+
+	private static void queuePendingUpload(GpuResidentSectionMetadataStore.CachedRegionMetadata metadata, boolean fullSync) {
+		PendingUpload existing = PENDING_UPLOADS.get(metadata);
+		if (existing == null) {
+			PENDING_UPLOADS.put(metadata, new PendingUpload(fullSync));
+			return;
+		}
+
+		if (fullSync && !existing.fullSync()) {
+			PENDING_UPLOADS.put(metadata, new PendingUpload(true));
+		}
 	}
 
 	private record ResidentRegionRecord(
 		int sceneId,
 		long generation,
+		RenderRegion region,
+		boolean translucentPass,
 		int regionSlot,
 		int sectionBaseIndex,
 		int sectionCount,
@@ -112,6 +173,17 @@ public final class GpuResidentGeometryBookkeeping {
 			}
 			return maxSectionSceneId;
 		}
+	}
+
+	private record PendingUpload(boolean fullSync) {
+	}
+
+	public record ResidentBatchInput(
+		RenderRegion region,
+		SectionRenderDataStorage storage,
+		int sectionCount,
+		int maxCommandCount
+	) {
 	}
 
 	private static long[] buildSectionPresenceBits(byte[] sectionOrderSnapshot) {

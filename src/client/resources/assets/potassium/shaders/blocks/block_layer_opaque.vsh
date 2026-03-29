@@ -44,12 +44,7 @@ void main() {
 
 #ifdef USE_FOG
     v_FragDistance = getFragDistance(position);
-
-    if (useSceneData) {
-        fadeFactor = sceneSection.dynamicData.x;
-    } else {
-        fadeFactor = 1.0;
-    }
+    fadeFactor = 1.0;
 #endif
 
     gl_Position = u_ProjectionMatrix * u_ModelViewMatrix * vec4(position, 1.0);

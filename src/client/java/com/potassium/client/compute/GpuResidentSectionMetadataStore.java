@@ -147,7 +147,7 @@ final class GpuResidentSectionMetadataStore {
 					dirtyTracker.potassium$copyDirtySectionBits(dirtySectionWords);
 					if (cachedMetadata.refreshDirtySections(regionInput, storageVersion, preferLocalIndices, dirtySectionWords)) {
 						dirtyTracker.potassium$clearMetadataDirty();
-						GpuResidentGeometryBookkeeping.record(storage, cachedMetadata);
+						GpuResidentGeometryBookkeeping.record(storage, regionInput.region(), translucentPass, cachedMetadata);
 						return cachedMetadata;
 					}
 				}
@@ -167,8 +167,12 @@ final class GpuResidentSectionMetadataStore {
 		);
 		REGION_METADATA_CACHE.put(storage, rebuiltMetadata);
 		dirtyTracker.potassium$clearMetadataDirty();
-		GpuResidentGeometryBookkeeping.record(storage, rebuiltMetadata);
+		GpuResidentGeometryBookkeeping.record(storage, regionInput.region(), translucentPass, rebuiltMetadata);
 		return rebuiltMetadata;
+	}
+
+	static CachedRegionMetadata peekCachedMetadata(SectionRenderDataStorage storage) {
+		return REGION_METADATA_CACHE.get(storage);
 	}
 
 	static void uploadIfDirty(CachedRegionMetadata cachedMetadata) {
@@ -518,8 +522,6 @@ final class GpuResidentSectionMetadataStore {
 					localSectionIndex
 				);
 			}
-
-			GpuSceneDataStore.uploadDirtySections(this);
 		}
 
 		int dirtySectionStart() {

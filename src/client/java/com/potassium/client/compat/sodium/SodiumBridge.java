@@ -1,6 +1,7 @@
 package com.potassium.client.compat.sodium;
 
 import com.potassium.client.PotassiumClientMod;
+import com.potassium.client.compute.GpuResidentGeometryStore;
 import com.potassium.client.compute.GpuSceneDataStore;
 import com.potassium.client.compute.SectionVisibilityCompute;
 import com.potassium.client.compute.SectionVisibilityCompute.ComputePassResult;
@@ -85,6 +86,8 @@ public final class SodiumBridge {
 	private static final ThreadLocal<RenderPassContext> PASS_CONTEXT_POOL = ThreadLocal.withInitial(RenderPassContext::new);
 	private static final ThreadLocal<IndexedCommandScratchBuffer> CPU_COMMAND_SCRATCH =
 		ThreadLocal.withInitial(() -> new IndexedCommandScratchBuffer(256));
+	private static final ThreadLocal<GpuResidentGeometryStore.SectionRecord> SECTION_GEOMETRY_SCRATCH =
+		ThreadLocal.withInitial(GpuResidentGeometryStore::createScratchRecord);
 	private static final GeneratedCommandBatch REGION_FRUSTUM_CULLED_BATCH = GeneratedCommandBatch.skip(1, 1, 0, 0, 0);
 	private static final CompletableFuture<GeneratedCommandBatch> REGION_FRUSTUM_CULLED_FUTURE =
 		CompletableFuture.completedFuture(REGION_FRUSTUM_CULLED_BATCH);
@@ -138,6 +141,7 @@ public final class SodiumBridge {
 		context.begin(pass, currentViewport);
 		IndexedIndirectCommandBuffer commandBuffer = IndirectBackend.indexedCommandBuffer();
 		commandBuffer.beginFrame();
+		GpuResidentGeometryBookkeeping.flushPendingUploads();
 		GpuSceneDataStore.bindAsStorage(GRAPHICS_SCENE_DATA_BINDING);
 		context.commandBuffer = commandBuffer;
 		context.computeCullingEnabled = isComputeGeneratedBatchesEnabled() && SectionVisibilityCompute.isEnabled();
@@ -262,16 +266,7 @@ public final class SodiumBridge {
 
 		boolean useBlockFaceCulling = SodiumClientMod.options().performance.useBlockFaceCulling;
 		boolean preferLocalIndices = renderPass.isTranslucent() && fragmentDiscard;
-		SectionVisibilityCompute.SectionSceneIds sceneIds = SectionVisibilityCompute.resolveSceneIds(
-			region,
-			storage,
-			renderList,
-			preferLocalIndices,
-			renderPass.isTranslucent()
-		);
-		if (GLCapabilities.hasShaderDrawParameters()) {
-			GpuSceneDataStore.updateSectionVisibility(sceneIds, region, renderList, renderPass.isTranslucent());
-		}
+		GpuResidentGeometryBookkeeping.flushPendingUploads();
 
 		if (context.pendingPreparedBatch != null) {
 			if (!context.pendingPreparedBatch.skipDraw()) {
@@ -279,6 +274,22 @@ public final class SodiumBridge {
 			}
 			context.pendingPreparedBatch = null;
 		}
+
+		if (context.computeCullingEnabled && !renderPass.isTranslucent() && context.compactedComputeBatch != null) {
+			if (!context.compactedComputeBatchPrepared && !context.compactedComputeBatchDrawn) {
+				applyGeneratedBatch(context, context.compactedComputeBatch);
+				context.compactedComputeBatchPrepared = true;
+			}
+			return;
+		}
+
+		SectionVisibilityCompute.SectionSceneIds sceneIds = SectionVisibilityCompute.resolveSceneIds(
+			region,
+			storage,
+			renderList,
+			preferLocalIndices,
+			renderPass.isTranslucent()
+		);
 
 		if (FORCE_TRANSLATED_BATCH_SUBMISSION || shouldForceTranslatedSubmission(renderPass, fragmentDiscard)) {
 			prepareTranslatedSceneIds(
@@ -400,9 +411,18 @@ public final class SodiumBridge {
 			return false;
 		}
 
+		if (context.compactedComputeBatch != null && context.compactedComputeBatchDrawn) {
+			recordOverrideSuccess();
+			return true;
+		}
+
 		PreparedBatch preparedBatch = consumePreparedBatch(context);
 		try {
 			if (preparedBatch != null && preparedBatch.skipDraw()) {
+				if (context.compactedComputeBatchPrepared) {
+					context.compactedComputeBatchPrepared = false;
+					context.compactedComputeBatchDrawn = true;
+				}
 				context.culledBatchCount++;
 				recordOverrideSuccess();
 				return true;
@@ -454,9 +474,18 @@ public final class SodiumBridge {
 			if (!preparedBatch.gpuCounted()) {
 				context.executedCommandCount += preparedBatch.commandCount();
 			}
+			if (context.compactedComputeBatchPrepared) {
+				context.compactedComputeBatchPrepared = false;
+				context.compactedComputeBatchDrawn = true;
+			}
 			recordOverrideSuccess();
 			return true;
 		} catch (RuntimeException exception) {
+			if (context.compactedComputeBatchPrepared) {
+				context.compactedComputeBatch = null;
+				context.compactedComputeBatchPrepared = false;
+				context.compactedComputeBatchDrawn = false;
+			}
 			if (preparedBatch != null && !preparedBatch.skipDraw()) {
 				rollbackBatch(context, preparedBatch);
 			}
@@ -589,33 +618,32 @@ public final class SodiumBridge {
 		boolean useGpuDrawCount = isGpuIndirectCountEnabled();
 		Viewport cullingViewport = effectiveViewport(context.viewport);
 		List<RegionBatchInput> regionInputs = context.regionInputs;
+		List<GpuResidentGeometryBookkeeping.ResidentBatchInput> residentRegions =
+			GpuResidentGeometryBookkeeping.snapshotResidentRegions(false);
 		int regionInputCount = 0;
-		int nextFirstCommandIndex = 0;
+		int totalMaxCommandCount = 0;
+		int frustumTestedRegionCount = 0;
+		int frustumCulledRegionCount = 0;
+		int firstCommandIndex = context.commandBuffer.commandCount();
 
-		for (java.util.Iterator<ChunkRenderList> iterator = renderLists.iterator(renderPass.isTranslucent()); iterator.hasNext(); ) {
-			ChunkRenderList renderList = iterator.next();
-			RenderRegion region = renderList.getRegion();
-			SectionRenderDataStorage storage = region.getStorage(renderPass);
-			if (storage == null) {
-				continue;
-			}
-
+		for (GpuResidentGeometryBookkeeping.ResidentBatchInput residentRegion : residentRegions) {
+			RenderRegion region = residentRegion.region();
+			SectionRenderDataStorage storage = residentRegion.storage();
 			context.scheduledBatchCount++;
+			if (cullingViewport != null) {
+				frustumTestedRegionCount++;
+			}
 			if (cullingViewport != null && !isRegionVisible(cullingViewport, region)) {
-				context.preparedGeneratedBatches.put(region, GeneratedCommandBatch.skip(1, 1, 0, 0, 0));
+				frustumCulledRegionCount++;
 				continue;
 			}
 
-			int expectedSectionCount = renderList.getSectionsWithGeometryCount();
+			int expectedSectionCount = residentRegion.sectionCount();
 			if (expectedSectionCount <= 0) {
-				context.preparedGeneratedBatches.put(
-					region,
-					GeneratedCommandBatch.skip(cullingViewport != null ? 1 : 0, 0, 0, 0, 0)
-				);
 				continue;
 			}
 
-			int maxCommandCount = estimateCommandCapacity(renderList);
+			int maxCommandCount = residentRegion.maxCommandCount();
 			RegionBatchInput regionInput;
 			if (regionInputCount < regionInputs.size()) {
 				regionInput = regionInputs.get(regionInputCount);
@@ -626,22 +654,30 @@ public final class SodiumBridge {
 			regionInput.configure(
 				region,
 				storage,
-				renderList,
-				nextFirstCommandIndex,
+				null,
+				firstCommandIndex,
 				maxCommandCount,
 				expectedSectionCount
 			);
 			regionInputCount++;
-			nextFirstCommandIndex = Math.addExact(nextFirstCommandIndex, maxCommandCount);
+			totalMaxCommandCount = Math.addExact(totalMaxCommandCount, maxCommandCount);
 		}
 
+		context.visibleRegionCount = regionInputCount;
 		if (regionInputCount == 0) {
-			context.visibleRegionCount = context.scheduledBatchCount;
+			context.compactedComputeBatch = GeneratedCommandBatch.skip(
+				frustumTestedRegionCount,
+				frustumCulledRegionCount,
+				0,
+				0,
+				0
+			);
+			context.compactedComputeBatchPrepared = false;
+			context.compactedComputeBatchDrawn = false;
 			return;
 		}
 
-		context.visibleRegionCount = context.scheduledBatchCount;
-		context.commandBuffer.reserveGpuCommandRange(nextFirstCommandIndex);
+		context.commandBuffer.reserveGpuCommandRange(totalMaxCommandCount);
 
 		try {
 			ComputePassResult computePassResult = SectionVisibilityCompute.generateIndexedCommands(
@@ -658,50 +694,51 @@ public final class SodiumBridge {
 			);
 			if (computePassResult.dispatched()) {
 				context.computeDispatchCount++;
-				context.commandBuffer.commitGpuGeneratedCommands(0, nextFirstCommandIndex);
+				context.commandBuffer.commitGpuGeneratedCommands(
+					firstCommandIndex,
+					useGpuDrawCount ? totalMaxCommandCount : computePassResult.totalCommandCount()
+				);
 			}
 
-			for (int regionIndex = 0; regionIndex < regionInputCount; regionIndex++) {
-				RegionBatchInput regionInput = regionInputs.get(regionIndex);
-				int testedSectionCount = computePassResult.testedSectionCounts()[regionIndex];
-				GeneratedCommandBatch generatedBatch;
-				if (useGpuDrawCount) {
-					generatedBatch = GeneratedCommandBatch.computeCounted(
-						regionInput.firstCommandIndex(),
-						regionInput.maxCommandCount(),
-						SectionVisibilityCompute.commandCountOffsetBytes(regionIndex),
-						cullingViewport != null ? 1 : 0,
-						0,
+			int testedSectionCount = sumCounts(computePassResult.testedSectionCounts(), regionInputCount);
+			int visibleSectionCount = computePassResult.countersReadBack()
+				? sumCounts(computePassResult.visibleSectionCounts(), regionInputCount)
+				: 0;
+			context.compactedComputeBatch = useGpuDrawCount
+				? GeneratedCommandBatch.computeCounted(
+					firstCommandIndex,
+					totalMaxCommandCount,
+					SectionVisibilityCompute.totalCommandCountOffsetBytes(),
+					frustumTestedRegionCount,
+					frustumCulledRegionCount,
+					testedSectionCount,
+					visibleSectionCount,
+					testedSectionCount - visibleSectionCount
+				)
+				: computePassResult.totalCommandCount() > 0
+					? GeneratedCommandBatch.compute(
+						firstCommandIndex,
+						computePassResult.totalCommandCount(),
+						frustumTestedRegionCount,
+						frustumCulledRegionCount,
 						testedSectionCount,
-						0,
-						0
+						visibleSectionCount,
+						testedSectionCount - visibleSectionCount
+					)
+					: GeneratedCommandBatch.skip(
+						frustumTestedRegionCount,
+						frustumCulledRegionCount,
+						testedSectionCount,
+						visibleSectionCount,
+						testedSectionCount - visibleSectionCount
 					);
-				} else {
-					int commandCount = computePassResult.commandCounts()[regionIndex];
-					int visibleSectionCount = computePassResult.visibleSectionCounts()[regionIndex];
-					generatedBatch = commandCount > 0
-						? GeneratedCommandBatch.compute(
-							regionInput.firstCommandIndex(),
-							commandCount,
-							cullingViewport != null ? 1 : 0,
-							0,
-							testedSectionCount,
-							visibleSectionCount,
-							testedSectionCount - visibleSectionCount
-						)
-						: GeneratedCommandBatch.skip(
-							cullingViewport != null ? 1 : 0,
-							0,
-							testedSectionCount,
-							visibleSectionCount,
-							testedSectionCount - visibleSectionCount
-						);
-				}
-				context.preparedGeneratedBatches.put(regionInput.region(), generatedBatch);
-			}
+			context.compactedComputeBatchPrepared = false;
+			context.compactedComputeBatchDrawn = false;
 		} catch (RuntimeException exception) {
 			context.computeFailureCount++;
-			context.preparedGeneratedBatches.clear();
+			context.compactedComputeBatch = null;
+			context.compactedComputeBatchPrepared = false;
+			context.compactedComputeBatchDrawn = false;
 			PotassiumClientMod.LOGGER.warn(
 				"Potassium compute command generation failed for one render pass. Falling back to CPU generation.",
 				exception
@@ -772,63 +809,108 @@ public final class SodiumBridge {
 			return GeneratedCommandBatch.skip(1, 1, 0, 0, 0);
 		}
 
-		ByteIterator iterator = renderList.sectionsWithGeometryIterator(renderPass.isTranslucent());
-		if (iterator == null) {
-			return GeneratedCommandBatch.skip(0, 0, 0, 0, 0);
-		}
-
 		int estimatedCommandCapacity = estimateCommandCapacity(renderList);
 		IndexedCommandScratchBuffer commandBuffer = CPU_COMMAND_SCRATCH.get();
 		commandBuffer.reset(estimatedCommandCapacity);
-		SectionVisibilityCompute.SectionSceneIds sceneIds = SectionVisibilityCompute.resolveSceneIds(
-			region,
-			storage,
-			renderList,
-			preferLocalIndices,
-			renderPass.isTranslucent()
-		);
-		int regionChunkX = region.getChunkX();
-		int regionChunkY = region.getChunkY();
-		int regionChunkZ = region.getChunkZ();
+		boolean useResidentOpaqueSections = !renderPass.isTranslucent();
+		SectionVisibilityCompute.SectionSceneIds sceneIds = useResidentOpaqueSections
+			? SectionVisibilityCompute.resolveResidentSceneIds(storage)
+			: SectionVisibilityCompute.resolveSceneIds(
+				region,
+				storage,
+				renderList,
+				preferLocalIndices,
+				true
+			);
+		GpuResidentGeometryStore.SectionRecord sectionRecord = SECTION_GEOMETRY_SCRATCH.get();
 		int frustumTestedSectionCount = 0;
 		int frustumVisibleSectionCount = 0;
 
-		while (iterator.hasNext()) {
-			int localSectionIndex = iterator.nextByteAsInt();
-			long dataPointer = storage.getDataPointer(localSectionIndex);
-			int sectionChunkX = regionChunkX + LOCAL_SECTION_CHUNK_X[localSectionIndex];
-			int sectionChunkY = regionChunkY + LOCAL_SECTION_CHUNK_Y[localSectionIndex];
-			int sectionChunkZ = regionChunkZ + LOCAL_SECTION_CHUNK_Z[localSectionIndex];
-			if (viewport != null) {
-				frustumTestedSectionCount++;
-				if (!isSectionVisible(viewport, sectionChunkX, sectionChunkY, sectionChunkZ)) {
+		if (useResidentOpaqueSections && sceneIds.regionSlot() >= 0) {
+			for (int localSectionIndex = 0; localSectionIndex < LOCAL_SECTION_CHUNK_X.length; localSectionIndex++) {
+				if (!GpuResidentGeometryStore.loadSection(sceneIds.regionSlot(), localSectionIndex, sectionRecord)) {
+					continue;
+				}
+				int sectionChunkX = sectionRecord.sectionChunkX();
+				int sectionChunkY = sectionRecord.sectionChunkY();
+				int sectionChunkZ = sectionRecord.sectionChunkZ();
+				if (viewport != null) {
+					frustumTestedSectionCount++;
+					if (!isSectionVisible(viewport, sectionChunkX, sectionChunkY, sectionChunkZ)) {
+						continue;
+					}
+
+					frustumVisibleSectionCount++;
+				}
+
+				int visibleFaces = useBlockFaceCulling
+					? DefaultChunkRenderer.getVisibleFaces(
+						cameraTransform.intX,
+						cameraTransform.intY,
+						cameraTransform.intZ,
+						sectionChunkX,
+						sectionChunkY,
+						sectionChunkZ
+					)
+					: ALL_FACES_MASK;
+
+				visibleFaces &= sectionRecord.sliceMask();
+				if (visibleFaces == 0) {
 					continue;
 				}
 
-				frustumVisibleSectionCount++;
+				int sectionSceneId = sectionRecord.sectionSceneId();
+				if (preferLocalIndices && sectionRecord.usesLocalIndex()) {
+					appendLocalIndexedCommands(commandBuffer, sectionRecord, visibleFaces, sectionSceneId);
+				} else {
+					appendSharedIndexedCommands(commandBuffer, sectionRecord, visibleFaces, sectionSceneId);
+				}
+			}
+		} else {
+			ByteIterator iterator = renderList.sectionsWithGeometryIterator(renderPass.isTranslucent());
+			if (iterator == null) {
+				return GeneratedCommandBatch.skip(0, 0, 0, 0, 0);
 			}
 
-			int visibleFaces = useBlockFaceCulling
-				? DefaultChunkRenderer.getVisibleFaces(
-					cameraTransform.intX,
-					cameraTransform.intY,
-					cameraTransform.intZ,
-					sectionChunkX,
-					sectionChunkY,
-					sectionChunkZ
-				)
-				: ALL_FACES_MASK;
+			while (iterator.hasNext()) {
+				int localSectionIndex = iterator.nextByteAsInt();
+				if (!GpuResidentGeometryStore.loadSection(sceneIds.regionSlot(), localSectionIndex, sectionRecord)) {
+					continue;
+				}
+				int sectionChunkX = sectionRecord.sectionChunkX();
+				int sectionChunkY = sectionRecord.sectionChunkY();
+				int sectionChunkZ = sectionRecord.sectionChunkZ();
+				if (viewport != null) {
+					frustumTestedSectionCount++;
+					if (!isSectionVisible(viewport, sectionChunkX, sectionChunkY, sectionChunkZ)) {
+						continue;
+					}
 
-			visibleFaces &= SectionRenderDataUnsafe.getSliceMask(dataPointer);
-			if (visibleFaces == 0) {
-				continue;
-			}
+					frustumVisibleSectionCount++;
+				}
 
-			int sectionSceneId = sceneIds.sectionSceneId(localSectionIndex);
-			if (preferLocalIndices && SectionRenderDataUnsafe.isLocalIndex(dataPointer)) {
-				appendLocalIndexedCommands(commandBuffer, dataPointer, visibleFaces, sectionSceneId);
-			} else {
-				appendSharedIndexedCommands(commandBuffer, dataPointer, visibleFaces, sectionSceneId);
+				int visibleFaces = useBlockFaceCulling
+					? DefaultChunkRenderer.getVisibleFaces(
+						cameraTransform.intX,
+						cameraTransform.intY,
+						cameraTransform.intZ,
+						sectionChunkX,
+						sectionChunkY,
+						sectionChunkZ
+					)
+					: ALL_FACES_MASK;
+
+				visibleFaces &= sectionRecord.sliceMask();
+				if (visibleFaces == 0) {
+					continue;
+				}
+
+				int sectionSceneId = sectionRecord.sectionSceneId();
+				if (preferLocalIndices && sectionRecord.usesLocalIndex()) {
+					appendLocalIndexedCommands(commandBuffer, sectionRecord, visibleFaces, sectionSceneId);
+				} else {
+					appendSharedIndexedCommands(commandBuffer, sectionRecord, visibleFaces, sectionSceneId);
+				}
 			}
 		}
 
@@ -1329,6 +1411,14 @@ public final class SodiumBridge {
 		return preparedSceneIds != null ? preparedSceneIds : PreparedTranslatedSceneIds.EMPTY;
 	}
 
+	private static int sumCounts(int[] values, int count) {
+		int total = 0;
+		for (int index = 0; index < count; index++) {
+			total = Math.addExact(total, values[index]);
+		}
+		return total;
+	}
+
 	private static void recordMirroredBatch(RenderPassContext context, PreparedBatch preparedBatch) {
 		context.mirroredBatchCount++;
 		if (!preparedBatch.gpuCounted()) {
@@ -1384,6 +1474,27 @@ public final class SodiumBridge {
 
 	private static void appendLocalIndexedCommands(
 		IndexedCommandScratchBuffer commandBuffer,
+		GpuResidentGeometryStore.SectionRecord sectionRecord,
+		int visibleFaces,
+		int sectionSceneId
+	) {
+		int baseElement = sectionRecord.baseElement();
+		int baseVertex = sectionRecord.baseVertex();
+
+		for (int facing = 0; facing < FACING_COUNT; facing++) {
+			int vertexCount = sectionRecord.vertexCount(facing);
+			int elementCount = (vertexCount >> 2) * 6;
+			if (((visibleFaces >>> facing) & 1) != 0) {
+				commandBuffer.addDrawElementsCommand(elementCount, 1, baseElement, baseVertex, sectionSceneId);
+			}
+
+			baseVertex += vertexCount;
+			baseElement += elementCount;
+		}
+	}
+
+	private static void appendLocalIndexedCommands(
+		IndexedCommandScratchBuffer commandBuffer,
 		long dataPointer,
 		int visibleFaces,
 		int sectionSceneId
@@ -1406,6 +1517,51 @@ public final class SodiumBridge {
 
 			baseVertex += vertexCount;
 			baseElement += elementCount;
+		}
+	}
+
+	private static void appendSharedIndexedCommands(
+		IndexedCommandScratchBuffer commandBuffer,
+		GpuResidentGeometryStore.SectionRecord sectionRecord,
+		int visibleFaces,
+		int sectionSceneId
+	) {
+		int baseElement = sectionRecord.baseElement();
+		long facingList = sectionRecord.facingList();
+		long visibleRunVertexCount = 0L;
+		int currentBaseVertex = sectionRecord.baseVertex();
+		boolean previousVisible = false;
+
+		for (int facing = 0; facing <= FACING_COUNT; facing++) {
+			boolean currentVisible = false;
+			int vertexCount = 0;
+
+			if (facing < FACING_COUNT) {
+				vertexCount = sectionRecord.vertexCount(facing);
+				if (vertexCount != 0) {
+					int faceOrder = (int) ((facingList >>> (facing * 8)) & 0xFFL);
+					currentVisible = ((visibleFaces >>> faceOrder) & 1) != 0;
+				}
+			}
+
+			if (!currentVisible) {
+				if (previousVisible) {
+					if (facing < FACING_COUNT && vertexCount == 0) {
+						continue;
+					}
+
+					int elementCount = Math.toIntExact((visibleRunVertexCount >> 2) * 6L);
+					commandBuffer.addDrawElementsCommand(elementCount, 1, baseElement, currentBaseVertex, sectionSceneId);
+					currentBaseVertex += Math.toIntExact(visibleRunVertexCount);
+					visibleRunVertexCount = 0L;
+				}
+
+				currentBaseVertex += vertexCount;
+			} else {
+				visibleRunVertexCount += vertexCount;
+			}
+
+			previousVisible = currentVisible;
 		}
 	}
 
@@ -1525,16 +1681,16 @@ public final class SodiumBridge {
 
 		int[] commandSceneIds = new int[Math.max(estimateCommandCapacity(renderList), 1)];
 		int commandCount = 0;
-		int regionChunkX = region.getChunkX();
-		int regionChunkY = region.getChunkY();
-		int regionChunkZ = region.getChunkZ();
+		GpuResidentGeometryStore.SectionRecord sectionRecord = SECTION_GEOMETRY_SCRATCH.get();
 
 		while (iterator.hasNext()) {
 			int localSectionIndex = iterator.nextByteAsInt();
-			long dataPointer = storage.getDataPointer(localSectionIndex);
-			int sectionChunkX = regionChunkX + LOCAL_SECTION_CHUNK_X[localSectionIndex];
-			int sectionChunkY = regionChunkY + LOCAL_SECTION_CHUNK_Y[localSectionIndex];
-			int sectionChunkZ = regionChunkZ + LOCAL_SECTION_CHUNK_Z[localSectionIndex];
+			if (!GpuResidentGeometryStore.loadSection(sceneIds.regionSlot(), localSectionIndex, sectionRecord)) {
+				continue;
+			}
+			int sectionChunkX = sectionRecord.sectionChunkX();
+			int sectionChunkY = sectionRecord.sectionChunkY();
+			int sectionChunkZ = sectionRecord.sectionChunkZ();
 			int visibleFaces = useBlockFaceCulling
 				? DefaultChunkRenderer.getVisibleFaces(
 					cameraTransform.intX,
@@ -1545,16 +1701,16 @@ public final class SodiumBridge {
 					sectionChunkZ
 				)
 				: ALL_FACES_MASK;
-			visibleFaces &= SectionRenderDataUnsafe.getSliceMask(dataPointer);
+			visibleFaces &= sectionRecord.sliceMask();
 			if (visibleFaces == 0) {
 				continue;
 			}
 
-			int sectionSceneId = sceneIds.sectionSceneId(localSectionIndex);
-			if (preferLocalIndices && SectionRenderDataUnsafe.isLocalIndex(dataPointer)) {
+			int sectionSceneId = sectionRecord.sectionSceneId();
+			if (preferLocalIndices && sectionRecord.usesLocalIndex()) {
 				commandCount = appendLocalSceneIds(commandSceneIds, commandCount, visibleFaces, sectionSceneId);
 			} else {
-				commandCount = appendSharedSceneIds(commandSceneIds, commandCount, dataPointer, visibleFaces, sectionSceneId);
+				commandCount = appendSharedSceneIds(commandSceneIds, commandCount, sectionRecord, visibleFaces, sectionSceneId);
 			}
 		}
 
@@ -1570,6 +1726,42 @@ public final class SodiumBridge {
 			if (((visibleFaces >>> facing) & 1) != 0) {
 				commandSceneIds[commandCount++] = sectionSceneId;
 			}
+		}
+
+		return commandCount;
+	}
+
+	private static int appendSharedSceneIds(
+		int[] commandSceneIds,
+		int commandCount,
+		GpuResidentGeometryStore.SectionRecord sectionRecord,
+		int visibleFaces,
+		int sectionSceneId
+	) {
+		long facingList = sectionRecord.facingList();
+		boolean previousVisible = false;
+
+		for (int facing = 0; facing <= FACING_COUNT; facing++) {
+			boolean currentVisible = false;
+			int vertexCount = 0;
+
+			if (facing < FACING_COUNT) {
+				vertexCount = sectionRecord.vertexCount(facing);
+				if (vertexCount != 0) {
+					int faceOrder = (int) ((facingList >>> (facing * 8)) & 0xFFL);
+					currentVisible = ((visibleFaces >>> faceOrder) & 1) != 0;
+				}
+			}
+
+			if (!currentVisible && previousVisible) {
+				if (facing < FACING_COUNT && vertexCount == 0) {
+					continue;
+				}
+
+				commandSceneIds[commandCount++] = sectionSceneId;
+			}
+
+			previousVisible = currentVisible;
 		}
 
 		return commandCount;
@@ -1688,6 +1880,9 @@ public final class SodiumBridge {
 		private final ArrayDeque<PreparedTranslatedSceneIds> preparedTranslatedSceneIds = new ArrayDeque<>();
 		private IndexedIndirectCommandBuffer commandBuffer;
 		private PreparedBatch pendingPreparedBatch;
+		private GeneratedCommandBatch compactedComputeBatch;
+		private boolean compactedComputeBatchPrepared;
+		private boolean compactedComputeBatchDrawn;
 		private boolean preparedBatchesScheduled;
 		private boolean persistentMappingEnabled;
 		private boolean computeCullingEnabled;
@@ -1742,6 +1937,9 @@ public final class SodiumBridge {
 			this.viewport = viewport;
 			this.commandBuffer = null;
 			this.pendingPreparedBatch = null;
+			this.compactedComputeBatch = null;
+			this.compactedComputeBatchPrepared = false;
+			this.compactedComputeBatchDrawn = false;
 			this.preparedBatchesScheduled = false;
 			this.persistentMappingEnabled = false;
 			this.computeCullingEnabled = false;
@@ -1794,6 +1992,9 @@ public final class SodiumBridge {
 		private void finish() {
 			this.pendingPreparedBatch = null;
 			this.commandBuffer = null;
+			this.compactedComputeBatch = null;
+			this.compactedComputeBatchPrepared = false;
+			this.compactedComputeBatchDrawn = false;
 			this.preparedGeneratedBatches.clear();
 			this.scheduledGeneratedBatches.clear();
 			this.preparedTranslatedSceneIds.clear();

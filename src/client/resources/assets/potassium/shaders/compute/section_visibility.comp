@@ -12,9 +12,13 @@ const uint MODEL_NEG_Z = 5u;
 const uint MODEL_UNASSIGNED = 6u;
 const uint FLAG_USE_LOCAL_INDEX = 1u;
 const uint COMMAND_WORD_STRIDE = 5u;
-const uint COUNTERS_PER_REGION = 2u;
+const uint GLOBAL_COMMAND_COUNT_OFFSET = 0u;
+const uint GLOBAL_ACTIVE_REGION_COUNT_OFFSET = 1u;
+const uint GLOBAL_COUNTER_COUNT = 2u;
+const uint COUNTERS_PER_REGION = 3u;
 const uint REGION_COMMAND_COUNT_OFFSET = 0u;
 const uint REGION_VISIBLE_SECTION_COUNT_OFFSET = 1u;
+const uint REGION_ACTIVE_MARK_OFFSET = 2u;
 const uint ALL_FACES_MASK = (1u << FACING_COUNT) - 1u;
 
 struct SectionCommandInput {
@@ -47,6 +51,10 @@ layout(std430, binding = 2) buffer CommandCounters {
 
 layout(std430, binding = 3) buffer IndirectCommands {
 	uint commandWords[];
+};
+
+layout(std430, binding = 4) buffer ActiveRegionList {
+	uint activeRegionIndices[];
 };
 
 uniform vec4 uFrustumPlanes[6];
@@ -123,7 +131,17 @@ uint computeVisibleFaces(ivec3 sectionChunkPosition) {
 }
 
 uint regionCounterIndex(uint regionIndex, uint counterOffset) {
-	return (regionIndex * COUNTERS_PER_REGION) + counterOffset;
+	return GLOBAL_COUNTER_COUNT + (regionIndex * COUNTERS_PER_REGION) + counterOffset;
+}
+
+void registerActiveRegion(uint regionIndex) {
+	uint regionActiveCounterIndex = regionCounterIndex(regionIndex, REGION_ACTIVE_MARK_OFFSET);
+	if (atomicCompSwap(counterValues[regionActiveCounterIndex], 0u, 1u) != 0u) {
+		return;
+	}
+
+	uint activeRegionSlot = atomicAdd(counterValues[GLOBAL_ACTIVE_REGION_COUNT_OFFSET], 1u);
+	activeRegionIndices[activeRegionSlot] = regionIndex;
 }
 
 void writeCommand(uint slot, uint count, uint firstIndex, uint baseVertex, uint baseInstance) {
@@ -139,13 +157,20 @@ void emitLocalCommands(SectionCommandInput section, uint regionIndex, uint comma
 	uint baseElement = section.drawInfo.x;
 	uint baseVertex = section.drawInfo.y;
 	uint sectionSceneId = section.regionInfo.y;
+	bool regionActive = false;
 
 	for (uint facing = 0u; facing < FACING_COUNT; facing++) {
 		uint vertexCount = getVertexCount(section, facing);
 		uint elementCount = (vertexCount >> 2u) * 6u;
 
 		if (((visibleFaces >> facing) & 1u) != 0u) {
-			uint slot = commandBase + atomicAdd(counterValues[regionCounterIndex(regionIndex, REGION_COMMAND_COUNT_OFFSET)], 1u);
+			if (!regionActive) {
+				registerActiveRegion(regionIndex);
+				regionActive = true;
+			}
+
+			atomicAdd(counterValues[regionCounterIndex(regionIndex, REGION_COMMAND_COUNT_OFFSET)], 1u);
+			uint slot = commandBase + atomicAdd(counterValues[GLOBAL_COMMAND_COUNT_OFFSET], 1u);
 			writeCommand(slot, elementCount, baseElement, baseVertex, sectionSceneId);
 		}
 
@@ -160,6 +185,7 @@ void emitSharedCommands(SectionCommandInput section, uint regionIndex, uint comm
 	uint sectionSceneId = section.regionInfo.y;
 	uint visibleRunVertexCount = 0u;
 	bool previousVisible = false;
+	bool regionActive = false;
 
 	for (uint facing = 0u; facing <= FACING_COUNT; facing++) {
 		bool currentVisible = false;
@@ -180,7 +206,13 @@ void emitSharedCommands(SectionCommandInput section, uint regionIndex, uint comm
 				}
 
 				uint elementCount = (visibleRunVertexCount >> 2u) * 6u;
-				uint slot = commandBase + atomicAdd(counterValues[regionCounterIndex(regionIndex, REGION_COMMAND_COUNT_OFFSET)], 1u);
+				if (!regionActive) {
+					registerActiveRegion(regionIndex);
+					regionActive = true;
+				}
+
+				atomicAdd(counterValues[regionCounterIndex(regionIndex, REGION_COMMAND_COUNT_OFFSET)], 1u);
+				uint slot = commandBase + atomicAdd(counterValues[GLOBAL_COMMAND_COUNT_OFFSET], 1u);
 				writeCommand(slot, elementCount, baseElement, currentBaseVertex, sectionSceneId);
 				currentBaseVertex += visibleRunVertexCount;
 				visibleRunVertexCount = 0u;

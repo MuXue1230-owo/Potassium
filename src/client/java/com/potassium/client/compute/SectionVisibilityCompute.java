@@ -49,9 +49,13 @@ public final class SectionVisibilityCompute {
 		RenderRegion.REGION_WIDTH * RenderRegion.REGION_HEIGHT * RenderRegion.REGION_LENGTH;
 	private static final int REGION_DISPATCH_GROUP_COUNT_Y =
 		(MAX_REGION_SECTION_COUNT + LOCAL_SIZE_X - 1) / LOCAL_SIZE_X;
-	private static final int COUNTERS_PER_REGION = 2;
+	private static final int GLOBAL_COMMAND_COUNT_OFFSET = 0;
+	private static final int GLOBAL_ACTIVE_REGION_COUNT_OFFSET = 1;
+	private static final int GLOBAL_COUNTER_COUNT = 2;
+	private static final int COUNTERS_PER_REGION = 3;
 	private static final int REGION_COMMAND_COUNT_OFFSET = 0;
 	private static final int REGION_VISIBLE_SECTION_COUNT_OFFSET = 1;
+	private static final int REGION_ACTIVE_MARK_OFFSET = 2;
 	private static final int FLAG_USE_LOCAL_INDEX = 1;
 	private static final int FACING_COUNT = 7;
 	private static final int ALL_FACES_MASK = (1 << FACING_COUNT) - 1;
@@ -80,6 +84,7 @@ public final class SectionVisibilityCompute {
 	private static int sectionBufferHandle;
 	private static int regionDescriptorBufferHandle;
 	private static int counterBufferHandle;
+	private static int activeRegionBufferHandle;
 	private static int frustumPlanesLocation = -1;
 	private static int cameraPositionLocation = -1;
 	private static int cameraBlockPositionLocation = -1;
@@ -125,6 +130,7 @@ public final class SectionVisibilityCompute {
 			GpuResidentSectionMetadataStore.initialize();
 			regionDescriptorBufferHandle = GL45C.glCreateBuffers();
 			counterBufferHandle = GL45C.glCreateBuffers();
+			activeRegionBufferHandle = GL45C.glCreateBuffers();
 			frustumPlanesLocation = GL20C.glGetUniformLocation(programHandle, "uFrustumPlanes");
 			cameraPositionLocation = GL20C.glGetUniformLocation(programHandle, "uCameraPosition");
 			cameraBlockPositionLocation = GL20C.glGetUniformLocation(programHandle, "uCameraBlockPosition");
@@ -212,12 +218,18 @@ public final class SectionVisibilityCompute {
 		for (int regionIndex = 0; regionIndex < regionCount; regionIndex++) {
 			RegionBatchInput regionInput = regionInputs.get(regionIndex);
 			GpuResidentSectionMetadataStore.CachedRegionMetadata cachedMetadata =
-				GpuResidentSectionMetadataStore.resolveMetadata(regionInput, preferLocalIndices, translucentPass);
+				regionInput.renderList() != null
+					? GpuResidentSectionMetadataStore.resolveMetadata(regionInput, preferLocalIndices, translucentPass)
+					: GpuResidentSectionMetadataStore.peekCachedMetadata(regionInput.storage());
+			if (cachedMetadata == null) {
+				throw new IllegalStateException("Resident compute region is missing cached metadata.");
+			}
 			cachedMetadatas[regionIndex] = cachedMetadata;
 			testedSectionCounts[regionIndex] = cachedMetadata.sectionCount();
 			requiredRegionSlots = Math.max(requiredRegionSlots, cachedMetadata.regionSlot() + 1);
 		}
 
+		GpuResidentGeometryBookkeeping.flushPendingUploads();
 		GpuResidentSectionMetadataStore.preallocateSlotCapacity(requiredRegionSlots);
 
 		ByteBuffer descriptorView = thisFrameRegionDescriptorView(regionCount);
@@ -237,6 +249,7 @@ public final class SectionVisibilityCompute {
 		GL30C.glBindBufferBase(GL43C.GL_SHADER_STORAGE_BUFFER, 1, regionDescriptorBufferHandle);
 		GL30C.glBindBufferBase(GL43C.GL_SHADER_STORAGE_BUFFER, 2, counterBufferHandle);
 		commandBuffer.bindAsStorage(3);
+		GL30C.glBindBufferBase(GL43C.GL_SHADER_STORAGE_BUFFER, 4, activeRegionBufferHandle);
 		try {
 			GL20C.glUseProgram(programHandle);
 			GL20C.glUniform4fv(frustumPlanesLocation, frustumPlanes);
@@ -266,6 +279,7 @@ public final class SectionVisibilityCompute {
 			GL30C.glBindBufferBase(GL43C.GL_SHADER_STORAGE_BUFFER, 1, 0);
 			GL30C.glBindBufferBase(GL43C.GL_SHADER_STORAGE_BUFFER, 2, 0);
 			GL30C.glBindBufferBase(GL43C.GL_SHADER_STORAGE_BUFFER, 3, 0);
+			GL30C.glBindBufferBase(GL43C.GL_SHADER_STORAGE_BUFFER, 4, 0);
 		}
 
 		if (!readBackCounters) {
@@ -274,14 +288,24 @@ public final class SectionVisibilityCompute {
 				false,
 				testedSectionCounts,
 				scratch.commandCounts,
-				scratch.visibleSectionCounts
+				scratch.visibleSectionCounts,
+				0,
+				0
 			);
 		}
 
 		int[] commandCounts = scratch.commandCounts;
 		int[] visibleSectionCounts = scratch.visibleSectionCounts;
-		readCounters(regionInputs, regionCount, commandCounts, visibleSectionCounts);
-		return scratch.result.configure(true, true, testedSectionCounts, commandCounts, visibleSectionCounts);
+		CounterReadback counterReadback = readCounters(regionInputs, regionCount, commandCounts, visibleSectionCounts);
+		return scratch.result.configure(
+			true,
+			true,
+			testedSectionCounts,
+			commandCounts,
+			visibleSectionCounts,
+			counterReadback.totalCommandCount(),
+			counterReadback.activeRegionCount()
+		);
 	}
 
 	public static void bindCountersAsParameterBuffer() {
@@ -289,7 +313,11 @@ public final class SectionVisibilityCompute {
 	}
 
 	public static long commandCountOffsetBytes(int regionIndex) {
-		return (long) ((regionIndex * COUNTERS_PER_REGION) + REGION_COMMAND_COUNT_OFFSET) * Integer.BYTES;
+		return (long) (GLOBAL_COUNTER_COUNT + (regionIndex * COUNTERS_PER_REGION) + REGION_COMMAND_COUNT_OFFSET) * Integer.BYTES;
+	}
+
+	public static long totalCommandCountOffsetBytes() {
+		return (long) GLOBAL_COMMAND_COUNT_OFFSET * Integer.BYTES;
 	}
 
 	public static PackedRegionAnalysis debugAnalyzePackedRegion(
@@ -519,6 +547,26 @@ public final class SectionVisibilityCompute {
 		GpuResidentSectionMetadataStore.CachedRegionMetadata cachedMetadata =
 			GpuResidentSectionMetadataStore.resolveMetadata(regionInput, preferLocalIndices, translucentPass);
 		return new SectionSceneIds(
+			cachedMetadata.regionSlot(),
+			cachedMetadata.regionSceneId(),
+			cachedMetadata.packedIndexByLocalSection(),
+			cachedMetadata.packedSectionSceneIds()
+		);
+	}
+
+	public static SectionSceneIds resolveResidentSceneIds(SectionRenderDataStorage storage) {
+		if (storage == null) {
+			return SectionSceneIds.EMPTY;
+		}
+
+		GpuResidentSectionMetadataStore.CachedRegionMetadata cachedMetadata =
+			GpuResidentSectionMetadataStore.peekCachedMetadata(storage);
+		if (cachedMetadata == null) {
+			return SectionSceneIds.EMPTY;
+		}
+
+		return new SectionSceneIds(
+			cachedMetadata.regionSlot(),
 			cachedMetadata.regionSceneId(),
 			cachedMetadata.packedIndexByLocalSection(),
 			cachedMetadata.packedSectionSceneIds()
@@ -641,7 +689,7 @@ public final class SectionVisibilityCompute {
 	}
 
 	private static void resetCounters(int regionCount) {
-		long clearBytes = (long) regionCount * COUNTERS_PER_REGION * Integer.BYTES;
+		long clearBytes = (long) (GLOBAL_COUNTER_COUNT + (regionCount * COUNTERS_PER_REGION)) * Integer.BYTES;
 		if (clearBytes <= 0L) {
 			return;
 		}
@@ -658,7 +706,7 @@ public final class SectionVisibilityCompute {
 		);
 	}
 
-	private static void readCounters(
+	private static CounterReadback readCounters(
 		List<RegionBatchInput> regionInputs,
 		int regionCount,
 		int[] commandCounts,
@@ -666,11 +714,20 @@ public final class SectionVisibilityCompute {
 	) {
 		ByteBuffer readbackView = counterBufferView.duplicate().order(ByteOrder.nativeOrder());
 		readbackView.clear();
-		readbackView.limit(regionCount * COUNTERS_PER_REGION * Integer.BYTES);
+		readbackView.limit((GLOBAL_COUNTER_COUNT + (regionCount * COUNTERS_PER_REGION)) * Integer.BYTES);
 		GL45C.glGetNamedBufferSubData(counterBufferHandle, 0L, readbackView);
+		int totalCommandCount = readbackView.getInt(GLOBAL_COMMAND_COUNT_OFFSET * Integer.BYTES);
+		int activeRegionCount = readbackView.getInt(GLOBAL_ACTIVE_REGION_COUNT_OFFSET * Integer.BYTES);
+		int maxTotalCommandCount = 0;
+		if (totalCommandCount < 0) {
+			throw new IllegalStateException("Compute produced a negative totalCommandCount.");
+		}
+		if (activeRegionCount < 0 || activeRegionCount > regionCount) {
+			throw new IllegalStateException("Compute produced an invalid activeRegionCount.");
+		}
 
 		for (int regionIndex = 0; regionIndex < regionCount; regionIndex++) {
-			int baseOffset = regionIndex * COUNTERS_PER_REGION * Integer.BYTES;
+			int baseOffset = (GLOBAL_COUNTER_COUNT + (regionIndex * COUNTERS_PER_REGION)) * Integer.BYTES;
 			int commandCount = readbackView.getInt(baseOffset + (REGION_COMMAND_COUNT_OFFSET * Integer.BYTES));
 			int visibleSectionCount = readbackView.getInt(baseOffset + (REGION_VISIBLE_SECTION_COUNT_OFFSET * Integer.BYTES));
 			if (commandCount < 0) {
@@ -686,9 +743,15 @@ public final class SectionVisibilityCompute {
 				throw new IllegalStateException("Compute reported more visible sections than exist in one region.");
 			}
 
+			maxTotalCommandCount = Math.addExact(maxTotalCommandCount, regionInputs.get(regionIndex).maxCommandCount());
 			commandCounts[regionIndex] = commandCount;
 			visibleSectionCounts[regionIndex] = visibleSectionCount;
 		}
+		if (totalCommandCount > maxTotalCommandCount) {
+			throw new IllegalStateException("Compute generated more commands than the reserved indirect range for one pass.");
+		}
+
+		return new CounterReadback(totalCommandCount, activeRegionCount);
 	}
 
 	private static int checkedInt(long value, String label) {
@@ -718,6 +781,11 @@ public final class SectionVisibilityCompute {
 		if (counterBufferHandle != 0) {
 			GL15C.glDeleteBuffers(counterBufferHandle);
 			counterBufferHandle = 0;
+		}
+
+		if (activeRegionBufferHandle != 0) {
+			GL15C.glDeleteBuffers(activeRegionBufferHandle);
+			activeRegionBufferHandle = 0;
 		}
 
 		REGION_METADATA_CACHE.clear();
@@ -816,12 +884,14 @@ public final class SectionVisibilityCompute {
 		int newCapacity = nextCapacity(requiredRegions);
 		int regionDescriptorBytes = newCapacity * REGION_DESCRIPTOR_STRIDE_BYTES;
 		ByteBuffer newRegionDescriptorView = MemoryUtil.memAlloc(regionDescriptorBytes).order(ByteOrder.nativeOrder());
-		int counterBufferBytes = newCapacity * COUNTERS_PER_REGION * Integer.BYTES;
+		int counterBufferBytes = (GLOBAL_COUNTER_COUNT + (newCapacity * COUNTERS_PER_REGION)) * Integer.BYTES;
 		ByteBuffer newCounterBufferView = MemoryUtil.memAlloc(counterBufferBytes).order(ByteOrder.nativeOrder());
+		long activeRegionBufferBytes = (long) newCapacity * Integer.BYTES;
 
 		try {
 			GL45C.glNamedBufferData(regionDescriptorBufferHandle, regionDescriptorBytes, GL15C.GL_DYNAMIC_DRAW);
 			GL45C.glNamedBufferData(counterBufferHandle, counterBufferBytes, GL15C.GL_DYNAMIC_READ);
+			GL45C.glNamedBufferData(activeRegionBufferHandle, activeRegionBufferBytes, GL15C.GL_DYNAMIC_DRAW);
 		} catch (RuntimeException exception) {
 			MemoryUtil.memFree(newRegionDescriptorView);
 			MemoryUtil.memFree(newCounterBufferView);
@@ -1023,7 +1093,9 @@ public final class SectionVisibilityCompute {
 			false,
 			EMPTY_COUNTS,
 			EMPTY_COUNTS,
-			EMPTY_COUNTS
+			EMPTY_COUNTS,
+			0,
+			0
 		);
 
 		private boolean dispatched;
@@ -1031,19 +1103,25 @@ public final class SectionVisibilityCompute {
 		private int[] testedSectionCounts = EMPTY_COUNTS;
 		private int[] commandCounts = EMPTY_COUNTS;
 		private int[] visibleSectionCounts = EMPTY_COUNTS;
+		private int totalCommandCount;
+		private int activeRegionCount;
 
 		private ComputePassResult configure(
 			boolean dispatched,
 			boolean countersReadBack,
 			int[] testedSectionCounts,
 			int[] commandCounts,
-			int[] visibleSectionCounts
+			int[] visibleSectionCounts,
+			int totalCommandCount,
+			int activeRegionCount
 		) {
 			this.dispatched = dispatched;
 			this.countersReadBack = countersReadBack;
 			this.testedSectionCounts = testedSectionCounts;
 			this.commandCounts = commandCounts;
 			this.visibleSectionCounts = visibleSectionCounts;
+			this.totalCommandCount = totalCommandCount;
+			this.activeRegionCount = activeRegionCount;
 			return this;
 		}
 
@@ -1070,6 +1148,17 @@ public final class SectionVisibilityCompute {
 		public int[] visibleSectionCounts() {
 			return this.visibleSectionCounts;
 		}
+
+		public int totalCommandCount() {
+			return this.totalCommandCount;
+		}
+
+		public int activeRegionCount() {
+			return this.activeRegionCount;
+		}
+	}
+
+	private record CounterReadback(int totalCommandCount, int activeRegionCount) {
 	}
 
 	public record PackedRegionAnalysis(
@@ -1085,16 +1174,22 @@ public final class SectionVisibilityCompute {
 	}
 
 	public static final class SectionSceneIds {
-		private static final SectionSceneIds EMPTY = new SectionSceneIds(-1, new short[0], new int[0]);
+		private static final SectionSceneIds EMPTY = new SectionSceneIds(-1, -1, new short[0], new int[0]);
 
+		private final int regionSlot;
 		private final int regionSceneId;
 		private final short[] packedIndexByLocalSection;
 		private final int[] packedSectionSceneIds;
 
-		private SectionSceneIds(int regionSceneId, short[] packedIndexByLocalSection, int[] packedSectionSceneIds) {
+		private SectionSceneIds(int regionSlot, int regionSceneId, short[] packedIndexByLocalSection, int[] packedSectionSceneIds) {
+			this.regionSlot = regionSlot;
 			this.regionSceneId = regionSceneId;
 			this.packedIndexByLocalSection = packedIndexByLocalSection;
 			this.packedSectionSceneIds = packedSectionSceneIds;
+		}
+
+		public int regionSlot() {
+			return this.regionSlot;
 		}
 
 		public int regionSceneId() {

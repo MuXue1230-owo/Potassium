@@ -23,11 +23,11 @@
 
 ### 🧪 Naming Origin
 
-| Element | Symbol | Role |
-| :--- | :--- | :--- |
-| **Sodium** | Na | Base rendering optimization, high-performance foundation |
-| **Potassium** | K | **This Mod**: Provides more "reactive" advanced rendering features on top of Sodium |
-| **Lithium** | Li | Logic layer optimization (physics/entities), complementary to rendering |
+| Element       | Symbol | Role                                                                                |
+|:--------------|:-------|:------------------------------------------------------------------------------------|
+| **Sodium**    | Na     | Base rendering optimization, high-performance foundation                            |
+| **Potassium** | K      | **This Mod**: Provides more "reactive" advanced rendering features on top of Sodium |
+| **Lithium**   | Li     | Logic layer optimization (physics/entities), complementary to rendering             |
 
 > 💡 **Chemistry Pun**: Potassium lies below Sodium in the periodic table, both belonging to **alkali metals**. Potassium is more chemically reactive—just as this mod introduces more aggressive GPU features on top of Sodium!
 
@@ -37,21 +37,21 @@
 
 ### 🚀 Performance Improvements
 
-| Feature | Description | Expected Gain |
-| :--- | :--- | :--- |
-| **Indirect Drawing** | Batch submit draw commands using `glMultiDrawArraysIndirect` | Draw Calls reduced 10-100x |
-| **GPU Culling** | Frustum/Occlusion culling on GPU using Compute Shaders | CPU rendering overhead reduced 50%+ |
-| **Persistent Mapping** | Reduce CPU-GPU sync wait using `glBufferStorage` | More stable frame times, less stutter |
-| **DSA Support** | Direct State Access reduces state binding overhead | More efficient code, lower driver overhead |
+| Feature                | Description                                                  | Expected Gain                              |
+|:-----------------------|:-------------------------------------------------------------|:-------------------------------------------|
+| **Indirect Drawing**   | Batch submit draw commands using `glMultiDrawArraysIndirect` | Draw Calls reduced 10-100x                 |
+| **GPU Culling**        | Frustum/Occlusion culling on GPU using Compute Shaders       | CPU rendering overhead reduced 50%+        |
+| **Persistent Mapping** | Reduce CPU-GPU sync wait using `glBufferStorage`             | More stable frame times, less stutter      |
+| **DSA Support**        | Direct State Access reduces state binding overhead           | More efficient code, lower driver overhead |
 
 ### 📊 Performance Comparison (Expected)
 
-| Scenario | Sodium Native | Potassium | Improvement |
-| :--- | :--- | :--- | :--- |
-| Chunk Render Draw Calls | ~500/frame | ~5/frame | **99% ↓** |
-| CPU Render Time | ~8ms | ~2ms | **75% ↓** |
-| Ultra Far View (32+ chunks) | 30-40 FPS | 60-80 FPS | **2x+** |
-| Complex Terrain Frame Variance | ±15 FPS | ±5 FPS | **More Stable** |
+| Scenario                       | Sodium Native | Potassium | Improvement     |
+|:-------------------------------|:--------------|:----------|:----------------|
+| Chunk Render Draw Calls        | ~500/frame    | ~5/frame  | **99% ↓**       |
+| CPU Render Time                | ~8ms          | ~2ms      | **75% ↓**       |
+| Ultra Far View (32+ chunks)    | 30-40 FPS     | 60-80 FPS | **2x+**         |
+| Complex Terrain Frame Variance | ±15 FPS       | ±5 FPS    | **More Stable** |
 
 > ⚠️ Data above is theoretical expectation. Actual performance depends on hardware configuration and game scene.
 
@@ -61,22 +61,22 @@
 
 ### Hard Requirements (Will not run if not met)
 
-| Component | Requirement | Note |
-| :--- | :--- | :--- |
-| **Minecraft** | 1.20.4+ | Based on Fabric Loader |
-| **Java** | 17+ | 64-bit JVM required |
-| **Sodium** | 0.5.0+ | Must be installed as a dependency |
-| **OpenGL** | **4.5+** | **Core requirement, NO fallback** |
-| **OS** | Windows / Linux | **macOS NOT supported** |
+| Component     | Requirement     | Note                              |
+|:--------------|:----------------|:----------------------------------|
+| **Minecraft** | 26.1            | Based on Fabric Loader            |
+| **Java**      | 25+             | 64-bit JVM required               |
+| **Sodium**    | 1.8.7+          | Must be installed as a dependency |
+| **OpenGL**    | **4.5+**        | **Core requirement, NO fallback** |
+| **OS**        | Windows / Linux | **macOS NOT supported**           |
 
 ### Recommended Configuration
 
-| Component | Recommended |
-| :--- | :--- |
-| **GPU** | NVIDIA GTX 1060+ / AMD RX 580+ / Intel Arc A380+ |
-| **VRAM** | 4GB+ |
-| **Driver** | Latest version (released after 2023) |
-| **RAM** | 8GB+ (4GB+ allocated to Minecraft) |
+| Component  | Recommended                                      |
+|:-----------|:-------------------------------------------------|
+| **GPU**    | NVIDIA GTX 1060+ / AMD RX 580+ / Intel Arc A380+ |
+| **VRAM**   | 4GB+                                             |
+| **Driver** | Latest version (released after 2023)             |
+| **RAM**    | 8GB+ (4GB+ allocated to Minecraft)               |
 
 ### ❌ Unsupported Devices
 
@@ -137,14 +137,14 @@ Config file located at `config/potassium.json`:
 
 ### Config Options
 
-| Option | Default | Description |
-| :--- | :--- | :--- |
-| `enable_indirect_draw` | true | Enable Indirect Drawing (Core Feature) |
-| `enable_gpu_culling` | true | Enable GPU-side culling (Requires Compute Shader) |
-| `enable_persistent_mapping` | true | Enable Persistent Mapping Buffers |
-| `debug_overlay` | false | Show rendering debug info (F3 Screen) |
-| `max_indirect_draw_count` | 65536 | Max indirect draw command count |
-| `buffer_size_mb` | 256 | Command buffer size (MB) |
+| Option                      | Default | Description                                       |
+|:----------------------------|:--------|:--------------------------------------------------|
+| `enable_indirect_draw`      | true    | Enable Indirect Drawing (Core Feature)            |
+| `enable_gpu_culling`        | true    | Enable GPU-side culling (Requires Compute Shader) |
+| `enable_persistent_mapping` | true    | Enable Persistent Mapping Buffers                 |
+| `debug_overlay`             | false   | Show rendering debug info (F3 Screen)             |
+| `max_indirect_draw_count`   | 65536   | Max indirect draw command count                   |
+| `buffer_size_mb`            | 256     | Command buffer size (MB)                          |
 
 ---
 
@@ -174,13 +174,13 @@ Config file located at `config/potassium.json`:
 
 ### Core Modules
 
-| Module | Description |
-| :--- | :--- |
-| `GLCapabilities` | OpenGL capability detection and version validation |
-| `IndirectCommandBuffer` | Indirect draw command buffer management |
-| `GpuCullingPipeline` | GPU-side culling compute pipeline |
-| `PersistentBuffer` | Persistent mapping buffer wrapper |
-| `SodiumBridge` | Sodium rendering backend adaptation layer |
+| Module                  | Description                                        |
+|:------------------------|:---------------------------------------------------|
+| `GLCapabilities`        | OpenGL capability detection and version validation |
+| `IndirectCommandBuffer` | Indirect draw command buffer management            |
+| `GpuCullingPipeline`    | GPU-side culling compute pipeline                  |
+| `PersistentBuffer`      | Persistent mapping buffer wrapper                  |
+| `SodiumBridge`          | Sodium rendering backend adaptation layer          |
 
 ---
 

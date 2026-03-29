@@ -147,19 +147,12 @@ public final class IndexedIndirectCommandBuffer implements AutoCloseable {
 		return this.commandCount;
 	}
 
-	public void bindCommandRangeAsStorage(int binding, int firstCommandIndex, int commandCapacity) {
-		if (firstCommandIndex < 0 || firstCommandIndex > this.capacityCommands) {
-			throw new IllegalArgumentException("firstCommandIndex is out of range.");
-		}
-		if (commandCapacity <= 0 || firstCommandIndex + commandCapacity > this.capacityCommands) {
-			throw new IllegalArgumentException("commandCapacity is out of range.");
-		}
-
+	public void bindAsStorage(int binding) {
 		this.gpuBuffer.bindRange(
 			GL43C.GL_SHADER_STORAGE_BUFFER,
 			binding,
-			this.drawOffsetBytes(firstCommandIndex),
-			(long) commandCapacity * COMMAND_STRIDE_BYTES
+			this.gpuBuffer.activeBaseOffsetBytes(),
+			toByteSize(this.capacityCommands)
 		);
 	}
 

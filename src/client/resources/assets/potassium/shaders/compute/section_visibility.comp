@@ -2,16 +2,176 @@
 
 layout(local_size_x = 64) in;
 
-layout(std430, binding = 0) readonly buffer SectionInputs {
-	vec4 sectionSphere[];
+const uint FACING_COUNT = 7u;
+const uint MODEL_POS_X = 0u;
+const uint MODEL_POS_Y = 1u;
+const uint MODEL_POS_Z = 2u;
+const uint MODEL_NEG_X = 3u;
+const uint MODEL_NEG_Y = 4u;
+const uint MODEL_NEG_Z = 5u;
+const uint MODEL_UNASSIGNED = 6u;
+const uint FLAG_USE_LOCAL_INDEX = 1u;
+const uint COMMAND_WORD_STRIDE = 5u;
+const uint ALL_FACES_MASK = (1u << FACING_COUNT) - 1u;
+
+struct SectionCommandInput {
+	vec4 sphere;
+	ivec4 sectionInfo;
+	uvec4 drawInfo;
+	uvec4 vertexCounts0;
+	uvec4 vertexCounts1;
 };
 
-layout(std430, binding = 1) writeonly buffer SectionVisibility {
-	uint visibility[];
+layout(std430, binding = 0) readonly buffer SectionInputs {
+	SectionCommandInput sections[];
+};
+
+layout(std430, binding = 1) buffer CommandCounters {
+	uint counterValues[];
+};
+
+layout(std430, binding = 2) buffer IndirectCommands {
+	uint commandWords[];
 };
 
 uniform vec4 uFrustumPlanes[6];
 uniform uint uSectionCount;
+uniform ivec3 uCameraBlockPosition;
+uniform uint uUseBlockFaceCulling;
+uniform uint uCommandBaseIndex;
+
+bool isSphereVisible(vec4 sphere) {
+	vec3 center = sphere.xyz;
+	float radius = sphere.w;
+
+	for (int planeIndex = 0; planeIndex < 6; planeIndex++) {
+		vec4 plane = uFrustumPlanes[planeIndex];
+		if (dot(plane.xyz, center) + plane.w < -radius) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+uint getVertexCount(SectionCommandInput section, uint facing) {
+	if (facing < 4u) {
+		return section.vertexCounts0[int(facing)];
+	}
+
+	return section.vertexCounts1[int(facing - 4u)];
+}
+
+uint getFaceOrder(SectionCommandInput section, uint facing) {
+	uint shift = facing * 8u;
+	if (shift < 32u) {
+		return (section.drawInfo.z >> shift) & 0xFFu;
+	}
+
+	return (section.drawInfo.w >> (shift - 32u)) & 0xFFu;
+}
+
+uint computeVisibleFaces(ivec3 sectionChunkPosition) {
+	if (uUseBlockFaceCulling == 0u) {
+		return ALL_FACES_MASK;
+	}
+
+	int sectionMinX = sectionChunkPosition.x << 4;
+	int sectionMinY = sectionChunkPosition.y << 4;
+	int sectionMinZ = sectionChunkPosition.z << 4;
+	int sectionMaxX = sectionMinX + 16;
+	int sectionMaxY = sectionMinY + 16;
+	int sectionMaxZ = sectionMinZ + 16;
+	uint visibleFaces = 1u << MODEL_UNASSIGNED;
+
+	if (uCameraBlockPosition.x > sectionMinX - 3) {
+		visibleFaces |= 1u << MODEL_POS_X;
+	}
+	if (uCameraBlockPosition.y > sectionMinY - 3) {
+		visibleFaces |= 1u << MODEL_POS_Y;
+	}
+	if (uCameraBlockPosition.z > sectionMinZ - 3) {
+		visibleFaces |= 1u << MODEL_POS_Z;
+	}
+	if (uCameraBlockPosition.x < sectionMaxX + 3) {
+		visibleFaces |= 1u << MODEL_NEG_X;
+	}
+	if (uCameraBlockPosition.y < sectionMaxY + 3) {
+		visibleFaces |= 1u << MODEL_NEG_Y;
+	}
+	if (uCameraBlockPosition.z < sectionMaxZ + 3) {
+		visibleFaces |= 1u << MODEL_NEG_Z;
+	}
+
+	return visibleFaces;
+}
+
+void writeCommand(uint slot, uint count, uint firstIndex, uint baseVertex) {
+	uint commandWordIndex = (uCommandBaseIndex + slot) * COMMAND_WORD_STRIDE;
+	commandWords[commandWordIndex] = count;
+	commandWords[commandWordIndex + 1u] = 1u;
+	commandWords[commandWordIndex + 2u] = firstIndex;
+	commandWords[commandWordIndex + 3u] = baseVertex;
+	commandWords[commandWordIndex + 4u] = 0u;
+}
+
+void emitLocalCommands(SectionCommandInput section, uint visibleFaces) {
+	uint baseElement = section.drawInfo.x;
+	uint baseVertex = section.drawInfo.y;
+
+	for (uint facing = 0u; facing < FACING_COUNT; facing++) {
+		uint vertexCount = getVertexCount(section, facing);
+		uint elementCount = (vertexCount >> 2u) * 6u;
+
+		if (((visibleFaces >> facing) & 1u) != 0u) {
+			uint slot = atomicAdd(counterValues[0], 1u);
+			writeCommand(slot, elementCount, baseElement, baseVertex);
+		}
+
+		baseVertex += vertexCount;
+		baseElement += elementCount;
+	}
+}
+
+void emitSharedCommands(SectionCommandInput section, uint visibleFaces) {
+	uint baseElement = section.drawInfo.x;
+	uint currentBaseVertex = section.drawInfo.y;
+	uint visibleRunVertexCount = 0u;
+	bool previousVisible = false;
+
+	for (uint facing = 0u; facing <= FACING_COUNT; facing++) {
+		bool currentVisible = false;
+		uint vertexCount = 0u;
+
+		if (facing < FACING_COUNT) {
+			vertexCount = getVertexCount(section, facing);
+			if (vertexCount != 0u) {
+				uint faceOrder = getFaceOrder(section, facing);
+				currentVisible = ((visibleFaces >> faceOrder) & 1u) != 0u;
+			}
+		}
+
+		if (!currentVisible) {
+			if (previousVisible) {
+				if (facing < FACING_COUNT && vertexCount == 0u) {
+					continue;
+				}
+
+				uint elementCount = (visibleRunVertexCount >> 2u) * 6u;
+				uint slot = atomicAdd(counterValues[0], 1u);
+				writeCommand(slot, elementCount, baseElement, currentBaseVertex);
+				currentBaseVertex += visibleRunVertexCount;
+				visibleRunVertexCount = 0u;
+			}
+
+			currentBaseVertex += vertexCount;
+		} else {
+			visibleRunVertexCount += vertexCount;
+		}
+
+		previousVisible = currentVisible;
+	}
+}
 
 void main() {
 	uint index = gl_GlobalInvocationID.x;
@@ -19,18 +179,20 @@ void main() {
 		return;
 	}
 
-	vec4 sphere = sectionSphere[index];
-	vec3 center = sphere.xyz;
-	float radius = sphere.w;
-	uint visible = 1u;
-
-	for (int planeIndex = 0; planeIndex < 6; planeIndex++) {
-		vec4 plane = uFrustumPlanes[planeIndex];
-		if (dot(plane.xyz, center) + plane.w < -radius) {
-			visible = 0u;
-			break;
-		}
+	SectionCommandInput section = sections[index];
+	if (!isSphereVisible(section.sphere)) {
+		return;
 	}
 
-	visibility[index] = visible;
+	atomicAdd(counterValues[1], 1u);
+	uint visibleFaces = computeVisibleFaces(section.sectionInfo.xyz) & uint(section.sectionInfo.w);
+	if (visibleFaces == 0u) {
+		return;
+	}
+
+	if ((section.vertexCounts1.w & FLAG_USE_LOCAL_INDEX) != 0u) {
+		emitLocalCommands(section, visibleFaces);
+	} else {
+		emitSharedCommands(section, visibleFaces);
+	}
 }

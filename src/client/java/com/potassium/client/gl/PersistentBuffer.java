@@ -8,7 +8,7 @@ import org.lwjgl.opengl.GL32C;
 import org.lwjgl.opengl.GL45C;
 
 public final class PersistentBuffer implements AutoCloseable {
-	private static final int PERSISTENT_SEGMENT_COUNT = 3;
+	private static final int DEFAULT_PERSISTENT_SEGMENT_COUNT = 3;
 	private static final long FENCE_POLL_TIMEOUT_NANOS = 1_000_000L;
 
 	private final int target;
@@ -25,9 +25,13 @@ public final class PersistentBuffer implements AutoCloseable {
 	private boolean frameWritten;
 
 	public PersistentBuffer(int target, long initialCapacityBytes, boolean persistentMappingEnabled) {
+		this(target, initialCapacityBytes, persistentMappingEnabled, DEFAULT_PERSISTENT_SEGMENT_COUNT);
+	}
+
+	public PersistentBuffer(int target, long initialCapacityBytes, boolean persistentMappingEnabled, int persistentSegmentCount) {
 		this.target = target;
 		this.persistentMappingEnabled = persistentMappingEnabled;
-		this.segmentCount = persistentMappingEnabled ? PERSISTENT_SEGMENT_COUNT : 1;
+		this.segmentCount = persistentMappingEnabled ? Math.max(persistentSegmentCount, 2) : 1;
 		this.segmentFences = new long[this.segmentCount];
 		this.allocateStorage(initialCapacityBytes);
 	}
@@ -118,6 +122,10 @@ public final class PersistentBuffer implements AutoCloseable {
 
 	public boolean isPersistentMappingEnabled() {
 		return this.persistentMappingEnabled;
+	}
+
+	public int segmentCount() {
+		return this.segmentCount;
 	}
 
 	public long activeBaseOffsetBytes() {

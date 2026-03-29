@@ -26,12 +26,17 @@ public final class IndexedIndirectCommandBuffer implements AutoCloseable {
 	private boolean gpuGeneratedCommandsPresent;
 
 	public IndexedIndirectCommandBuffer(int initialCapacityCommands, boolean persistentMappingEnabled) {
+		this(initialCapacityCommands, persistentMappingEnabled, 3);
+	}
+
+	public IndexedIndirectCommandBuffer(int initialCapacityCommands, boolean persistentMappingEnabled, int persistentSegmentCount) {
 		this.capacityCommands = Math.max(initialCapacityCommands, 1);
 		this.commandStream = allocateCommandStream(this.capacityCommands);
 		this.gpuBuffer = new PersistentBuffer(
 			GL40C.GL_DRAW_INDIRECT_BUFFER,
 			toByteSize(this.capacityCommands),
-			persistentMappingEnabled
+			persistentMappingEnabled,
+			persistentSegmentCount
 		);
 	}
 
@@ -215,6 +220,10 @@ public final class IndexedIndirectCommandBuffer implements AutoCloseable {
 
 	public boolean usesPersistentMapping() {
 		return this.gpuBuffer.isPersistentMappingEnabled();
+	}
+
+	public int segmentCount() {
+		return this.gpuBuffer.segmentCount();
 	}
 
 	public int usedBytes() {

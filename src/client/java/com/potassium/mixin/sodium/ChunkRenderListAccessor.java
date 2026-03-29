@@ -10,4 +10,8 @@ public interface ChunkRenderListAccessor extends ChunkRenderListOrdering {
 	@Override
 	@Accessor("sectionsWithGeometry")
 	byte[] potassium$getSectionsWithGeometry();
+
+	@Override
+	@Accessor("sectionsWithGeometryMap")
+	long[] potassium$getSectionsWithGeometryMap();
 }

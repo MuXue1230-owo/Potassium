@@ -2,18 +2,22 @@ package com.potassium.client.compute;
 
 import com.potassium.client.PotassiumClientMod;
 import com.potassium.client.compat.sodium.ChunkRenderListOrdering;
+import com.potassium.client.compat.sodium.SectionRenderDataStorageDirtyTracker;
 import com.potassium.client.compat.sodium.SectionRenderDataStorageVersioned;
 import com.potassium.client.gl.GLCapabilities;
+import com.potassium.client.gl.GpuMemoryBudget;
 import com.potassium.client.render.indirect.IndexedIndirectCommandBuffer;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.IntBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.WeakHashMap;
 import net.caffeinemc.mods.sodium.client.render.chunk.ChunkRenderMatrices;
+import net.caffeinemc.mods.sodium.client.render.chunk.DefaultChunkRenderer;
 import net.caffeinemc.mods.sodium.client.render.chunk.LocalSectionIndex;
 import net.caffeinemc.mods.sodium.client.render.chunk.data.SectionRenderDataStorage;
 import net.caffeinemc.mods.sodium.client.render.chunk.data.SectionRenderDataUnsafe;
@@ -48,8 +52,14 @@ public final class SectionVisibilityCompute {
 	private static final int REGION_COMMAND_COUNT_OFFSET = 0;
 	private static final int REGION_VISIBLE_SECTION_COUNT_OFFSET = 1;
 	private static final int FLAG_USE_LOCAL_INDEX = 1;
+	private static final int FACING_COUNT = 7;
+	private static final int ALL_FACES_MASK = (1 << FACING_COUNT) - 1;
 	private static final float SECTION_BOUNDING_RADIUS = 14.0f;
+	private static final float SECTION_PADDED_HALF_EXTENT = 9.125f;
+	private static final boolean ENABLE_REGION_METADATA_CACHE = true;
 	private static final Map<SectionRenderDataStorage, CachedRegionMetadata> REGION_METADATA_CACHE = new WeakHashMap<>();
+	private static final ThreadLocal<long[]> DIRTY_SECTION_WORDS =
+		ThreadLocal.withInitial(() -> new long[(MAX_REGION_SECTION_COUNT + Long.SIZE - 1) / Long.SIZE]);
 
 	private static boolean enabled;
 	private static String disableReason = "not initialized";
@@ -66,6 +76,8 @@ public final class SectionVisibilityCompute {
 	private static int nextRegionSlot;
 	private static ByteBuffer regionDescriptorView;
 	private static ByteBuffer counterBufferView;
+	private static ByteBuffer sectionUploadView;
+	private static IntBuffer counterClearValue;
 
 	private SectionVisibilityCompute() {
 	}
@@ -89,9 +101,16 @@ public final class SectionVisibilityCompute {
 			cameraPositionLocation = GL20C.glGetUniformLocation(programHandle, "uCameraPosition");
 			cameraBlockPositionLocation = GL20C.glGetUniformLocation(programHandle, "uCameraBlockPosition");
 			useBlockFaceCullingLocation = GL20C.glGetUniformLocation(programHandle, "uUseBlockFaceCulling");
+			counterClearValue = MemoryUtil.memCallocInt(1);
+			preallocateWorkingSet();
 			enabled = true;
 			disableReason = "none";
-			PotassiumClientMod.LOGGER.info("Section visibility compute shader ready");
+			PotassiumClientMod.LOGGER.info(
+				"Section visibility compute shader ready (preallocated regionSlots={}, regionDescriptors={}, sectionBuffer={} MiB)",
+				regionSlotCapacity,
+				regionDescriptorCapacity,
+				sectionBufferBytes(regionSlotCapacity) / (1024L * 1024L)
+			);
 		} catch (RuntimeException exception) {
 			disable("initialization failed", exception);
 		}
@@ -127,7 +146,13 @@ public final class SectionVisibilityCompute {
 			destination[offset] = plane.x;
 			destination[offset + 1] = plane.y;
 			destination[offset + 2] = plane.z;
-			destination[offset + 3] = plane.w;
+			destination[offset + 3] =
+				-(
+					plane.w +
+					(plane.x < 0.0f ? -SECTION_PADDED_HALF_EXTENT : SECTION_PADDED_HALF_EXTENT) * plane.x +
+					(plane.y < 0.0f ? -SECTION_PADDED_HALF_EXTENT : SECTION_PADDED_HALF_EXTENT) * plane.y +
+					(plane.z < 0.0f ? -SECTION_PADDED_HALF_EXTENT : SECTION_PADDED_HALF_EXTENT) * plane.z
+				);
 		}
 	}
 
@@ -153,7 +178,7 @@ public final class SectionVisibilityCompute {
 
 		for (int regionIndex = 0; regionIndex < regionInputs.size(); regionIndex++) {
 			RegionBatchInput regionInput = regionInputs.get(regionIndex);
-			CachedRegionMetadata cachedMetadata = getOrBuildCachedMetadata(regionInput, preferLocalIndices);
+			CachedRegionMetadata cachedMetadata = getOrBuildCachedMetadata(regionInput, preferLocalIndices, translucentPass);
 			cachedMetadatas[regionIndex] = cachedMetadata;
 			testedSectionCounts[regionIndex] = cachedMetadata.sectionCount();
 			requiredRegionSlots = Math.max(requiredRegionSlots, cachedMetadata.regionSlot() + 1);
@@ -233,6 +258,79 @@ public final class SectionVisibilityCompute {
 		return (long) ((regionIndex * COUNTERS_PER_REGION) + REGION_COMMAND_COUNT_OFFSET) * Integer.BYTES;
 	}
 
+	public static PackedRegionAnalysis debugAnalyzePackedRegion(
+		RegionBatchInput regionInput,
+		CameraTransform cameraTransform,
+		boolean useBlockFaceCulling,
+		boolean preferLocalIndices
+	) {
+		CachedRegionMetadata cachedMetadata = getOrBuildCachedMetadata(regionInput, preferLocalIndices, false);
+		ByteBuffer metadataView = ByteBuffer.wrap(cachedMetadata.templateBytes()).order(ByteOrder.nativeOrder());
+		int sectionCount = cachedMetadata.sectionCount();
+		int sliceMaskedSectionCount = 0;
+		int visibleSectionCount = 0;
+		int emittedCommandCount = 0;
+		int localSectionCount = 0;
+		int sharedSectionCount = 0;
+		int firstVisibleFacesMask = 0;
+		int firstSliceMask = 0;
+		boolean capturedFirstVisibleSection = false;
+
+		for (int sectionIndex = 0; sectionIndex < sectionCount; sectionIndex++) {
+			int sectionOffsetBytes = sectionIndex * INPUT_STRIDE_BYTES;
+			int sectionChunkX = metadataView.getInt(sectionOffsetBytes + (Integer.BYTES * 4));
+			int sectionChunkY = metadataView.getInt(sectionOffsetBytes + (Integer.BYTES * 5));
+			int sectionChunkZ = metadataView.getInt(sectionOffsetBytes + (Integer.BYTES * 6));
+			int sliceMask = metadataView.getInt(sectionOffsetBytes + (Integer.BYTES * 7));
+			if (sliceMask != 0) {
+				sliceMaskedSectionCount++;
+			}
+
+			int visibleFaces = useBlockFaceCulling
+				? DefaultChunkRenderer.getVisibleFaces(
+					cameraTransform.intX,
+					cameraTransform.intY,
+					cameraTransform.intZ,
+					sectionChunkX,
+					sectionChunkY,
+					sectionChunkZ
+				)
+				: ALL_FACES_MASK;
+			visibleFaces &= sliceMask;
+			if (visibleFaces == 0) {
+				continue;
+			}
+
+			visibleSectionCount++;
+			if (!capturedFirstVisibleSection) {
+				firstVisibleFacesMask = visibleFaces;
+				firstSliceMask = sliceMask;
+				capturedFirstVisibleSection = true;
+			}
+
+			int flags = metadataView.getInt(sectionOffsetBytes + (Integer.BYTES * 22));
+			boolean useLocalIndex = preferLocalIndices && (flags & FLAG_USE_LOCAL_INDEX) != 0;
+			if (useLocalIndex) {
+				localSectionCount++;
+				emittedCommandCount += Integer.bitCount(visibleFaces & ALL_FACES_MASK);
+			} else {
+				sharedSectionCount++;
+				emittedCommandCount += countSharedCommands(metadataView, sectionOffsetBytes, visibleFaces);
+			}
+		}
+
+		return new PackedRegionAnalysis(
+			sectionCount,
+			sliceMaskedSectionCount,
+			visibleSectionCount,
+			emittedCommandCount,
+			localSectionCount,
+			sharedSectionCount,
+			firstVisibleFacesMask,
+			firstSliceMask
+		);
+	}
+
 	public static void shutdown() {
 		enabled = false;
 		releaseResources();
@@ -246,7 +344,11 @@ public final class SectionVisibilityCompute {
 		return descriptorView;
 	}
 
-	private static CachedRegionMetadata getOrBuildCachedMetadata(RegionBatchInput regionInput, boolean preferLocalIndices) {
+	private static CachedRegionMetadata getOrBuildCachedMetadata(
+		RegionBatchInput regionInput,
+		boolean preferLocalIndices,
+		boolean translucentPass
+	) {
 		ChunkRenderList renderList = regionInput.renderList();
 		SectionRenderDataStorage storage = regionInput.storage();
 		if (!(renderList instanceof ChunkRenderListOrdering ordering)) {
@@ -255,13 +357,41 @@ public final class SectionVisibilityCompute {
 		if (!(storage instanceof SectionRenderDataStorageVersioned versioned)) {
 			throw new IllegalStateException("Potassium section render storage version mixin is not applied.");
 		}
+		if (!(storage instanceof SectionRenderDataStorageDirtyTracker dirtyTracker)) {
+			throw new IllegalStateException("Potassium section render dirty-tracker mixin is not applied.");
+		}
 
 		byte[] sectionsWithGeometry = ordering.potassium$getSectionsWithGeometry();
+		long[] sectionsWithGeometryMap = ordering.potassium$getSectionsWithGeometryMap();
 		int sectionCount = renderList.getSectionsWithGeometryCount();
 		int storageVersion = versioned.potassium$getStorageVersion();
+		boolean preserveSectionOrder = translucentPass;
 		CachedRegionMetadata cachedMetadata = REGION_METADATA_CACHE.get(storage);
-		if (cachedMetadata != null && cachedMetadata.matches(storageVersion, preferLocalIndices, sectionsWithGeometry, sectionCount)) {
-			return cachedMetadata;
+		if (ENABLE_REGION_METADATA_CACHE && cachedMetadata != null) {
+			if (
+				cachedMetadata.matchesLayout(
+					preferLocalIndices,
+					preserveSectionOrder,
+					sectionsWithGeometry,
+					sectionsWithGeometryMap,
+					sectionCount
+				)
+			) {
+				if (cachedMetadata.storageVersion() == storageVersion) {
+					return cachedMetadata;
+				}
+
+				if (dirtyTracker.potassium$isFullMetadataDirty()) {
+					// Rebuild below.
+				} else {
+					long[] dirtySectionWords = DIRTY_SECTION_WORDS.get();
+					dirtyTracker.potassium$copyDirtySectionBits(dirtySectionWords);
+					if (cachedMetadata.refreshDirtySections(regionInput, storageVersion, preferLocalIndices, dirtySectionWords)) {
+						dirtyTracker.potassium$clearMetadataDirty();
+						return cachedMetadata;
+					}
+				}
+			}
 		}
 
 		int regionSlot = cachedMetadata != null ? cachedMetadata.regionSlot() : nextRegionSlot++;
@@ -269,11 +399,14 @@ public final class SectionVisibilityCompute {
 			regionInput,
 			storageVersion,
 			preferLocalIndices,
+			preserveSectionOrder,
 			sectionsWithGeometry,
+			sectionsWithGeometryMap,
 			sectionCount,
 			regionSlot
 		);
 		REGION_METADATA_CACHE.put(storage, rebuiltMetadata);
+		dirtyTracker.potassium$clearMetadataDirty();
 		return rebuiltMetadata;
 	}
 
@@ -281,7 +414,9 @@ public final class SectionVisibilityCompute {
 		RegionBatchInput regionInput,
 		int storageVersion,
 		boolean preferLocalIndices,
+		boolean preserveSectionOrder,
 		byte[] sectionsWithGeometry,
+		long[] sectionsWithGeometryMap,
 		int sectionCount,
 		int regionSlot
 	) {
@@ -290,47 +425,107 @@ public final class SectionVisibilityCompute {
 		int regionChunkX = region.getChunkX();
 		int regionChunkY = region.getChunkY();
 		int regionChunkZ = region.getChunkZ();
-		byte[] sectionOrderSnapshot = new byte[sectionCount];
-		System.arraycopy(sectionsWithGeometry, 0, sectionOrderSnapshot, 0, sectionCount);
+		byte[] sectionOrderSnapshot = preserveSectionOrder
+			? snapshotSectionOrder(sectionsWithGeometry, sectionCount)
+			: buildStableSectionOrder(sectionsWithGeometryMap, sectionCount);
+		long[] geometryMapSnapshot = preserveSectionOrder ? null : sectionsWithGeometryMap.clone();
 		byte[] templateBytes = new byte[sectionCount * INPUT_STRIDE_BYTES];
 		ByteBuffer metadataView = ByteBuffer.wrap(templateBytes).order(ByteOrder.nativeOrder());
 
 		for (int sectionIndex = 0; sectionIndex < sectionCount; sectionIndex++) {
 			int localSectionIndex = Byte.toUnsignedInt(sectionOrderSnapshot[sectionIndex]);
-			long dataPointer = storage.getDataPointer(localSectionIndex);
-			int sectionChunkX = regionChunkX + LocalSectionIndex.unpackX(localSectionIndex);
-			int sectionChunkY = regionChunkY + LocalSectionIndex.unpackY(localSectionIndex);
-			int sectionChunkZ = regionChunkZ + LocalSectionIndex.unpackZ(localSectionIndex);
-			long facingList = SectionRenderDataUnsafe.getFacingList(dataPointer);
-			int flags = preferLocalIndices && SectionRenderDataUnsafe.isLocalIndex(dataPointer) ? FLAG_USE_LOCAL_INDEX : 0;
-
-			metadataView.putFloat((sectionChunkX << 4) + 8.0f);
-			metadataView.putFloat((sectionChunkY << 4) + 8.0f);
-			metadataView.putFloat((sectionChunkZ << 4) + 8.0f);
-			metadataView.putFloat(SECTION_BOUNDING_RADIUS);
-			metadataView.putInt(sectionChunkX);
-			metadataView.putInt(sectionChunkY);
-			metadataView.putInt(sectionChunkZ);
-			metadataView.putInt(SectionRenderDataUnsafe.getSliceMask(dataPointer));
-			metadataView.putInt(checkedInt(SectionRenderDataUnsafe.getBaseElement(dataPointer), "baseElement"));
-			metadataView.putInt(checkedInt(SectionRenderDataUnsafe.getBaseVertex(dataPointer), "baseVertex"));
-			metadataView.putInt((int) facingList);
-			metadataView.putInt((int) (facingList >>> Integer.SIZE));
-			metadataView.putInt(checkedInt(SectionRenderDataUnsafe.getVertexCount(dataPointer, 0), "vertexCount[0]"));
-			metadataView.putInt(checkedInt(SectionRenderDataUnsafe.getVertexCount(dataPointer, 1), "vertexCount[1]"));
-			metadataView.putInt(checkedInt(SectionRenderDataUnsafe.getVertexCount(dataPointer, 2), "vertexCount[2]"));
-			metadataView.putInt(checkedInt(SectionRenderDataUnsafe.getVertexCount(dataPointer, 3), "vertexCount[3]"));
-			metadataView.putInt(checkedInt(SectionRenderDataUnsafe.getVertexCount(dataPointer, 4), "vertexCount[4]"));
-			metadataView.putInt(checkedInt(SectionRenderDataUnsafe.getVertexCount(dataPointer, 5), "vertexCount[5]"));
-			metadataView.putInt(checkedInt(SectionRenderDataUnsafe.getVertexCount(dataPointer, 6), "vertexCount[6]"));
-			metadataView.putInt(0);
-			metadataView.putInt(0);
-			metadataView.putInt(0);
-			metadataView.putInt(flags);
-			metadataView.putInt(0);
+			writeSectionMetadata(
+				metadataView,
+				sectionIndex,
+				localSectionIndex,
+				storage,
+				regionChunkX,
+				regionChunkY,
+				regionChunkZ,
+				preferLocalIndices
+			);
 		}
 
-		return new CachedRegionMetadata(storageVersion, preferLocalIndices, sectionOrderSnapshot, templateBytes, regionSlot, true);
+		return new CachedRegionMetadata(
+			storageVersion,
+			preferLocalIndices,
+			preserveSectionOrder,
+			sectionOrderSnapshot,
+			geometryMapSnapshot,
+			templateBytes,
+			regionSlot,
+			true
+		);
+	}
+
+	private static void writeSectionMetadata(
+		ByteBuffer metadataView,
+		int sectionIndex,
+		int localSectionIndex,
+		SectionRenderDataStorage storage,
+		int regionChunkX,
+		int regionChunkY,
+		int regionChunkZ,
+		boolean preferLocalIndices
+	) {
+		long dataPointer = storage.getDataPointer(localSectionIndex);
+		int sectionChunkX = regionChunkX + LocalSectionIndex.unpackX(localSectionIndex);
+		int sectionChunkY = regionChunkY + LocalSectionIndex.unpackY(localSectionIndex);
+		int sectionChunkZ = regionChunkZ + LocalSectionIndex.unpackZ(localSectionIndex);
+		long facingList = SectionRenderDataUnsafe.getFacingList(dataPointer);
+		int flags = preferLocalIndices && SectionRenderDataUnsafe.isLocalIndex(dataPointer) ? FLAG_USE_LOCAL_INDEX : 0;
+		int offset = sectionIndex * INPUT_STRIDE_BYTES;
+		metadataView.position(offset);
+		metadataView.putFloat((sectionChunkX << 4) + 8.0f);
+		metadataView.putFloat((sectionChunkY << 4) + 8.0f);
+		metadataView.putFloat((sectionChunkZ << 4) + 8.0f);
+		metadataView.putFloat(SECTION_BOUNDING_RADIUS);
+		metadataView.putInt(sectionChunkX);
+		metadataView.putInt(sectionChunkY);
+		metadataView.putInt(sectionChunkZ);
+		metadataView.putInt(SectionRenderDataUnsafe.getSliceMask(dataPointer));
+		metadataView.putInt(checkedInt(SectionRenderDataUnsafe.getBaseElement(dataPointer), "baseElement"));
+		metadataView.putInt(checkedInt(SectionRenderDataUnsafe.getBaseVertex(dataPointer), "baseVertex"));
+		metadataView.putInt((int) facingList);
+		metadataView.putInt((int) (facingList >>> Integer.SIZE));
+		metadataView.putInt(checkedInt(SectionRenderDataUnsafe.getVertexCount(dataPointer, 0), "vertexCount[0]"));
+		metadataView.putInt(checkedInt(SectionRenderDataUnsafe.getVertexCount(dataPointer, 1), "vertexCount[1]"));
+		metadataView.putInt(checkedInt(SectionRenderDataUnsafe.getVertexCount(dataPointer, 2), "vertexCount[2]"));
+		metadataView.putInt(checkedInt(SectionRenderDataUnsafe.getVertexCount(dataPointer, 3), "vertexCount[3]"));
+		metadataView.putInt(checkedInt(SectionRenderDataUnsafe.getVertexCount(dataPointer, 4), "vertexCount[4]"));
+		metadataView.putInt(checkedInt(SectionRenderDataUnsafe.getVertexCount(dataPointer, 5), "vertexCount[5]"));
+		metadataView.putInt(checkedInt(SectionRenderDataUnsafe.getVertexCount(dataPointer, 6), "vertexCount[6]"));
+		metadataView.putInt(0);
+		metadataView.putInt(0);
+		metadataView.putInt(0);
+		metadataView.putInt(flags);
+		metadataView.putInt(0);
+	}
+
+	private static byte[] snapshotSectionOrder(byte[] sectionsWithGeometry, int sectionCount) {
+		byte[] snapshot = new byte[sectionCount];
+		System.arraycopy(sectionsWithGeometry, 0, snapshot, 0, sectionCount);
+		return snapshot;
+	}
+
+	private static byte[] buildStableSectionOrder(long[] sectionsWithGeometryMap, int sectionCount) {
+		byte[] stableOrder = new byte[sectionCount];
+		int writeIndex = 0;
+
+		for (int wordIndex = 0; wordIndex < sectionsWithGeometryMap.length; wordIndex++) {
+			long sectionBits = sectionsWithGeometryMap[wordIndex];
+			while (sectionBits != 0L) {
+				int bitIndex = Long.numberOfTrailingZeros(sectionBits);
+				stableOrder[writeIndex++] = (byte) ((wordIndex << 6) + bitIndex);
+				sectionBits &= sectionBits - 1L;
+			}
+		}
+
+		if (writeIndex != sectionCount) {
+			throw new IllegalStateException("Stable section order size does not match the geometry section count.");
+		}
+
+		return stableOrder;
 	}
 
 	private static void uploadCachedMetadataIfDirty(CachedRegionMetadata cachedMetadata) {
@@ -339,8 +534,24 @@ public final class SectionVisibilityCompute {
 		}
 
 		ensureStaticBufferCapacity(cachedMetadata.regionSlot() + 1);
-		ByteBuffer uploadView = ByteBuffer.wrap(cachedMetadata.templateBytes()).order(ByteOrder.nativeOrder());
-		GL45C.glNamedBufferSubData(sectionBufferHandle, sectionBaseOffsetBytes(cachedMetadata.regionSlot()), uploadView);
+		int uploadOffsetBytes = cachedMetadata.dirtyUploadOffsetBytes();
+		int uploadLengthBytes = cachedMetadata.dirtyUploadLengthBytes();
+		if (uploadLengthBytes <= 0) {
+			cachedMetadata.markUploaded();
+			return;
+		}
+
+		ensureSectionUploadCapacity(uploadLengthBytes);
+		ByteBuffer uploadView = sectionUploadView.duplicate().order(ByteOrder.nativeOrder());
+		uploadView.clear();
+		uploadView.limit(uploadLengthBytes);
+		uploadView.put(cachedMetadata.templateBytes(), uploadOffsetBytes, uploadLengthBytes);
+		uploadView.flip();
+		GL45C.glNamedBufferSubData(
+			sectionBufferHandle,
+			sectionBaseOffsetBytes(cachedMetadata.regionSlot()) + uploadOffsetBytes,
+			uploadView
+		);
 		cachedMetadata.markUploaded();
 	}
 
@@ -351,14 +562,21 @@ public final class SectionVisibilityCompute {
 	}
 
 	private static void resetCounters(int regionCount) {
-		ByteBuffer counterResetView = counterBufferView.duplicate().order(ByteOrder.nativeOrder());
-		counterResetView.clear();
-		counterResetView.limit(regionCount * COUNTERS_PER_REGION * Integer.BYTES);
-		while (counterResetView.hasRemaining()) {
-			counterResetView.putInt(0);
+		long clearBytes = (long) regionCount * COUNTERS_PER_REGION * Integer.BYTES;
+		if (clearBytes <= 0L) {
+			return;
 		}
-		counterResetView.flip();
-		GL45C.glNamedBufferSubData(counterBufferHandle, 0L, counterResetView);
+
+		counterClearValue.clear();
+		GL45C.glClearNamedBufferSubData(
+			counterBufferHandle,
+			GL30C.GL_R32UI,
+			0L,
+			clearBytes,
+			GL30C.GL_RED_INTEGER,
+			GL11C.GL_UNSIGNED_INT,
+			counterClearValue
+		);
 	}
 
 	private static void readCounters(
@@ -435,8 +653,52 @@ public final class SectionVisibilityCompute {
 			counterBufferView = null;
 		}
 
+		if (sectionUploadView != null) {
+			MemoryUtil.memFree(sectionUploadView);
+			sectionUploadView = null;
+		}
+
+		if (counterClearValue != null) {
+			MemoryUtil.memFree(counterClearValue);
+			counterClearValue = null;
+		}
+
 		regionSlotCapacity = 0;
 		regionDescriptorCapacity = 0;
+	}
+
+	private static void preallocateWorkingSet() {
+		GpuMemoryBudget.Budget requestedBudget = GpuMemoryBudget.current();
+		if (tryPreallocateBudget(requestedBudget)) {
+			return;
+		}
+
+		GpuMemoryBudget.Budget fallbackBudget = GpuMemoryBudget.conservativeFallback(
+			"fallback after compute buffer preallocation failure"
+		);
+		if (
+			fallbackBudget.computeRegionSlots() != requestedBudget.computeRegionSlots() ||
+			fallbackBudget.computeRegionDescriptors() != requestedBudget.computeRegionDescriptors()
+		) {
+			tryPreallocateBudget(fallbackBudget);
+		}
+	}
+
+	private static boolean tryPreallocateBudget(GpuMemoryBudget.Budget budget) {
+		try {
+			ensureStaticBufferCapacity(budget.computeRegionSlots());
+			ensureDynamicCapacity(budget.computeRegionDescriptors());
+			return true;
+		} catch (RuntimeException exception) {
+			PotassiumClientMod.LOGGER.warn(
+				"Failed to preallocate compute buffers for '{}' preset (regionSlots={}, regionDescriptors={}). Continuing with smaller or on-demand allocations.",
+				budget.preset().configName(),
+				budget.computeRegionSlots(),
+				budget.computeRegionDescriptors(),
+				exception
+			);
+			return false;
+		}
 	}
 
 	private static void ensureStaticBufferCapacity(int requiredRegionSlots) {
@@ -444,11 +706,25 @@ public final class SectionVisibilityCompute {
 			return;
 		}
 
-		regionSlotCapacity = nextCapacity(requiredRegionSlots);
-		GL45C.glNamedBufferData(sectionBufferHandle, sectionBufferBytes(regionSlotCapacity), GL15C.GL_DYNAMIC_DRAW);
+		int newCapacity = nextCapacity(requiredRegionSlots);
+		GL45C.glNamedBufferData(sectionBufferHandle, sectionBufferBytes(newCapacity), GL15C.GL_DYNAMIC_DRAW);
+		regionSlotCapacity = newCapacity;
 		for (CachedRegionMetadata cachedMetadata : REGION_METADATA_CACHE.values()) {
 			cachedMetadata.markDirty();
 		}
+	}
+
+	private static void ensureSectionUploadCapacity(int requiredBytes) {
+		if (sectionUploadView != null && sectionUploadView.capacity() >= requiredBytes) {
+			return;
+		}
+
+		int newCapacity = nextCapacity(requiredBytes);
+		ByteBuffer newUploadView = MemoryUtil.memAlloc(newCapacity).order(ByteOrder.nativeOrder());
+		if (sectionUploadView != null) {
+			MemoryUtil.memFree(sectionUploadView);
+		}
+		sectionUploadView = newUploadView;
 	}
 
 	private static void ensureDynamicCapacity(int requiredRegions) {
@@ -456,23 +732,30 @@ public final class SectionVisibilityCompute {
 			return;
 		}
 
-		regionDescriptorCapacity = nextCapacity(requiredRegions);
+		int newCapacity = nextCapacity(requiredRegions);
+		int regionDescriptorBytes = newCapacity * REGION_DESCRIPTOR_STRIDE_BYTES;
+		ByteBuffer newRegionDescriptorView = MemoryUtil.memAlloc(regionDescriptorBytes).order(ByteOrder.nativeOrder());
+		int counterBufferBytes = newCapacity * COUNTERS_PER_REGION * Integer.BYTES;
+		ByteBuffer newCounterBufferView = MemoryUtil.memAlloc(counterBufferBytes).order(ByteOrder.nativeOrder());
+
+		try {
+			GL45C.glNamedBufferData(regionDescriptorBufferHandle, regionDescriptorBytes, GL15C.GL_DYNAMIC_DRAW);
+			GL45C.glNamedBufferData(counterBufferHandle, counterBufferBytes, GL15C.GL_DYNAMIC_READ);
+		} catch (RuntimeException exception) {
+			MemoryUtil.memFree(newRegionDescriptorView);
+			MemoryUtil.memFree(newCounterBufferView);
+			throw exception;
+		}
 
 		if (regionDescriptorView != null) {
 			MemoryUtil.memFree(regionDescriptorView);
 		}
-
-		int regionDescriptorBytes = regionDescriptorCapacity * REGION_DESCRIPTOR_STRIDE_BYTES;
-		regionDescriptorView = MemoryUtil.memAlloc(regionDescriptorBytes).order(ByteOrder.nativeOrder());
-		GL45C.glNamedBufferData(regionDescriptorBufferHandle, regionDescriptorBytes, GL15C.GL_DYNAMIC_DRAW);
-
+		regionDescriptorView = newRegionDescriptorView;
 		if (counterBufferView != null) {
 			MemoryUtil.memFree(counterBufferView);
 		}
-
-		int counterBufferBytes = regionDescriptorCapacity * COUNTERS_PER_REGION * Integer.BYTES;
-		counterBufferView = MemoryUtil.memAlloc(counterBufferBytes).order(ByteOrder.nativeOrder());
-		GL45C.glNamedBufferData(counterBufferHandle, counterBufferBytes, GL15C.GL_DYNAMIC_READ);
+		counterBufferView = newCounterBufferView;
+		regionDescriptorCapacity = newCapacity;
 	}
 
 	private static String loadShaderSource() {
@@ -511,6 +794,53 @@ public final class SectionVisibilityCompute {
 		}
 
 		return createdProgram;
+	}
+
+	private static int countSharedCommands(ByteBuffer metadataView, int sectionOffsetBytes, int visibleFaces) {
+		int commandCount = 0;
+		boolean previousVisible = false;
+
+		for (int facing = 0; facing <= FACING_COUNT; facing++) {
+			boolean currentVisible = false;
+			int vertexCount = 0;
+
+			if (facing < FACING_COUNT) {
+				vertexCount = getPackedVertexCount(metadataView, sectionOffsetBytes, facing);
+				if (vertexCount != 0) {
+					int faceOrder = getPackedFaceOrder(metadataView, sectionOffsetBytes, facing);
+					currentVisible = ((visibleFaces >>> faceOrder) & 1) != 0;
+				}
+			}
+
+			if (!currentVisible && previousVisible) {
+				if (facing < FACING_COUNT && vertexCount == 0) {
+					continue;
+				}
+
+				commandCount++;
+			}
+
+			previousVisible = currentVisible;
+		}
+
+		return commandCount;
+	}
+
+	private static int getPackedVertexCount(ByteBuffer metadataView, int sectionOffsetBytes, int facing) {
+		int vertexCountsOffsetBytes = sectionOffsetBytes + (Integer.BYTES * 12);
+		return metadataView.getInt(vertexCountsOffsetBytes + (facing * Integer.BYTES));
+	}
+
+	private static int getPackedFaceOrder(ByteBuffer metadataView, int sectionOffsetBytes, int facing) {
+		int drawInfoOffsetBytes = sectionOffsetBytes + (Integer.BYTES * 8);
+		int lowFacingList = metadataView.getInt(drawInfoOffsetBytes + (Integer.BYTES * 2));
+		int highFacingList = metadataView.getInt(drawInfoOffsetBytes + (Integer.BYTES * 3));
+		int shift = facing * Byte.SIZE;
+		if (shift < Integer.SIZE) {
+			return (lowFacingList >>> shift) & 0xFF;
+		}
+
+		return (highFacingList >>> (shift - Integer.SIZE)) & 0xFF;
 	}
 
 	private static void disable(String reason, RuntimeException exception) {
@@ -573,28 +903,54 @@ public final class SectionVisibilityCompute {
 		}
 	}
 
+	public record PackedRegionAnalysis(
+		int sectionCount,
+		int sliceMaskedSectionCount,
+		int visibleSectionCount,
+		int emittedCommandCount,
+		int localSectionCount,
+		int sharedSectionCount,
+		int firstVisibleFacesMask,
+		int firstSliceMask
+	) {
+	}
+
 	private static final class CachedRegionMetadata {
-		private final int storageVersion;
+		private int storageVersion;
 		private final boolean preferLocalIndices;
+		private final boolean preserveSectionOrder;
 		private final byte[] sectionOrderSnapshot;
+		private final long[] geometryMapSnapshot;
 		private final byte[] templateBytes;
 		private final int regionSlot;
 		private boolean dirty;
+		private int dirtySectionStart;
+		private int dirtySectionEndExclusive;
 
 		private CachedRegionMetadata(
 			int storageVersion,
 			boolean preferLocalIndices,
+			boolean preserveSectionOrder,
 			byte[] sectionOrderSnapshot,
+			long[] geometryMapSnapshot,
 			byte[] templateBytes,
 			int regionSlot,
 			boolean dirty
 		) {
 			this.storageVersion = storageVersion;
 			this.preferLocalIndices = preferLocalIndices;
+			this.preserveSectionOrder = preserveSectionOrder;
 			this.sectionOrderSnapshot = sectionOrderSnapshot;
+			this.geometryMapSnapshot = geometryMapSnapshot;
 			this.templateBytes = templateBytes;
 			this.regionSlot = regionSlot;
 			this.dirty = dirty;
+			this.dirtySectionStart = dirty ? 0 : -1;
+			this.dirtySectionEndExclusive = dirty ? sectionOrderSnapshot.length : -1;
+		}
+
+		private int storageVersion() {
+			return this.storageVersion;
 		}
 
 		private int sectionCount() {
@@ -619,24 +975,71 @@ public final class SectionVisibilityCompute {
 
 		private void markDirty() {
 			this.dirty = true;
+			this.dirtySectionStart = 0;
+			this.dirtySectionEndExclusive = this.sectionOrderSnapshot.length;
 		}
 
 		private void markUploaded() {
 			this.dirty = false;
+			this.dirtySectionStart = -1;
+			this.dirtySectionEndExclusive = -1;
 		}
 
-		private boolean matches(
-			int currentStorageVersion,
+		private int dirtyUploadOffsetBytes() {
+			return Math.max(this.dirtySectionStart, 0) * INPUT_STRIDE_BYTES;
+		}
+
+		private int dirtyUploadLengthBytes() {
+			if (!this.dirty || this.dirtySectionStart < 0 || this.dirtySectionEndExclusive <= this.dirtySectionStart) {
+				return 0;
+			}
+
+			return (this.dirtySectionEndExclusive - this.dirtySectionStart) * INPUT_STRIDE_BYTES;
+		}
+
+		private void markDirtyRange(int firstSectionIndex, int endExclusiveSectionIndex) {
+			if (firstSectionIndex < 0 || endExclusiveSectionIndex <= firstSectionIndex) {
+				return;
+			}
+
+			if (!this.dirty) {
+				this.dirty = true;
+				this.dirtySectionStart = firstSectionIndex;
+				this.dirtySectionEndExclusive = endExclusiveSectionIndex;
+				return;
+			}
+
+			this.dirtySectionStart = Math.min(this.dirtySectionStart, firstSectionIndex);
+			this.dirtySectionEndExclusive = Math.max(this.dirtySectionEndExclusive, endExclusiveSectionIndex);
+		}
+
+		private boolean matchesLayout(
 			boolean currentPreferLocalIndices,
+			boolean currentPreserveSectionOrder,
 			byte[] currentSectionOrder,
+			long[] currentGeometryMap,
 			int currentSectionCount
 		) {
 			if (
-				this.storageVersion != currentStorageVersion ||
 				this.preferLocalIndices != currentPreferLocalIndices ||
+				this.preserveSectionOrder != currentPreserveSectionOrder ||
 				this.sectionOrderSnapshot.length != currentSectionCount
 			) {
 				return false;
+			}
+
+			if (!this.preserveSectionOrder) {
+				if (this.geometryMapSnapshot == null || this.geometryMapSnapshot.length != currentGeometryMap.length) {
+					return false;
+				}
+
+				for (int wordIndex = 0; wordIndex < currentGeometryMap.length; wordIndex++) {
+					if (this.geometryMapSnapshot[wordIndex] != currentGeometryMap[wordIndex]) {
+						return false;
+					}
+				}
+
+				return true;
 			}
 
 			for (int sectionIndex = 0; sectionIndex < currentSectionCount; sectionIndex++) {
@@ -645,6 +1048,54 @@ public final class SectionVisibilityCompute {
 				}
 			}
 
+			return true;
+		}
+
+		private boolean refreshDirtySections(
+			RegionBatchInput regionInput,
+			int currentStorageVersion,
+			boolean currentPreferLocalIndices,
+			long[] dirtySectionWords
+		) {
+			RenderRegion region = regionInput.region();
+			SectionRenderDataStorage storage = regionInput.storage();
+			int regionChunkX = region.getChunkX();
+			int regionChunkY = region.getChunkY();
+			int regionChunkZ = region.getChunkZ();
+			ByteBuffer metadataView = ByteBuffer.wrap(this.templateBytes).order(ByteOrder.nativeOrder());
+			boolean updated = false;
+			int firstDirtySectionIndex = Integer.MAX_VALUE;
+			int lastDirtySectionIndex = -1;
+
+			for (int sectionIndex = 0; sectionIndex < this.sectionOrderSnapshot.length; sectionIndex++) {
+				int localSectionIndex = Byte.toUnsignedInt(this.sectionOrderSnapshot[sectionIndex]);
+				int wordIndex = localSectionIndex >>> 6;
+				if (wordIndex >= dirtySectionWords.length) {
+					return false;
+				}
+				if ((dirtySectionWords[wordIndex] & (1L << (localSectionIndex & 63))) == 0L) {
+					continue;
+				}
+
+				writeSectionMetadata(
+					metadataView,
+					sectionIndex,
+					localSectionIndex,
+					storage,
+					regionChunkX,
+					regionChunkY,
+					regionChunkZ,
+					currentPreferLocalIndices
+				);
+				updated = true;
+				firstDirtySectionIndex = Math.min(firstDirtySectionIndex, sectionIndex);
+				lastDirtySectionIndex = Math.max(lastDirtySectionIndex, sectionIndex);
+			}
+
+			this.storageVersion = currentStorageVersion;
+			if (updated) {
+				this.markDirtyRange(firstDirtySectionIndex, lastDirtySectionIndex + 1);
+			}
 			return true;
 		}
 	}

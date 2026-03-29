@@ -2,7 +2,8 @@ package com.potassium.client.compat.sodium;
 
 import com.potassium.client.PotassiumClientMod;
 import com.potassium.client.compute.SectionVisibilityCompute;
-import com.potassium.client.compute.SectionVisibilityCompute.GpuCommandGenerationResult;
+import com.potassium.client.compute.SectionVisibilityCompute.ComputePassResult;
+import com.potassium.client.compute.SectionVisibilityCompute.RegionBatchInput;
 import com.potassium.client.render.indirect.IndexedCommandScratchBuffer;
 import com.potassium.client.render.indirect.IndexedIndirectCommandBuffer;
 import com.potassium.client.render.indirect.IndirectBackend;
@@ -118,6 +119,14 @@ public final class SodiumBridge {
 
 		if (context.computeCullingEnabled) {
 			SectionVisibilityCompute.captureFrustumPlanes(matrices, context.computeFrustumPlanes);
+			scheduleComputeGeneratedBatches(
+				context,
+				renderLists,
+				renderPass,
+				cameraTransform,
+				fragmentDiscard
+			);
+			context.preparedBatchesScheduled = true;
 			return;
 		}
 
@@ -185,16 +194,7 @@ public final class SodiumBridge {
 
 		GeneratedCommandBatch generatedBatch;
 		if (context.computeCullingEnabled) {
-			generatedBatch = tryBuildComputeGeneratedBatch(
-				context,
-				region,
-				storage,
-				renderList,
-				cameraTransform,
-				renderPass,
-				useBlockFaceCulling,
-				preferLocalIndices
-			);
+			generatedBatch = consumePreparedGeneratedBatch(context, region);
 		} else {
 			generatedBatch = consumeScheduledGeneratedBatch(context, region);
 		}
@@ -362,52 +362,111 @@ public final class SodiumBridge {
 		}
 	}
 
-	private static GeneratedCommandBatch tryBuildComputeGeneratedBatch(
+	private static GeneratedCommandBatch consumePreparedGeneratedBatch(RenderPassContext context, RenderRegion region) {
+		return context.preparedGeneratedBatches.remove(region);
+	}
+
+	private static void scheduleComputeGeneratedBatches(
 		RenderPassContext context,
-		RenderRegion region,
-		SectionRenderDataStorage storage,
-		ChunkRenderList renderList,
-		CameraTransform cameraTransform,
+		ChunkRenderListIterable renderLists,
 		TerrainRenderPass renderPass,
-		boolean useBlockFaceCulling,
-		boolean preferLocalIndices
+		CameraTransform cameraTransform,
+		boolean fragmentDiscard
 	) {
-		if (context.viewport != null && !isRegionVisible(context.viewport, region)) {
-			return GeneratedCommandBatch.skip(1, 1, 0, 0, 0);
+		boolean useBlockFaceCulling = SodiumClientMod.options().performance.useBlockFaceCulling;
+		boolean preferLocalIndices = renderPass.isTranslucent() && fragmentDiscard;
+		List<RegionBatchInput> regionInputs = new ArrayList<>();
+		int nextFirstCommandIndex = 0;
+
+		for (java.util.Iterator<ChunkRenderList> iterator = renderLists.iterator(renderPass.isTranslucent()); iterator.hasNext(); ) {
+			ChunkRenderList renderList = iterator.next();
+			RenderRegion region = renderList.getRegion();
+			SectionRenderDataStorage storage = region.getStorage(renderPass);
+			if (storage == null) {
+				continue;
+			}
+
+			context.scheduledBatchCount++;
+			if (context.viewport != null && !isRegionVisible(context.viewport, region)) {
+				context.preparedGeneratedBatches.put(region, GeneratedCommandBatch.skip(1, 1, 0, 0, 0));
+				continue;
+			}
+
+			int expectedSectionCount = renderList.getSectionsWithGeometryCount();
+			if (expectedSectionCount <= 0) {
+				context.preparedGeneratedBatches.put(
+					region,
+					GeneratedCommandBatch.skip(context.viewport != null ? 1 : 0, 0, 0, 0, 0)
+				);
+				continue;
+			}
+
+			int maxCommandCount = estimateCommandCapacity(renderList);
+			regionInputs.add(
+				new RegionBatchInput(
+					region,
+					storage,
+					renderList,
+					nextFirstCommandIndex,
+					maxCommandCount,
+					expectedSectionCount
+				)
+			);
+			nextFirstCommandIndex = Math.addExact(nextFirstCommandIndex, maxCommandCount);
 		}
 
+		if (regionInputs.isEmpty()) {
+			return;
+		}
+
+		context.commandBuffer.reserveGpuCommandRange(nextFirstCommandIndex);
+
 		try {
-			GpuCommandGenerationResult computeResult = SectionVisibilityCompute.generateIndexedCommands(
+			ComputePassResult computePassResult = SectionVisibilityCompute.generateIndexedCommands(
 				context.commandBuffer,
-				region,
-				storage,
-				renderList,
-				renderPass,
+				regionInputs,
+				renderPass.isTranslucent(),
 				cameraTransform,
 				context.computeFrustumPlanes,
 				useBlockFaceCulling,
 				preferLocalIndices
 			);
-			if (computeResult.dispatched()) {
+			if (computePassResult.dispatched()) {
 				context.computeDispatchCount++;
+				context.commandBuffer.commitGpuGeneratedCommands(0, nextFirstCommandIndex);
 			}
 
-			return GeneratedCommandBatch.compute(
-				computeResult.firstCommandIndex(),
-				computeResult.commandCount(),
-				context.viewport != null ? 1 : 0,
-				0,
-				computeResult.testedSectionCount(),
-				computeResult.visibleSectionCount(),
-				computeResult.culledSectionCount()
-			);
+			for (int regionIndex = 0; regionIndex < regionInputs.size(); regionIndex++) {
+				RegionBatchInput regionInput = regionInputs.get(regionIndex);
+				int testedSectionCount = computePassResult.testedSectionCounts()[regionIndex];
+				int commandCount = computePassResult.commandCounts()[regionIndex];
+				int visibleSectionCount = computePassResult.visibleSectionCounts()[regionIndex];
+				GeneratedCommandBatch generatedBatch = commandCount > 0
+					? GeneratedCommandBatch.compute(
+						regionInput.firstCommandIndex(),
+						commandCount,
+						context.viewport != null ? 1 : 0,
+						0,
+						testedSectionCount,
+						visibleSectionCount,
+						testedSectionCount - visibleSectionCount
+					)
+					: GeneratedCommandBatch.skip(
+						context.viewport != null ? 1 : 0,
+						0,
+						testedSectionCount,
+						visibleSectionCount,
+						testedSectionCount - visibleSectionCount
+					);
+				context.preparedGeneratedBatches.put(regionInput.region(), generatedBatch);
+			}
 		} catch (RuntimeException exception) {
 			context.computeFailureCount++;
+			context.preparedGeneratedBatches.clear();
 			PotassiumClientMod.LOGGER.warn(
-				"Potassium compute command generation failed for one render region. Falling back to CPU generation.",
+				"Potassium compute command generation failed for one render pass. Falling back to CPU generation.",
 				exception
 			);
-			return null;
 		}
 	}
 
@@ -430,10 +489,6 @@ public final class SodiumBridge {
 
 		PreparedBatch preparedBatch;
 		if (generatedBatch.gpuGenerated()) {
-			context.commandBuffer.commitGpuGeneratedCommands(
-				generatedBatch.firstCommandIndex(),
-				generatedBatch.commandCount()
-			);
 			preparedBatch = PreparedBatch.draw(
 				generatedBatch.firstCommandIndex(),
 				generatedBatch.commandCount(),
@@ -597,10 +652,15 @@ public final class SodiumBridge {
 	}
 
 	private static void rollbackBatch(RenderPassContext context, PreparedBatch preparedBatch) {
-		int executedCommandCount = context.executedCommandCount;
-		context.commandBuffer.rewindToCommandCount(executedCommandCount);
+		if (preparedBatch.source() != CommandSource.GENERATED_COMPUTE) {
+			int executedCommandCount = context.executedCommandCount;
+			context.commandBuffer.rewindToCommandCount(executedCommandCount);
+			context.mirroredCommandCount = Math.max(context.mirroredCommandCount - preparedBatch.commandCount(), executedCommandCount);
+		} else {
+			context.mirroredCommandCount = Math.max(context.mirroredCommandCount - preparedBatch.commandCount(), 0);
+		}
+
 		context.mirroredBatchCount = Math.max(context.mirroredBatchCount - 1, context.executedBatchCount);
-		context.mirroredCommandCount = Math.max(context.mirroredCommandCount - preparedBatch.commandCount(), executedCommandCount);
 
 		if (preparedBatch.source() == CommandSource.TRANSLATED) {
 			context.translatedBatchCount = Math.max(context.translatedBatchCount - 1, 0);
@@ -775,6 +835,7 @@ public final class SodiumBridge {
 		private final int visibleRegionCount;
 		private final Viewport viewport;
 		private final float[] computeFrustumPlanes = new float[24];
+		private final Map<RenderRegion, GeneratedCommandBatch> preparedGeneratedBatches = new IdentityHashMap<>();
 		private final Map<RenderRegion, CompletableFuture<GeneratedCommandBatch>> scheduledGeneratedBatches = new IdentityHashMap<>();
 		private IndexedIndirectCommandBuffer commandBuffer;
 		private PreparedBatch pendingPreparedBatch;

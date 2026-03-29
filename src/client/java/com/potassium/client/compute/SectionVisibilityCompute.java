@@ -8,14 +8,13 @@ import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
-import net.caffeinemc.mods.sodium.client.model.quad.properties.ModelQuadFacing;
+import java.util.List;
 import net.caffeinemc.mods.sodium.client.render.chunk.ChunkRenderMatrices;
 import net.caffeinemc.mods.sodium.client.render.chunk.LocalSectionIndex;
 import net.caffeinemc.mods.sodium.client.render.chunk.data.SectionRenderDataStorage;
 import net.caffeinemc.mods.sodium.client.render.chunk.data.SectionRenderDataUnsafe;
 import net.caffeinemc.mods.sodium.client.render.chunk.lists.ChunkRenderList;
 import net.caffeinemc.mods.sodium.client.render.chunk.region.RenderRegion;
-import net.caffeinemc.mods.sodium.client.render.chunk.terrain.TerrainRenderPass;
 import net.caffeinemc.mods.sodium.client.render.viewport.CameraTransform;
 import net.caffeinemc.mods.sodium.client.util.iterator.ByteIterator;
 import org.joml.FrustumIntersection;
@@ -34,10 +33,10 @@ public final class SectionVisibilityCompute {
 	private static final String SHADER_RESOURCE = "assets/potassium/shaders/compute/section_visibility.comp";
 	private static final int PLANE_COUNT = 6;
 	private static final int LOCAL_SIZE_X = 64;
-	private static final int INPUT_STRIDE_BYTES = Integer.BYTES * 20;
-	private static final int COUNTER_BUFFER_BYTES = Integer.BYTES * 2;
-	private static final int COUNTER_COMMAND_COUNT_OFFSET = 0;
-	private static final int COUNTER_VISIBLE_SECTION_COUNT_OFFSET = Integer.BYTES;
+	private static final int INPUT_STRIDE_BYTES = Integer.BYTES * 24;
+	private static final int COUNTERS_PER_REGION = 2;
+	private static final int REGION_COMMAND_COUNT_OFFSET = 0;
+	private static final int REGION_VISIBLE_SECTION_COUNT_OFFSET = 1;
 	private static final int FLAG_USE_LOCAL_INDEX = 1;
 	private static final float SECTION_BOUNDING_RADIUS = 14.0f;
 
@@ -50,8 +49,8 @@ public final class SectionVisibilityCompute {
 	private static int sectionCountLocation = -1;
 	private static int cameraBlockPositionLocation = -1;
 	private static int useBlockFaceCullingLocation = -1;
-	private static int commandBaseIndexLocation = -1;
 	private static int capacitySections;
+	private static int capacityRegions;
 	private static ByteBuffer sectionMetadataBuffer;
 	private static ByteBuffer counterBufferView;
 
@@ -72,13 +71,10 @@ public final class SectionVisibilityCompute {
 			programHandle = createProgram(loadShaderSource());
 			inputBufferHandle = GL45C.glCreateBuffers();
 			counterBufferHandle = GL45C.glCreateBuffers();
-			GL45C.glNamedBufferData(counterBufferHandle, COUNTER_BUFFER_BYTES, GL15C.GL_DYNAMIC_READ);
-			counterBufferView = MemoryUtil.memAlloc(COUNTER_BUFFER_BYTES).order(ByteOrder.nativeOrder());
 			frustumPlanesLocation = GL20C.glGetUniformLocation(programHandle, "uFrustumPlanes");
 			sectionCountLocation = GL20C.glGetUniformLocation(programHandle, "uSectionCount");
 			cameraBlockPositionLocation = GL20C.glGetUniformLocation(programHandle, "uCameraBlockPosition");
 			useBlockFaceCullingLocation = GL20C.glGetUniformLocation(programHandle, "uUseBlockFaceCulling");
-			commandBaseIndexLocation = GL20C.glGetUniformLocation(programHandle, "uCommandBaseIndex");
 			enabled = true;
 			disableReason = "none";
 			PotassiumClientMod.LOGGER.info("Section visibility compute shader ready");
@@ -121,48 +117,44 @@ public final class SectionVisibilityCompute {
 		}
 	}
 
-	public static GpuCommandGenerationResult generateIndexedCommands(
+	public static ComputePassResult generateIndexedCommands(
 		IndexedIndirectCommandBuffer commandBuffer,
-		RenderRegion region,
-		SectionRenderDataStorage storage,
-		ChunkRenderList renderList,
-		TerrainRenderPass renderPass,
+		List<RegionBatchInput> regionInputs,
+		boolean translucentPass,
 		CameraTransform cameraTransform,
 		float[] frustumPlanes,
 		boolean useBlockFaceCulling,
 		boolean preferLocalIndices
 	) {
-		if (!enabled) {
-			return GpuCommandGenerationResult.empty();
+		if (!enabled || regionInputs.isEmpty()) {
+			return ComputePassResult.empty();
 		}
 
-		ByteIterator iterator = renderList.sectionsWithGeometryIterator(renderPass.isTranslucent());
-		if (iterator == null) {
-			return GpuCommandGenerationResult.empty();
+		int totalSections = 0;
+		for (RegionBatchInput regionInput : regionInputs) {
+			totalSections += regionInput.expectedSectionCount();
 		}
 
-		int sectionCount = renderList.getSectionsWithGeometryCount();
-		if (sectionCount <= 0) {
-			return GpuCommandGenerationResult.empty();
+		if (totalSections <= 0) {
+			return ComputePassResult.empty(regionInputs.size());
 		}
 
-		ensureCapacity(sectionCount);
+		ensureCapacity(totalSections, regionInputs.size());
 
-		int packedSectionCount = packSectionMetadata(
-			region,
-			storage,
+		int[] testedSectionCounts = new int[regionInputs.size()];
+		int packedSectionCount = packPassMetadata(
+			regionInputs,
+			translucentPass,
 			cameraTransform,
 			preferLocalIndices,
-			iterator
+			testedSectionCounts
 		);
 		if (packedSectionCount == 0) {
-			return GpuCommandGenerationResult.empty();
+			return ComputePassResult.empty(regionInputs.size());
 		}
 
-		int maxCommandCount = Math.max(Math.multiplyExact(packedSectionCount, ModelQuadFacing.COUNT), 1);
-		int firstCommandIndex = commandBuffer.reserveGpuCommandRange(maxCommandCount);
 		uploadSectionMetadata(packedSectionCount);
-		resetCounters();
+		resetCounters(regionInputs.size());
 
 		int previousProgram = GL11C.glGetInteger(GL20C.GL_CURRENT_PROGRAM);
 		GL30C.glBindBufferBase(GL43C.GL_SHADER_STORAGE_BUFFER, 0, inputBufferHandle);
@@ -179,7 +171,6 @@ public final class SectionVisibilityCompute {
 				cameraTransform.intZ
 			);
 			GL30C.glUniform1ui(useBlockFaceCullingLocation, useBlockFaceCulling ? 1 : 0);
-			GL30C.glUniform1ui(commandBaseIndexLocation, firstCommandIndex);
 			GL43C.glDispatchCompute((packedSectionCount + LOCAL_SIZE_X - 1) / LOCAL_SIZE_X, 1, 1);
 			GL42C.glMemoryBarrier(
 				GL43C.GL_SHADER_STORAGE_BARRIER_BIT |
@@ -193,33 +184,10 @@ public final class SectionVisibilityCompute {
 			GL30C.glBindBufferBase(GL43C.GL_SHADER_STORAGE_BUFFER, 2, 0);
 		}
 
-		ByteBuffer readbackView = counterBufferView.duplicate().order(ByteOrder.nativeOrder());
-		readbackView.clear();
-		readbackView.limit(COUNTER_BUFFER_BYTES);
-		GL45C.glGetNamedBufferSubData(counterBufferHandle, 0L, readbackView);
-		int commandCount = readbackView.getInt(COUNTER_COMMAND_COUNT_OFFSET);
-		int visibleSectionCount = readbackView.getInt(COUNTER_VISIBLE_SECTION_COUNT_OFFSET);
-		if (commandCount < 0) {
-			throw new IllegalStateException("Compute produced a negative commandCount.");
-		}
-		if (visibleSectionCount < 0) {
-			throw new IllegalStateException("Compute produced a negative visibleSectionCount.");
-		}
-
-		if (commandCount > maxCommandCount) {
-			throw new IllegalStateException("Compute generated more commands than the reserved indirect range.");
-		}
-		if (visibleSectionCount > packedSectionCount) {
-			throw new IllegalStateException("Compute reported more visible sections than were dispatched.");
-		}
-
-		return new GpuCommandGenerationResult(
-			true,
-			firstCommandIndex,
-			commandCount,
-			packedSectionCount,
-			visibleSectionCount
-		);
+		int[] commandCounts = new int[regionInputs.size()];
+		int[] visibleSectionCounts = new int[regionInputs.size()];
+		readCounters(regionInputs, commandCounts, visibleSectionCounts);
+		return new ComputePassResult(true, testedSectionCounts, commandCounts, visibleSectionCounts);
 	}
 
 	public static void shutdown() {
@@ -228,22 +196,57 @@ public final class SectionVisibilityCompute {
 		disableReason = "shutdown";
 	}
 
-	private static int packSectionMetadata(
-		RenderRegion region,
-		SectionRenderDataStorage storage,
+	private static int packPassMetadata(
+		List<RegionBatchInput> regionInputs,
+		boolean translucentPass,
 		CameraTransform cameraTransform,
 		boolean preferLocalIndices,
-		ByteIterator iterator
+		int[] testedSectionCounts
 	) {
+		ByteBuffer metadataView = sectionMetadataBuffer.duplicate().order(ByteOrder.nativeOrder());
+		metadataView.clear();
+		int packedSectionCount = 0;
+
+		for (int regionOrdinal = 0; regionOrdinal < regionInputs.size(); regionOrdinal++) {
+			RegionBatchInput regionInput = regionInputs.get(regionOrdinal);
+			int regionSectionCount = packRegionMetadata(
+				metadataView,
+				regionInput,
+				regionOrdinal,
+				translucentPass,
+				cameraTransform,
+				preferLocalIndices
+			);
+			testedSectionCounts[regionOrdinal] = regionSectionCount;
+			packedSectionCount += regionSectionCount;
+		}
+
+		return packedSectionCount;
+	}
+
+	private static int packRegionMetadata(
+		ByteBuffer metadataView,
+		RegionBatchInput regionInput,
+		int regionOrdinal,
+		boolean translucentPass,
+		CameraTransform cameraTransform,
+		boolean preferLocalIndices
+	) {
+		RenderRegion region = regionInput.region();
+		SectionRenderDataStorage storage = regionInput.storage();
+		ChunkRenderList renderList = regionInput.renderList();
+		ByteIterator iterator = renderList.sectionsWithGeometryIterator(translucentPass);
+		if (iterator == null) {
+			return 0;
+		}
+
 		int regionChunkX = region.getChunkX();
 		int regionChunkY = region.getChunkY();
 		int regionChunkZ = region.getChunkZ();
 		float cameraX = cameraTransform.intX + cameraTransform.fracX;
 		float cameraY = cameraTransform.intY + cameraTransform.fracY;
 		float cameraZ = cameraTransform.intZ + cameraTransform.fracZ;
-		ByteBuffer metadataView = sectionMetadataBuffer.duplicate().order(ByteOrder.nativeOrder());
-		metadataView.clear();
-		int ordinal = 0;
+		int testedSections = 0;
 
 		while (iterator.hasNext()) {
 			int localSectionIndex = iterator.nextByteAsInt();
@@ -276,11 +279,15 @@ public final class SectionVisibilityCompute {
 			metadataView.putInt(checkedInt(SectionRenderDataUnsafe.getVertexCount(dataPointer, 4), "vertexCount[4]"));
 			metadataView.putInt(checkedInt(SectionRenderDataUnsafe.getVertexCount(dataPointer, 5), "vertexCount[5]"));
 			metadataView.putInt(checkedInt(SectionRenderDataUnsafe.getVertexCount(dataPointer, 6), "vertexCount[6]"));
+			metadataView.putInt(0);
+			metadataView.putInt(regionOrdinal);
+			metadataView.putInt(regionInput.firstCommandIndex());
 			metadataView.putInt(flags);
-			ordinal++;
+			metadataView.putInt(0);
+			testedSections++;
 		}
 
-		return ordinal;
+		return testedSections;
 	}
 
 	private static void uploadSectionMetadata(int packedSectionCount) {
@@ -290,13 +297,47 @@ public final class SectionVisibilityCompute {
 		GL45C.glNamedBufferSubData(inputBufferHandle, 0L, metadataView);
 	}
 
-	private static void resetCounters() {
+	private static void resetCounters(int regionCount) {
 		ByteBuffer counterResetView = counterBufferView.duplicate().order(ByteOrder.nativeOrder());
 		counterResetView.clear();
-		counterResetView.putInt(0);
-		counterResetView.putInt(0);
+		counterResetView.limit(regionCount * COUNTERS_PER_REGION * Integer.BYTES);
+		while (counterResetView.hasRemaining()) {
+			counterResetView.putInt(0);
+		}
 		counterResetView.flip();
 		GL45C.glNamedBufferSubData(counterBufferHandle, 0L, counterResetView);
+	}
+
+	private static void readCounters(
+		List<RegionBatchInput> regionInputs,
+		int[] commandCounts,
+		int[] visibleSectionCounts
+	) {
+		ByteBuffer readbackView = counterBufferView.duplicate().order(ByteOrder.nativeOrder());
+		readbackView.clear();
+		readbackView.limit(regionInputs.size() * COUNTERS_PER_REGION * Integer.BYTES);
+		GL45C.glGetNamedBufferSubData(counterBufferHandle, 0L, readbackView);
+
+		for (int regionIndex = 0; regionIndex < regionInputs.size(); regionIndex++) {
+			int baseOffset = regionIndex * COUNTERS_PER_REGION * Integer.BYTES;
+			int commandCount = readbackView.getInt(baseOffset + (REGION_COMMAND_COUNT_OFFSET * Integer.BYTES));
+			int visibleSectionCount = readbackView.getInt(baseOffset + (REGION_VISIBLE_SECTION_COUNT_OFFSET * Integer.BYTES));
+			if (commandCount < 0) {
+				throw new IllegalStateException("Compute produced a negative commandCount.");
+			}
+			if (visibleSectionCount < 0) {
+				throw new IllegalStateException("Compute produced a negative visibleSectionCount.");
+			}
+			if (commandCount > regionInputs.get(regionIndex).maxCommandCount()) {
+				throw new IllegalStateException("Compute generated more commands than the reserved indirect range for one region.");
+			}
+			if (visibleSectionCount > regionInputs.get(regionIndex).expectedSectionCount()) {
+				throw new IllegalStateException("Compute reported more visible sections than exist in one region.");
+			}
+
+			commandCounts[regionIndex] = commandCount;
+			visibleSectionCounts[regionIndex] = visibleSectionCount;
+		}
 	}
 
 	private static int checkedInt(long value, String label) {
@@ -334,20 +375,30 @@ public final class SectionVisibilityCompute {
 		}
 
 		capacitySections = 0;
+		capacityRegions = 0;
 	}
 
-	private static void ensureCapacity(int requiredSections) {
-		if (requiredSections <= capacitySections) {
-			return;
+	private static void ensureCapacity(int requiredSections, int requiredRegions) {
+		if (requiredSections > capacitySections) {
+			if (sectionMetadataBuffer != null) {
+				MemoryUtil.memFree(sectionMetadataBuffer);
+			}
+
+			capacitySections = Integer.highestOneBit(Math.max(requiredSections - 1, 1)) << 1;
+			sectionMetadataBuffer = MemoryUtil.memAlloc(capacitySections * INPUT_STRIDE_BYTES).order(ByteOrder.nativeOrder());
+			GL45C.glNamedBufferData(inputBufferHandle, (long) capacitySections * INPUT_STRIDE_BYTES, GL15C.GL_DYNAMIC_DRAW);
 		}
 
-		if (sectionMetadataBuffer != null) {
-			MemoryUtil.memFree(sectionMetadataBuffer);
-		}
+		if (requiredRegions > capacityRegions) {
+			if (counterBufferView != null) {
+				MemoryUtil.memFree(counterBufferView);
+			}
 
-		capacitySections = Integer.highestOneBit(Math.max(requiredSections - 1, 1)) << 1;
-		sectionMetadataBuffer = MemoryUtil.memAlloc(capacitySections * INPUT_STRIDE_BYTES).order(ByteOrder.nativeOrder());
-		GL45C.glNamedBufferData(inputBufferHandle, (long) capacitySections * INPUT_STRIDE_BYTES, GL15C.GL_DYNAMIC_DRAW);
+			capacityRegions = Integer.highestOneBit(Math.max(requiredRegions - 1, 1)) << 1;
+			int counterBufferBytes = capacityRegions * COUNTERS_PER_REGION * Integer.BYTES;
+			counterBufferView = MemoryUtil.memAlloc(counterBufferBytes).order(ByteOrder.nativeOrder());
+			GL45C.glNamedBufferData(counterBufferHandle, counterBufferBytes, GL15C.GL_DYNAMIC_READ);
+		}
 	}
 
 	private static String loadShaderSource() {
@@ -395,21 +446,34 @@ public final class SectionVisibilityCompute {
 		disableReason = reason;
 	}
 
-	public record GpuCommandGenerationResult(
-		boolean dispatched,
+	public record RegionBatchInput(
+		RenderRegion region,
+		SectionRenderDataStorage storage,
+		ChunkRenderList renderList,
 		int firstCommandIndex,
-		int commandCount,
-		int testedSectionCount,
-		int visibleSectionCount
+		int maxCommandCount,
+		int expectedSectionCount
 	) {
-		private static final GpuCommandGenerationResult EMPTY = new GpuCommandGenerationResult(false, 0, 0, 0, 0);
+	}
 
-		public static GpuCommandGenerationResult empty() {
+	public record ComputePassResult(
+		boolean dispatched,
+		int[] testedSectionCounts,
+		int[] commandCounts,
+		int[] visibleSectionCounts
+	) {
+		private static final ComputePassResult EMPTY = new ComputePassResult(false, new int[0], new int[0], new int[0]);
+
+		public static ComputePassResult empty() {
 			return EMPTY;
 		}
 
-		public int culledSectionCount() {
-			return this.testedSectionCount - this.visibleSectionCount;
+		public static ComputePassResult empty(int regionCount) {
+			if (regionCount == 0) {
+				return EMPTY;
+			}
+
+			return new ComputePassResult(false, new int[regionCount], new int[regionCount], new int[regionCount]);
 		}
 	}
 }

@@ -12,6 +12,9 @@ const uint MODEL_NEG_Z = 5u;
 const uint MODEL_UNASSIGNED = 6u;
 const uint FLAG_USE_LOCAL_INDEX = 1u;
 const uint COMMAND_WORD_STRIDE = 5u;
+const uint COUNTERS_PER_REGION = 2u;
+const uint REGION_COMMAND_COUNT_OFFSET = 0u;
+const uint REGION_VISIBLE_SECTION_COUNT_OFFSET = 1u;
 const uint ALL_FACES_MASK = (1u << FACING_COUNT) - 1u;
 
 struct SectionCommandInput {
@@ -20,6 +23,7 @@ struct SectionCommandInput {
 	uvec4 drawInfo;
 	uvec4 vertexCounts0;
 	uvec4 vertexCounts1;
+	uvec4 regionInfo;
 };
 
 layout(std430, binding = 0) readonly buffer SectionInputs {
@@ -38,7 +42,6 @@ uniform vec4 uFrustumPlanes[6];
 uniform uint uSectionCount;
 uniform ivec3 uCameraBlockPosition;
 uniform uint uUseBlockFaceCulling;
-uniform uint uCommandBaseIndex;
 
 bool isSphereVisible(vec4 sphere) {
 	vec3 center = sphere.xyz;
@@ -106,8 +109,12 @@ uint computeVisibleFaces(ivec3 sectionChunkPosition) {
 	return visibleFaces;
 }
 
+uint regionCounterIndex(uint regionIndex, uint counterOffset) {
+	return (regionIndex * COUNTERS_PER_REGION) + counterOffset;
+}
+
 void writeCommand(uint slot, uint count, uint firstIndex, uint baseVertex) {
-	uint commandWordIndex = (uCommandBaseIndex + slot) * COMMAND_WORD_STRIDE;
+	uint commandWordIndex = slot * COMMAND_WORD_STRIDE;
 	commandWords[commandWordIndex] = count;
 	commandWords[commandWordIndex + 1u] = 1u;
 	commandWords[commandWordIndex + 2u] = firstIndex;
@@ -115,7 +122,7 @@ void writeCommand(uint slot, uint count, uint firstIndex, uint baseVertex) {
 	commandWords[commandWordIndex + 4u] = 0u;
 }
 
-void emitLocalCommands(SectionCommandInput section, uint visibleFaces) {
+void emitLocalCommands(SectionCommandInput section, uint regionIndex, uint regionCommandBase, uint visibleFaces) {
 	uint baseElement = section.drawInfo.x;
 	uint baseVertex = section.drawInfo.y;
 
@@ -124,7 +131,7 @@ void emitLocalCommands(SectionCommandInput section, uint visibleFaces) {
 		uint elementCount = (vertexCount >> 2u) * 6u;
 
 		if (((visibleFaces >> facing) & 1u) != 0u) {
-			uint slot = atomicAdd(counterValues[0], 1u);
+			uint slot = regionCommandBase + atomicAdd(counterValues[regionCounterIndex(regionIndex, REGION_COMMAND_COUNT_OFFSET)], 1u);
 			writeCommand(slot, elementCount, baseElement, baseVertex);
 		}
 
@@ -133,7 +140,7 @@ void emitLocalCommands(SectionCommandInput section, uint visibleFaces) {
 	}
 }
 
-void emitSharedCommands(SectionCommandInput section, uint visibleFaces) {
+void emitSharedCommands(SectionCommandInput section, uint regionIndex, uint regionCommandBase, uint visibleFaces) {
 	uint baseElement = section.drawInfo.x;
 	uint currentBaseVertex = section.drawInfo.y;
 	uint visibleRunVertexCount = 0u;
@@ -158,7 +165,7 @@ void emitSharedCommands(SectionCommandInput section, uint visibleFaces) {
 				}
 
 				uint elementCount = (visibleRunVertexCount >> 2u) * 6u;
-				uint slot = atomicAdd(counterValues[0], 1u);
+				uint slot = regionCommandBase + atomicAdd(counterValues[regionCounterIndex(regionIndex, REGION_COMMAND_COUNT_OFFSET)], 1u);
 				writeCommand(slot, elementCount, baseElement, currentBaseVertex);
 				currentBaseVertex += visibleRunVertexCount;
 				visibleRunVertexCount = 0u;
@@ -184,15 +191,17 @@ void main() {
 		return;
 	}
 
-	atomicAdd(counterValues[1], 1u);
+	uint regionIndex = section.regionInfo.x;
+	uint regionCommandBase = section.regionInfo.y;
+	atomicAdd(counterValues[regionCounterIndex(regionIndex, REGION_VISIBLE_SECTION_COUNT_OFFSET)], 1u);
 	uint visibleFaces = computeVisibleFaces(section.sectionInfo.xyz) & uint(section.sectionInfo.w);
 	if (visibleFaces == 0u) {
 		return;
 	}
 
-	if ((section.vertexCounts1.w & FLAG_USE_LOCAL_INDEX) != 0u) {
-		emitLocalCommands(section, visibleFaces);
+	if ((section.regionInfo.z & FLAG_USE_LOCAL_INDEX) != 0u) {
+		emitLocalCommands(section, regionIndex, regionCommandBase, visibleFaces);
 	} else {
-		emitSharedCommands(section, visibleFaces);
+		emitSharedCommands(section, regionIndex, regionCommandBase, visibleFaces);
 	}
 }

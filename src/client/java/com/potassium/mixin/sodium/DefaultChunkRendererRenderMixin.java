@@ -76,8 +76,7 @@ public abstract class DefaultChunkRendererRenderMixin {
 			renderList,
 			cameraTransform,
 			renderPass,
-			useBlockFaceCulling,
-			preferLocalIndices
+			fragmentDiscard
 		);
 	}
 }

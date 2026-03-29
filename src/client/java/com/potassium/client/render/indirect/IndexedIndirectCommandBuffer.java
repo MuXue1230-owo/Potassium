@@ -6,6 +6,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import org.lwjgl.opengl.GL40C;
 import org.lwjgl.opengl.GL43C;
+import org.lwjgl.opengl.GL45C;
 import org.lwjgl.system.MemoryUtil;
 
 public final class IndexedIndirectCommandBuffer implements AutoCloseable {
@@ -200,6 +201,16 @@ public final class IndexedIndirectCommandBuffer implements AutoCloseable {
 
 	public int bufferHandle() {
 		return this.gpuBuffer.handle();
+	}
+
+	public ByteBuffer readCommands(int firstCommandIndex, int commandCount) {
+		if (firstCommandIndex < 0 || commandCount < 0 || firstCommandIndex + commandCount > this.commandCount) {
+			throw new IllegalArgumentException("Requested command range is out of bounds.");
+		}
+
+		ByteBuffer readback = MemoryUtil.memAlloc(commandCount * COMMAND_STRIDE_BYTES).order(ByteOrder.nativeOrder());
+		GL45C.glGetNamedBufferSubData(this.gpuBuffer.handle(), this.drawOffsetBytes(firstCommandIndex), readback);
+		return readback;
 	}
 
 	public boolean usesPersistentMapping() {

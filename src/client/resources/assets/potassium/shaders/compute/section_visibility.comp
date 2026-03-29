@@ -54,20 +54,6 @@ uniform vec3 uCameraPosition;
 uniform ivec3 uCameraBlockPosition;
 uniform uint uUseBlockFaceCulling;
 
-bool isSphereVisible(vec4 sphere) {
-	vec3 center = sphere.xyz - uCameraPosition;
-	float radius = sphere.w;
-
-	for (int planeIndex = 0; planeIndex < 6; planeIndex++) {
-		vec4 plane = uFrustumPlanes[planeIndex];
-		if (dot(plane.xyz, center) + plane.w < -radius) {
-			return false;
-		}
-	}
-
-	return true;
-}
-
 uint getVertexCount(SectionCommandInput section, uint facing) {
 	if (facing < 4u) {
 		return section.vertexCounts0[int(facing)];
@@ -200,10 +186,6 @@ void main() {
 	}
 
 	SectionCommandInput section = sections[region.sectionBase + sectionLocalIndex];
-	if (!isSphereVisible(section.sphere)) {
-		return;
-	}
-
 	atomicAdd(counterValues[regionCounterIndex(regionIndex, REGION_VISIBLE_SECTION_COUNT_OFFSET)], 1u);
 	uint visibleFaces = computeVisibleFaces(section.sectionInfo.xyz) & uint(section.sectionInfo.w);
 	if (visibleFaces == 0u) {

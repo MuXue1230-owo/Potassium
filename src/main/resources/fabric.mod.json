@@ -1,0 +1,35 @@
+{
+	"schemaVersion": 1,
+	"id": "potassium",
+	"version": "${version}",
+	"name": "Potassium",
+	"description": "Advanced indirect rendering backend for Sodium. Requires OpenGL 4.5+.",
+	"authors": [
+		"MUXUE1230"
+	],
+	"contact": {
+		"homepage": "https://fabricmc.net/",
+		"sources": "https://github.com/FabricMC/fabric-example-mod"
+	},
+	"license": "CC0-1.0",
+	"icon": "assets/potassium/icon.png",
+	"environment": "client",
+	"entrypoints": {
+		"main": [
+			"cn.mxst.potassium.Potassium"
+		],
+		"fabric-datagen": [
+			"cn.mxst.potassium.PotassiumDataGenerator"
+		]
+	},
+	"mixins": [
+		"potassium.mixins.json"
+	],
+	"depends": {
+		"fabricloader": ">=0.18.5",
+		"minecraft": "~26.1",
+		"java": ">=25",
+		"fabric-api": "*",
+		"sodium": ">=0.8.7+mc26.1"
+	}
+}

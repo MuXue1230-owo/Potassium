@@ -476,7 +476,8 @@ public final class SodiumBridge {
 		boolean useBlockFaceCulling = SodiumClientMod.options().performance.useBlockFaceCulling;
 		boolean preferLocalIndices = renderPass.isTranslucent() && fragmentDiscard;
 		boolean useGpuDrawCount = USE_GPU_INDIRECT_COUNT && GLCapabilities.hasIndirectCount();
-		List<RegionBatchInput> regionInputs = new ArrayList<>();
+		List<RegionBatchInput> regionInputs = context.regionInputs;
+		int regionInputCount = 0;
 		int nextFirstCommandIndex = 0;
 
 		for (java.util.Iterator<ChunkRenderList> iterator = renderLists.iterator(renderPass.isTranslucent()); iterator.hasNext(); ) {
@@ -503,20 +504,26 @@ public final class SodiumBridge {
 			}
 
 			int maxCommandCount = estimateCommandCapacity(renderList);
-			regionInputs.add(
-				new RegionBatchInput(
-					region,
-					storage,
-					renderList,
-					nextFirstCommandIndex,
-					maxCommandCount,
-					expectedSectionCount
-				)
+			RegionBatchInput regionInput;
+			if (regionInputCount < regionInputs.size()) {
+				regionInput = regionInputs.get(regionInputCount);
+			} else {
+				regionInput = new RegionBatchInput();
+				regionInputs.add(regionInput);
+			}
+			regionInput.configure(
+				region,
+				storage,
+				renderList,
+				nextFirstCommandIndex,
+				maxCommandCount,
+				expectedSectionCount
 			);
+			regionInputCount++;
 			nextFirstCommandIndex = Math.addExact(nextFirstCommandIndex, maxCommandCount);
 		}
 
-		if (regionInputs.isEmpty()) {
+		if (regionInputCount == 0) {
 			context.visibleRegionCount = context.scheduledBatchCount;
 			return;
 		}
@@ -528,6 +535,7 @@ public final class SodiumBridge {
 			ComputePassResult computePassResult = SectionVisibilityCompute.generateIndexedCommands(
 				context.commandBuffer,
 				regionInputs,
+				regionInputCount,
 				renderPass.isTranslucent(),
 				cameraTransform,
 				context.computeFrustumPlanes,
@@ -540,7 +548,7 @@ public final class SodiumBridge {
 				context.commandBuffer.commitGpuGeneratedCommands(0, nextFirstCommandIndex);
 			}
 
-			for (int regionIndex = 0; regionIndex < regionInputs.size(); regionIndex++) {
+			for (int regionIndex = 0; regionIndex < regionInputCount; regionIndex++) {
 				RegionBatchInput regionInput = regionInputs.get(regionIndex);
 				int testedSectionCount = computePassResult.testedSectionCounts()[regionIndex];
 				GeneratedCommandBatch generatedBatch;
@@ -1419,6 +1427,7 @@ public final class SodiumBridge {
 		private int visibleRegionCount;
 		private Viewport viewport;
 		private final float[] computeFrustumPlanes = new float[24];
+		private final List<RegionBatchInput> regionInputs = new ArrayList<>();
 		private final Map<RenderRegion, GeneratedCommandBatch> preparedGeneratedBatches = new IdentityHashMap<>();
 		private final Map<RenderRegion, CompletableFuture<GeneratedCommandBatch>> scheduledGeneratedBatches = new IdentityHashMap<>();
 		private IndexedIndirectCommandBuffer commandBuffer;

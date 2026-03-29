@@ -60,6 +60,8 @@ public final class SectionVisibilityCompute {
 	private static final Map<SectionRenderDataStorage, CachedRegionMetadata> REGION_METADATA_CACHE = new WeakHashMap<>();
 	private static final ThreadLocal<long[]> DIRTY_SECTION_WORDS =
 		ThreadLocal.withInitial(() -> new long[(MAX_REGION_SECTION_COUNT + Long.SIZE - 1) / Long.SIZE]);
+	private static final ThreadLocal<ComputePassScratch> COMPUTE_PASS_SCRATCH =
+		ThreadLocal.withInitial(ComputePassScratch::new);
 
 	private static boolean enabled;
 	private static String disableReason = "not initialized";
@@ -159,6 +161,7 @@ public final class SectionVisibilityCompute {
 	public static ComputePassResult generateIndexedCommands(
 		IndexedIndirectCommandBuffer commandBuffer,
 		List<RegionBatchInput> regionInputs,
+		int regionCount,
 		boolean translucentPass,
 		CameraTransform cameraTransform,
 		float[] frustumPlanes,
@@ -166,17 +169,18 @@ public final class SectionVisibilityCompute {
 		boolean preferLocalIndices,
 		boolean readBackCounters
 	) {
-		if (!enabled || regionInputs.isEmpty()) {
+		if (!enabled || regionCount <= 0) {
 			return ComputePassResult.empty();
 		}
 
-		ensureDynamicCapacity(regionInputs.size());
-
-		CachedRegionMetadata[] cachedMetadatas = new CachedRegionMetadata[regionInputs.size()];
-		int[] testedSectionCounts = new int[regionInputs.size()];
+		ensureDynamicCapacity(regionCount);
+		ComputePassScratch scratch = COMPUTE_PASS_SCRATCH.get();
+		scratch.ensureCapacity(regionCount);
+		CachedRegionMetadata[] cachedMetadatas = scratch.cachedMetadatas;
+		int[] testedSectionCounts = scratch.testedSectionCounts;
 		int requiredRegionSlots = 0;
 
-		for (int regionIndex = 0; regionIndex < regionInputs.size(); regionIndex++) {
+		for (int regionIndex = 0; regionIndex < regionCount; regionIndex++) {
 			RegionBatchInput regionInput = regionInputs.get(regionIndex);
 			CachedRegionMetadata cachedMetadata = getOrBuildCachedMetadata(regionInput, preferLocalIndices, translucentPass);
 			cachedMetadatas[regionIndex] = cachedMetadata;
@@ -186,8 +190,8 @@ public final class SectionVisibilityCompute {
 
 		ensureStaticBufferCapacity(requiredRegionSlots);
 
-		ByteBuffer descriptorView = thisFrameRegionDescriptorView(regionInputs.size());
-		for (int regionIndex = 0; regionIndex < regionInputs.size(); regionIndex++) {
+		ByteBuffer descriptorView = thisFrameRegionDescriptorView(regionCount);
+		for (int regionIndex = 0; regionIndex < regionCount; regionIndex++) {
 			CachedRegionMetadata cachedMetadata = cachedMetadatas[regionIndex];
 			uploadCachedMetadataIfDirty(cachedMetadata);
 			descriptorView.putInt(cachedMetadata.sectionBaseIndex());
@@ -197,7 +201,7 @@ public final class SectionVisibilityCompute {
 		}
 
 		uploadRegionDescriptors(descriptorView);
-		resetCounters(regionInputs.size());
+		resetCounters(regionCount);
 
 		int previousProgram = GL11C.glGetInteger(GL20C.GL_CURRENT_PROGRAM);
 		GL30C.glBindBufferBase(GL43C.GL_SHADER_STORAGE_BUFFER, 0, sectionBufferHandle);
@@ -239,14 +243,14 @@ public final class SectionVisibilityCompute {
 				true,
 				false,
 				testedSectionCounts,
-				new int[regionInputs.size()],
-				new int[regionInputs.size()]
+				scratch.commandCounts,
+				scratch.visibleSectionCounts
 			);
 		}
 
-		int[] commandCounts = new int[regionInputs.size()];
-		int[] visibleSectionCounts = new int[regionInputs.size()];
-		readCounters(regionInputs, commandCounts, visibleSectionCounts);
+		int[] commandCounts = scratch.commandCounts;
+		int[] visibleSectionCounts = scratch.visibleSectionCounts;
+		readCounters(regionInputs, regionCount, commandCounts, visibleSectionCounts);
 		return new ComputePassResult(true, true, testedSectionCounts, commandCounts, visibleSectionCounts);
 	}
 
@@ -581,15 +585,16 @@ public final class SectionVisibilityCompute {
 
 	private static void readCounters(
 		List<RegionBatchInput> regionInputs,
+		int regionCount,
 		int[] commandCounts,
 		int[] visibleSectionCounts
 	) {
 		ByteBuffer readbackView = counterBufferView.duplicate().order(ByteOrder.nativeOrder());
 		readbackView.clear();
-		readbackView.limit(regionInputs.size() * COUNTERS_PER_REGION * Integer.BYTES);
+		readbackView.limit(regionCount * COUNTERS_PER_REGION * Integer.BYTES);
 		GL45C.glGetNamedBufferSubData(counterBufferHandle, 0L, readbackView);
 
-		for (int regionIndex = 0; regionIndex < regionInputs.size(); regionIndex++) {
+		for (int regionIndex = 0; regionIndex < regionCount; regionIndex++) {
 			int baseOffset = regionIndex * COUNTERS_PER_REGION * Integer.BYTES;
 			int commandCount = readbackView.getInt(baseOffset + (REGION_COMMAND_COUNT_OFFSET * Integer.BYTES));
 			int visibleSectionCount = readbackView.getInt(baseOffset + (REGION_VISIBLE_SECTION_COUNT_OFFSET * Integer.BYTES));
@@ -871,14 +876,68 @@ public final class SectionVisibilityCompute {
 		return capacity;
 	}
 
-	public record RegionBatchInput(
-		RenderRegion region,
-		SectionRenderDataStorage storage,
-		ChunkRenderList renderList,
-		int firstCommandIndex,
-		int maxCommandCount,
-		int expectedSectionCount
-	) {
+	public static final class RegionBatchInput {
+		private RenderRegion region;
+		private SectionRenderDataStorage storage;
+		private ChunkRenderList renderList;
+		private int firstCommandIndex;
+		private int maxCommandCount;
+		private int expectedSectionCount;
+
+		public RegionBatchInput() {
+		}
+
+		public RegionBatchInput(
+			RenderRegion region,
+			SectionRenderDataStorage storage,
+			ChunkRenderList renderList,
+			int firstCommandIndex,
+			int maxCommandCount,
+			int expectedSectionCount
+		) {
+			this.configure(region, storage, renderList, firstCommandIndex, maxCommandCount, expectedSectionCount);
+		}
+
+		public RegionBatchInput configure(
+			RenderRegion region,
+			SectionRenderDataStorage storage,
+			ChunkRenderList renderList,
+			int firstCommandIndex,
+			int maxCommandCount,
+			int expectedSectionCount
+		) {
+			this.region = region;
+			this.storage = storage;
+			this.renderList = renderList;
+			this.firstCommandIndex = firstCommandIndex;
+			this.maxCommandCount = maxCommandCount;
+			this.expectedSectionCount = expectedSectionCount;
+			return this;
+		}
+
+		public RenderRegion region() {
+			return this.region;
+		}
+
+		public SectionRenderDataStorage storage() {
+			return this.storage;
+		}
+
+		public ChunkRenderList renderList() {
+			return this.renderList;
+		}
+
+		public int firstCommandIndex() {
+			return this.firstCommandIndex;
+		}
+
+		public int maxCommandCount() {
+			return this.maxCommandCount;
+		}
+
+		public int expectedSectionCount() {
+			return this.expectedSectionCount;
+		}
 	}
 
 	public record ComputePassResult(
@@ -913,6 +972,29 @@ public final class SectionVisibilityCompute {
 		int firstVisibleFacesMask,
 		int firstSliceMask
 	) {
+	}
+
+	private static final class ComputePassScratch {
+		private CachedRegionMetadata[] cachedMetadatas = new CachedRegionMetadata[0];
+		private int[] testedSectionCounts = new int[0];
+		private int[] commandCounts = new int[0];
+		private int[] visibleSectionCounts = new int[0];
+
+		private void ensureCapacity(int requiredRegionCount) {
+			if (this.cachedMetadatas.length >= requiredRegionCount) {
+				return;
+			}
+
+			int newCapacity = 1;
+			while (newCapacity < requiredRegionCount) {
+				newCapacity <<= 1;
+			}
+
+			this.cachedMetadatas = new CachedRegionMetadata[newCapacity];
+			this.testedSectionCounts = new int[newCapacity];
+			this.commandCounts = new int[newCapacity];
+			this.visibleSectionCounts = new int[newCapacity];
+		}
 	}
 
 	private static final class CachedRegionMetadata {

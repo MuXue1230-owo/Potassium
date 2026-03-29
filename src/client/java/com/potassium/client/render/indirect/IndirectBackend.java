@@ -1,6 +1,7 @@
 package com.potassium.client.render.indirect;
 
 import com.potassium.client.gl.GLCapabilities;
+import com.potassium.client.gl.GpuMemoryBudget;
 import com.potassium.client.PotassiumClientMod;
 
 public final class IndirectBackend {
@@ -20,18 +21,31 @@ public final class IndirectBackend {
 
 		boolean persistentMappingSupported = GLCapabilities.hasPersistentMapping();
 		boolean persistentMappingEnabled = persistentMappingSupported;
+		GpuMemoryBudget.Budget requestedBudget = GpuMemoryBudget.current();
+		GpuMemoryBudget.Budget appliedBudget = requestedBudget;
+		int persistentSegmentCount = persistentMappingEnabled ? requestedBudget.persistentSegments() : 1;
 
-		commandBuffer = new IndirectCommandBuffer(DEFAULT_COMMAND_CAPACITY, persistentMappingEnabled);
-		indexedCommandBuffer = new IndexedIndirectCommandBuffer(
-			DEFAULT_COMMAND_CAPACITY,
-			persistentMappingEnabled
-		);
+		try {
+			allocateBuffers(requestedBudget.commandCapacity(), persistentMappingEnabled, persistentSegmentCount);
+		} catch (RuntimeException exception) {
+			appliedBudget = GpuMemoryBudget.conservativeFallback("fallback after indirect buffer allocation failure");
+			persistentSegmentCount = persistentMappingEnabled ? appliedBudget.persistentSegments() : 1;
+			PotassiumClientMod.LOGGER.warn(
+				"Falling back to conservative indirect buffer allocation after '{}' preset failed.",
+				requestedBudget.preset().configName(),
+				exception
+			);
+			allocateBuffers(appliedBudget.commandCapacity(), persistentMappingEnabled, persistentSegmentCount);
+		}
 		registered = true;
 		PotassiumClientMod.LOGGER.info(
-			"Indirect backend ready with {} commands (persistent mapping supported: {}, enabled: {})",
+			"Indirect backend ready with {} commands (persistent mapping supported: {}, enabled: {}, segments: {}, GPU reservation: {} MiB, budget: {})",
 			commandBuffer.capacityCommands(),
 			persistentMappingSupported,
-			commandBuffer.usesPersistentMapping()
+			commandBuffer.usesPersistentMapping(),
+			commandBuffer.segmentCount(),
+			describeReservationMiB(commandBuffer.capacityCommands(), commandBuffer.segmentCount()),
+			appliedBudget.preset().configName()
 		);
 	}
 
@@ -63,5 +77,31 @@ public final class IndirectBackend {
 		}
 
 		registered = false;
+	}
+
+	private static void allocateBuffers(int commandCapacity, boolean persistentMappingEnabled, int persistentSegmentCount) {
+		IndirectCommandBuffer newCommandBuffer = null;
+		IndexedIndirectCommandBuffer newIndexedCommandBuffer = null;
+
+		try {
+			newCommandBuffer = new IndirectCommandBuffer(commandCapacity, persistentMappingEnabled, persistentSegmentCount);
+			newIndexedCommandBuffer = new IndexedIndirectCommandBuffer(commandCapacity, persistentMappingEnabled, persistentSegmentCount);
+			commandBuffer = newCommandBuffer;
+			indexedCommandBuffer = newIndexedCommandBuffer;
+		} catch (RuntimeException exception) {
+			if (newIndexedCommandBuffer != null) {
+				newIndexedCommandBuffer.close();
+			}
+			if (newCommandBuffer != null) {
+				newCommandBuffer.close();
+			}
+			throw exception;
+		}
+	}
+
+	private static long describeReservationMiB(int commandCapacity, int segmentCount) {
+		long drawBytes = (long) commandCapacity * IndirectCommandBuffer.COMMAND_STRIDE_BYTES * segmentCount;
+		long indexedBytes = (long) commandCapacity * IndexedIndirectCommandBuffer.COMMAND_STRIDE_BYTES * segmentCount;
+		return (drawBytes + indexedBytes) / (1024L * 1024L);
 	}
 }

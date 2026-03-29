@@ -53,10 +53,13 @@ public final class SodiumBridge {
 	private static final int MAX_COMPUTE_DEBUG_BATCHES_PER_PASS = 8;
 	private static final int MAX_DRAW_DEBUG_BATCHES_PER_PASS = 8;
 	private static final boolean FORCE_TRANSLATED_BATCH_SUBMISSION = false;
-	private static final boolean ENABLE_COMPUTE_GENERATED_BATCHES = false;
+	private static final boolean ENABLE_COMPUTE_GENERATED_BATCHES = true;
+	private static final boolean ENABLE_TRANSLUCENT_BATCH_OVERRIDE = true;
+	private static final boolean FORCE_TRANSLUCENT_TRANSLATED_SUBMISSION = true;
+	private static final boolean FORCE_FRAGMENT_DISCARD_TRANSLATED_SUBMISSION = true;
 	private static final int FACING_COUNT = ModelQuadFacing.COUNT;
 	private static final int ALL_FACES_MASK = ModelQuadFacing.ALL;
-	private static final boolean USE_GPU_INDIRECT_COUNT = false;
+	private static final boolean USE_GPU_INDIRECT_COUNT = true;
 	private static final float REGION_HALF_WIDTH_BLOCKS = RenderRegion.REGION_WIDTH * 8.0f;
 	private static final float REGION_HALF_HEIGHT_BLOCKS = RenderRegion.REGION_HEIGHT * 8.0f;
 	private static final float REGION_HALF_LENGTH_BLOCKS = RenderRegion.REGION_LENGTH * 8.0f;
@@ -67,6 +70,10 @@ public final class SodiumBridge {
 	);
 	private static final int COMMAND_FILL_WORKER_COUNT = computeCommandFillWorkerCount();
 	private static final ExecutorService COMMAND_FILL_EXECUTOR = createCommandFillExecutor();
+	private static final ThreadLocal<RenderPassContext> PASS_CONTEXT_POOL = ThreadLocal.withInitial(RenderPassContext::new);
+	private static final GeneratedCommandBatch REGION_FRUSTUM_CULLED_BATCH = GeneratedCommandBatch.skip(1, 1, 0, 0, 0);
+	private static final CompletableFuture<GeneratedCommandBatch> REGION_FRUSTUM_CULLED_FUTURE =
+		CompletableFuture.completedFuture(REGION_FRUSTUM_CULLED_BATCH);
 
 	private static final ThreadLocal<RenderPassContext> ACTIVE_PASS = new ThreadLocal<>();
 	private static final BridgeDebugStats DEBUG_STATS = new BridgeDebugStats();
@@ -100,7 +107,8 @@ public final class SodiumBridge {
 	}
 
 	public static void beginRenderPass(TerrainRenderPass pass, ChunkRenderListIterable renderLists) {
-		RenderPassContext context = new RenderPassContext(pass, countVisibleRegions(renderLists, pass), currentViewport);
+		RenderPassContext context = PASS_CONTEXT_POOL.get();
+		context.begin(pass, currentViewport);
 		IndexedIndirectCommandBuffer commandBuffer = IndirectBackend.indexedCommandBuffer();
 		commandBuffer.beginFrame();
 		context.commandBuffer = commandBuffer;
@@ -128,12 +136,19 @@ public final class SodiumBridge {
 		) {
 			return;
 		}
-		if (renderPass.isTranslucent()) {
+		if (renderPass.isTranslucent() && !ENABLE_TRANSLUCENT_BATCH_OVERRIDE) {
+			context.preparedBatchesScheduled = true;
+			return;
+		}
+		if (shouldForceTranslatedSubmission(renderPass, fragmentDiscard)) {
 			context.preparedBatchesScheduled = true;
 			return;
 		}
 
-		boolean useComputePath = ENABLE_COMPUTE_GENERATED_BATCHES && context.computeCullingEnabled && !renderPass.isTranslucent();
+		boolean useComputePath =
+			ENABLE_COMPUTE_GENERATED_BATCHES &&
+			context.computeCullingEnabled &&
+			shouldUseComputeSubmission(renderPass, fragmentDiscard);
 		context.computeCullingEnabled = useComputePath;
 		if (useComputePath) {
 			SectionVisibilityCompute.captureFrustumPlanes(matrices, context.computeFrustumPlanes);
@@ -160,6 +175,11 @@ public final class SodiumBridge {
 			}
 
 			context.scheduledBatchCount++;
+			if (context.viewport != null && !isRegionVisible(context.viewport, region)) {
+				context.scheduledGeneratedBatches.put(region, REGION_FRUSTUM_CULLED_FUTURE);
+				continue;
+			}
+
 			context.scheduledGeneratedBatches.put(
 				region,
 				CompletableFuture.supplyAsync(
@@ -178,6 +198,7 @@ public final class SodiumBridge {
 			);
 		}
 
+		context.visibleRegionCount = context.scheduledBatchCount;
 		context.preparedBatchesScheduled = true;
 	}
 
@@ -194,7 +215,8 @@ public final class SodiumBridge {
 			context == null ||
 			!drawOverrideEnabled ||
 			FORCE_TRANSLATED_BATCH_SUBMISSION ||
-			context.pass.isTranslucent() ||
+			(renderPass != null && shouldForceTranslatedSubmission(renderPass, fragmentDiscard)) ||
+			(context.pass.isTranslucent() && !ENABLE_TRANSLUCENT_BATCH_OVERRIDE) ||
 			region == null ||
 			storage == null ||
 			renderList == null ||
@@ -235,18 +257,36 @@ public final class SodiumBridge {
 			);
 		}
 
-		debugCompareComputeBatch(
-			context,
-			generatedBatch,
-			region,
-			storage,
-			renderList,
-			cameraTransform,
-			renderPass,
-			useBlockFaceCulling,
-			preferLocalIndices
-		);
+		if (ENABLE_COMPUTE_DEBUG_COMPARISON) {
+			debugCompareComputeBatch(
+				context,
+				generatedBatch,
+				region,
+				storage,
+				renderList,
+				cameraTransform,
+				renderPass,
+				useBlockFaceCulling,
+				preferLocalIndices
+			);
+		}
 		applyGeneratedBatch(context, generatedBatch);
+	}
+
+	private static boolean shouldForceTranslatedSubmission(TerrainRenderPass renderPass, boolean fragmentDiscard) {
+		if (renderPass == null) {
+			return false;
+		}
+
+		if (renderPass.isTranslucent()) {
+			return FORCE_TRANSLUCENT_TRANSLATED_SUBMISSION;
+		}
+
+		return fragmentDiscard && FORCE_FRAGMENT_DISCARD_TRANSLATED_SUBMISSION;
+	}
+
+	private static boolean shouldUseComputeSubmission(TerrainRenderPass renderPass, boolean fragmentDiscard) {
+		return renderPass != null && !renderPass.isTranslucent() && !fragmentDiscard;
 	}
 
 	public static boolean tryDrawIndexedBatch(CommandList commandList, GlTessellation tessellation, MultiDrawBatch batch) {
@@ -259,7 +299,7 @@ public final class SodiumBridge {
 		context.seenCommandCount += batch.size;
 		drawOverrideAttemptCount++;
 
-		if (context.pass.isTranslucent()) {
+		if (context.pass.isTranslucent() && !ENABLE_TRANSLUCENT_BATCH_OVERRIDE) {
 			recordFallback(context, batch, "translucent override disabled");
 			return false;
 		}
@@ -298,7 +338,9 @@ public final class SodiumBridge {
 				recordMirroredBatch(context, preparedBatch);
 			}
 
-			debugComparePreparedBatchAgainstSodiumBatch(context, preparedBatch, batch);
+			if (ENABLE_DRAW_DEBUG_COMPARISON) {
+				debugComparePreparedBatchAgainstSodiumBatch(context, preparedBatch, batch);
+			}
 
 			if (preparedBatch.needsUpload()) {
 				context.commandBuffer.uploadAppendedCommands(preparedBatch.firstCommandIndex());
@@ -365,6 +407,7 @@ public final class SodiumBridge {
 			);
 		}
 
+		context.finish();
 		ACTIVE_PASS.remove();
 	}
 
@@ -382,6 +425,7 @@ public final class SodiumBridge {
 
 	public static void shutdown() {
 		ACTIVE_PASS.remove();
+		PASS_CONTEXT_POOL.remove();
 		DEBUG_STATS.reset();
 		currentViewport = null;
 		installed = false;
@@ -444,6 +488,11 @@ public final class SodiumBridge {
 			}
 
 			context.scheduledBatchCount++;
+			if (context.viewport != null && !isRegionVisible(context.viewport, region)) {
+				context.preparedGeneratedBatches.put(region, GeneratedCommandBatch.skip(1, 1, 0, 0, 0));
+				continue;
+			}
+
 			int expectedSectionCount = renderList.getSectionsWithGeometryCount();
 			if (expectedSectionCount <= 0) {
 				context.preparedGeneratedBatches.put(
@@ -468,9 +517,11 @@ public final class SodiumBridge {
 		}
 
 		if (regionInputs.isEmpty()) {
+			context.visibleRegionCount = context.scheduledBatchCount;
 			return;
 		}
 
+		context.visibleRegionCount = context.scheduledBatchCount;
 		context.commandBuffer.reserveGpuCommandRange(nextFirstCommandIndex);
 
 		try {
@@ -596,6 +647,10 @@ public final class SodiumBridge {
 		boolean preferLocalIndices,
 		Viewport viewport
 	) {
+		if (viewport != null && !isRegionVisible(viewport, region)) {
+			return GeneratedCommandBatch.skip(1, 1, 0, 0, 0);
+		}
+
 		ByteIterator iterator = renderList.sectionsWithGeometryIterator(renderPass.isTranslucent());
 		if (iterator == null) {
 			return GeneratedCommandBatch.skip(0, 0, 0, 0, 0);
@@ -605,6 +660,8 @@ public final class SodiumBridge {
 		int regionChunkX = region.getChunkX();
 		int regionChunkY = region.getChunkY();
 		int regionChunkZ = region.getChunkZ();
+		int frustumTestedSectionCount = 0;
+		int frustumVisibleSectionCount = 0;
 
 		while (iterator.hasNext()) {
 			int localSectionIndex = iterator.nextByteAsInt();
@@ -612,6 +669,14 @@ public final class SodiumBridge {
 			int sectionChunkX = regionChunkX + LocalSectionIndex.unpackX(localSectionIndex);
 			int sectionChunkY = regionChunkY + LocalSectionIndex.unpackY(localSectionIndex);
 			int sectionChunkZ = regionChunkZ + LocalSectionIndex.unpackZ(localSectionIndex);
+			if (viewport != null) {
+				frustumTestedSectionCount++;
+				if (!isSectionVisible(viewport, sectionChunkX, sectionChunkY, sectionChunkZ)) {
+					continue;
+				}
+
+				frustumVisibleSectionCount++;
+			}
 
 			int visibleFaces = useBlockFaceCulling
 				? DefaultChunkRenderer.getVisibleFaces(
@@ -637,17 +702,23 @@ public final class SodiumBridge {
 		}
 
 		if (commandBuffer.commandCount() == 0) {
-			return GeneratedCommandBatch.skip(0, 0, 0, 0, 0);
+			return GeneratedCommandBatch.skip(
+				viewport != null ? 1 : 0,
+				0,
+				frustumTestedSectionCount,
+				frustumVisibleSectionCount,
+				frustumTestedSectionCount - frustumVisibleSectionCount
+			);
 		}
 
 		return GeneratedCommandBatch.draw(
 			commandBuffer.view(),
 			commandBuffer.commandCount(),
+			viewport != null ? 1 : 0,
 			0,
-			0,
-			0,
-			0,
-			0
+			frustumTestedSectionCount,
+			frustumVisibleSectionCount,
+			frustumTestedSectionCount - frustumVisibleSectionCount
 		);
 	}
 
@@ -666,7 +737,6 @@ public final class SodiumBridge {
 			!ENABLE_COMPUTE_DEBUG_COMPARISON ||
 			!context.computeCullingEnabled ||
 			computeBatch == null ||
-			!computeBatch.gpuGenerated() ||
 			computeBatch.gpuCounted() ||
 			context.computeComparedBatchCount >= MAX_COMPUTE_DEBUG_BATCHES_PER_PASS
 		) {
@@ -674,7 +744,7 @@ public final class SodiumBridge {
 		}
 
 		context.computeComparedBatchCount++;
-		boolean computeBlockFaceCullingEnabled = false;
+		boolean computeBlockFaceCullingEnabled = useBlockFaceCulling;
 		GeneratedCommandBatch cpuBatch = buildGeneratedBatch(
 			region,
 			storage,
@@ -691,9 +761,173 @@ public final class SodiumBridge {
 			return;
 		}
 
+		CpuBatchAnalysis liveAnalysis = analyzeLiveGeneratedBatch(
+			region,
+			storage,
+			renderList,
+			cameraTransform,
+			renderPass,
+			computeBlockFaceCullingEnabled,
+			preferLocalIndices
+		);
+		SectionVisibilityCompute.PackedRegionAnalysis packedAnalysis = SectionVisibilityCompute.debugAnalyzePackedRegion(
+			new RegionBatchInput(
+				region,
+				storage,
+				renderList,
+				0,
+				estimateCommandCapacity(renderList),
+				renderList.getSectionsWithGeometryCount()
+			),
+			cameraTransform,
+			computeBlockFaceCullingEnabled,
+			preferLocalIndices
+		);
+		String detailedMismatchReason = mismatchReason + formatComputeMismatchDetails(computeBatch, cpuBatch, liveAnalysis, packedAnalysis);
+
 		context.computeMismatchedBatchCount++;
-		context.lastComputeMismatchReason = mismatchReason;
-		PotassiumClientMod.LOGGER.warn("Potassium compute mismatch in {} pass: {}", context.describePass(), mismatchReason);
+		recordComputeMismatchCategory(context, mismatchReason);
+		context.lastComputeMismatchReason = detailedMismatchReason;
+		PotassiumClientMod.LOGGER.warn("Potassium compute mismatch in {} pass: {}", context.describePass(), detailedMismatchReason);
+	}
+
+	private static String formatComputeMismatchDetails(
+		GeneratedCommandBatch computeBatch,
+		GeneratedCommandBatch cpuBatch,
+		CpuBatchAnalysis liveAnalysis,
+		SectionVisibilityCompute.PackedRegionAnalysis packedAnalysis
+	) {
+		return String.format(
+			" [gpuCommands=%d, gpuVisibleSections=%d, cpuCommands=%d, liveVisibleSections=%d, packedVisibleSections=%d, liveSliceMaskedSections=%d, packedSliceMaskedSections=%d, liveLocalSections=%d, liveSharedSections=%d, packedLocalSections=%d, packedSharedSections=%d, liveFirstVisibleFaces=0x%02X, liveFirstSliceMask=0x%02X, packedFirstVisibleFaces=0x%02X, packedFirstSliceMask=0x%02X]",
+			computeBatch.commandCount(),
+			computeBatch.frustumVisibleSectionCount(),
+			cpuBatch.commandCount(),
+			liveAnalysis.visibleSectionCount(),
+			packedAnalysis.visibleSectionCount(),
+			liveAnalysis.sliceMaskedSectionCount(),
+			packedAnalysis.sliceMaskedSectionCount(),
+			liveAnalysis.localSectionCount(),
+			liveAnalysis.sharedSectionCount(),
+			packedAnalysis.localSectionCount(),
+			packedAnalysis.sharedSectionCount(),
+			liveAnalysis.firstVisibleFacesMask(),
+			liveAnalysis.firstSliceMask(),
+			packedAnalysis.firstVisibleFacesMask(),
+			packedAnalysis.firstSliceMask()
+		);
+	}
+
+	private static CpuBatchAnalysis analyzeLiveGeneratedBatch(
+		RenderRegion region,
+		SectionRenderDataStorage storage,
+		ChunkRenderList renderList,
+		CameraTransform cameraTransform,
+		TerrainRenderPass renderPass,
+		boolean useBlockFaceCulling,
+		boolean preferLocalIndices
+	) {
+		ByteIterator iterator = renderList.sectionsWithGeometryIterator(renderPass.isTranslucent());
+		if (iterator == null) {
+			return new CpuBatchAnalysis(0, 0, 0, 0, 0, 0, 0, 0);
+		}
+
+		int regionChunkX = region.getChunkX();
+		int regionChunkY = region.getChunkY();
+		int regionChunkZ = region.getChunkZ();
+		int sectionCount = 0;
+		int sliceMaskedSectionCount = 0;
+		int visibleSectionCount = 0;
+		int emittedCommandCount = 0;
+		int localSectionCount = 0;
+		int sharedSectionCount = 0;
+		int firstVisibleFacesMask = 0;
+		int firstSliceMask = 0;
+		boolean capturedFirstVisibleSection = false;
+
+		while (iterator.hasNext()) {
+			sectionCount++;
+			int localSectionIndex = iterator.nextByteAsInt();
+			long dataPointer = storage.getDataPointer(localSectionIndex);
+			int sectionChunkX = regionChunkX + LocalSectionIndex.unpackX(localSectionIndex);
+			int sectionChunkY = regionChunkY + LocalSectionIndex.unpackY(localSectionIndex);
+			int sectionChunkZ = regionChunkZ + LocalSectionIndex.unpackZ(localSectionIndex);
+			int visibleFaces = useBlockFaceCulling
+				? DefaultChunkRenderer.getVisibleFaces(
+					cameraTransform.intX,
+					cameraTransform.intY,
+					cameraTransform.intZ,
+					sectionChunkX,
+					sectionChunkY,
+					sectionChunkZ
+				)
+				: ALL_FACES_MASK;
+			int sliceMask = SectionRenderDataUnsafe.getSliceMask(dataPointer);
+			if (sliceMask != 0) {
+				sliceMaskedSectionCount++;
+			}
+
+			visibleFaces &= sliceMask;
+			if (visibleFaces == 0) {
+				continue;
+			}
+
+			visibleSectionCount++;
+			if (!capturedFirstVisibleSection) {
+				firstVisibleFacesMask = visibleFaces;
+				firstSliceMask = sliceMask;
+				capturedFirstVisibleSection = true;
+			}
+
+			if (preferLocalIndices && SectionRenderDataUnsafe.isLocalIndex(dataPointer)) {
+				localSectionCount++;
+				emittedCommandCount += Integer.bitCount(visibleFaces & ALL_FACES_MASK);
+			} else {
+				sharedSectionCount++;
+				emittedCommandCount += countSharedCommandRuns(dataPointer, visibleFaces);
+			}
+		}
+
+		return new CpuBatchAnalysis(
+			sectionCount,
+			sliceMaskedSectionCount,
+			visibleSectionCount,
+			emittedCommandCount,
+			localSectionCount,
+			sharedSectionCount,
+			firstVisibleFacesMask,
+			firstSliceMask
+		);
+	}
+
+	private static int countSharedCommandRuns(long dataPointer, int visibleFaces) {
+		int commandCount = 0;
+		long facingList = SectionRenderDataUnsafe.getFacingList(dataPointer);
+		boolean previousVisible = false;
+
+		for (int facing = 0; facing <= FACING_COUNT; facing++) {
+			boolean currentVisible = false;
+			long vertexCount = 0L;
+
+			if (facing < FACING_COUNT) {
+				vertexCount = SectionRenderDataUnsafe.getVertexCount(dataPointer, facing);
+				if (vertexCount != 0L) {
+					long faceOrder = (facingList >>> (facing * 8)) & 0xFFL;
+					currentVisible = ((visibleFaces >>> (int) faceOrder) & 1) != 0;
+				}
+			}
+
+			if (!currentVisible && previousVisible) {
+				if (facing < FACING_COUNT && vertexCount == 0L) {
+					continue;
+				}
+
+				commandCount++;
+			}
+
+			previousVisible = currentVisible;
+		}
+
+		return commandCount;
 	}
 
 	private static String compareGeneratedBatches(
@@ -798,6 +1032,40 @@ public final class SodiumBridge {
 		}
 
 		return null;
+	}
+
+	private static void recordComputeMismatchCategory(RenderPassContext context, String mismatchReason) {
+		if (mismatchReason == null) {
+			return;
+		}
+
+		if (mismatchReason.startsWith("skip mismatch")) {
+			context.computeSkipMismatchCount++;
+			return;
+		}
+		if (mismatchReason.startsWith("commandCount mismatch")) {
+			context.computeCommandCountMismatchCount++;
+			return;
+		}
+		if (mismatchReason.startsWith("visibleSectionCount mismatch")) {
+			context.computeVisibleSectionMismatchCount++;
+			return;
+		}
+		if (mismatchReason.startsWith("command mismatch")) {
+			context.computeCommandMismatchCount++;
+		}
+	}
+
+	private record CpuBatchAnalysis(
+		int sectionCount,
+		int sliceMaskedSectionCount,
+		int visibleSectionCount,
+		int emittedCommandCount,
+		int localSectionCount,
+		int sharedSectionCount,
+		int firstVisibleFacesMask,
+		int firstSliceMask
+	) {
 	}
 
 	private static List<String> collectSortedCommandKeys(ByteBuffer commands, int commandCount) {
@@ -1064,12 +1332,20 @@ public final class SodiumBridge {
 	}
 
 	private static boolean isRegionVisible(Viewport viewport, RenderRegion region) {
+		CameraTransform cameraTransform = viewport.getTransform();
+		float relativeCenterX = (region.getOriginX() + REGION_HALF_WIDTH_BLOCKS) - (cameraTransform.intX + cameraTransform.fracX);
+		float relativeCenterY = (region.getOriginY() + REGION_HALF_HEIGHT_BLOCKS) - (cameraTransform.intY + cameraTransform.fracY);
+		float relativeCenterZ = (region.getOriginZ() + REGION_HALF_LENGTH_BLOCKS) - (cameraTransform.intZ + cameraTransform.fracZ);
 		return viewport.isBoxVisibleDirect(
-			region.getOriginX() + REGION_HALF_WIDTH_BLOCKS,
-			region.getOriginY() + REGION_HALF_HEIGHT_BLOCKS,
-			region.getOriginZ() + REGION_HALF_LENGTH_BLOCKS,
+			relativeCenterX,
+			relativeCenterY,
+			relativeCenterZ,
 			REGION_FRUSTUM_RADIUS
 		);
+	}
+
+	private static boolean isSectionVisible(Viewport viewport, int sectionChunkX, int sectionChunkY, int sectionChunkZ) {
+		return viewport.isBoxVisible(sectionChunkX, sectionChunkY, sectionChunkZ);
 	}
 
 	private static int estimateCommandCapacity(ChunkRenderList renderList) {
@@ -1119,17 +1395,6 @@ public final class SodiumBridge {
 		return exception.getClass().getSimpleName();
 	}
 
-	private static int countVisibleRegions(ChunkRenderListIterable renderLists, TerrainRenderPass pass) {
-		int regions = 0;
-
-		for (java.util.Iterator<ChunkRenderList> iterator = renderLists.iterator(pass.isTranslucent()); iterator.hasNext(); ) {
-			iterator.next();
-			regions++;
-		}
-
-		return regions;
-	}
-
 	private static int computeCommandFillWorkerCount() {
 		return Math.max(1, Math.min(Runtime.getRuntime().availableProcessors() - 1, 6));
 	}
@@ -1150,9 +1415,9 @@ public final class SodiumBridge {
 	}
 
 	private static final class RenderPassContext {
-		private final TerrainRenderPass pass;
-		private final int visibleRegionCount;
-		private final Viewport viewport;
+		private TerrainRenderPass pass;
+		private int visibleRegionCount;
+		private Viewport viewport;
 		private final float[] computeFrustumPlanes = new float[24];
 		private final Map<RenderRegion, GeneratedCommandBatch> preparedGeneratedBatches = new IdentityHashMap<>();
 		private final Map<RenderRegion, CompletableFuture<GeneratedCommandBatch>> scheduledGeneratedBatches = new IdentityHashMap<>();
@@ -1171,6 +1436,10 @@ public final class SodiumBridge {
 		private int computeComparedBatchCount;
 		private int computeMatchedBatchCount;
 		private int computeMismatchedBatchCount;
+		private int computeSkipMismatchCount;
+		private int computeCommandCountMismatchCount;
+		private int computeVisibleSectionMismatchCount;
+		private int computeCommandMismatchCount;
 		private String lastComputeMismatchReason = "none";
 		private int drawComparedBatchCount;
 		private int drawMatchedBatchCount;
@@ -1199,14 +1468,74 @@ public final class SodiumBridge {
 		private int fallbackCommandCount;
 		private String lastFallbackReason = "none";
 
-		private RenderPassContext(TerrainRenderPass pass, int visibleRegionCount, Viewport viewport) {
+		private RenderPassContext() {
+		}
+
+		private void begin(TerrainRenderPass pass, Viewport viewport) {
 			this.pass = pass;
-			this.visibleRegionCount = visibleRegionCount;
+			this.visibleRegionCount = 0;
 			this.viewport = viewport;
+			this.commandBuffer = null;
+			this.pendingPreparedBatch = null;
+			this.preparedBatchesScheduled = false;
+			this.persistentMappingEnabled = false;
+			this.computeCullingEnabled = false;
+			this.scheduledBatchCount = 0;
+			this.asyncReadyBatchCount = 0;
+			this.asyncWaitedBatchCount = 0;
+			this.asyncFailedBatchCount = 0;
+			this.syncGeneratedBatchCount = 0;
+			this.computeDispatchCount = 0;
+			this.computeFailureCount = 0;
+			this.computeComparedBatchCount = 0;
+			this.computeMatchedBatchCount = 0;
+			this.computeMismatchedBatchCount = 0;
+			this.computeSkipMismatchCount = 0;
+			this.computeCommandCountMismatchCount = 0;
+			this.computeVisibleSectionMismatchCount = 0;
+			this.computeCommandMismatchCount = 0;
+			this.lastComputeMismatchReason = "none";
+			this.drawComparedBatchCount = 0;
+			this.drawMatchedBatchCount = 0;
+			this.drawMismatchedBatchCount = 0;
+			this.lastDrawMismatchReason = "none";
+			this.generatedSkipBatchCount = 0;
+			this.frustumTestedRegionCount = 0;
+			this.frustumCulledRegionCount = 0;
+			this.frustumTestedSectionCount = 0;
+			this.frustumVisibleSectionCount = 0;
+			this.frustumCulledSectionCount = 0;
+			this.seenBatchCount = 0;
+			this.seenCommandCount = 0;
+			this.mirroredBatchCount = 0;
+			this.mirroredCommandCount = 0;
+			this.generatedBatchCount = 0;
+			this.generatedCommandCount = 0;
+			this.computeGeneratedBatchCount = 0;
+			this.computeGeneratedCommandCount = 0;
+			this.translatedBatchCount = 0;
+			this.translatedCommandCount = 0;
+			this.executedBatchCount = 0;
+			this.executedCommandCount = 0;
+			this.culledBatchCount = 0;
+			this.fallbackBatchCount = 0;
+			this.fallbackCommandCount = 0;
+			this.lastFallbackReason = "none";
+			this.preparedGeneratedBatches.clear();
+			this.scheduledGeneratedBatches.clear();
+		}
+
+		private void finish() {
+			this.pendingPreparedBatch = null;
+			this.commandBuffer = null;
+			this.preparedGeneratedBatches.clear();
+			this.scheduledGeneratedBatches.clear();
+			this.viewport = null;
+			this.pass = null;
 		}
 
 		private String describePass() {
-			return this.pass.isTranslucent() ? "translucent" : "opaque";
+			return this.pass != null && this.pass.isTranslucent() ? "translucent" : "opaque";
 		}
 	}
 
@@ -1255,6 +1584,19 @@ public final class SodiumBridge {
 		private int lastFrustumTestedSectionCount;
 		private int lastFrustumVisibleSectionCount;
 		private int lastFrustumCulledSectionCount;
+		private boolean lastOpaqueComputeCullingEnabled;
+		private int lastOpaqueComputeDispatchCount;
+		private int lastOpaqueComputeFailureCount;
+		private int lastOpaqueComputeComparedBatchCount;
+		private int lastOpaqueComputeMatchedBatchCount;
+		private int lastOpaqueComputeMismatchedBatchCount;
+		private int lastOpaqueComputeSkipMismatchCount;
+		private int lastOpaqueComputeCommandCountMismatchCount;
+		private int lastOpaqueComputeVisibleSectionMismatchCount;
+		private int lastOpaqueComputeCommandMismatchCount;
+		private String lastOpaqueComputeMismatchReason = "none";
+		private int lastOpaqueComputeGeneratedBatchCount;
+		private int lastOpaqueComputeGeneratedCommandCount;
 		private long overriddenPassCount;
 		private long fallbackPassCount;
 		private long completedPassCount;
@@ -1304,6 +1646,21 @@ public final class SodiumBridge {
 			this.lastFrustumTestedSectionCount = context.frustumTestedSectionCount;
 			this.lastFrustumVisibleSectionCount = context.frustumVisibleSectionCount;
 			this.lastFrustumCulledSectionCount = context.frustumCulledSectionCount;
+			if (!context.pass.isTranslucent()) {
+				this.lastOpaqueComputeCullingEnabled = context.computeCullingEnabled;
+				this.lastOpaqueComputeDispatchCount = context.computeDispatchCount;
+				this.lastOpaqueComputeFailureCount = context.computeFailureCount;
+				this.lastOpaqueComputeComparedBatchCount = context.computeComparedBatchCount;
+				this.lastOpaqueComputeMatchedBatchCount = context.computeMatchedBatchCount;
+				this.lastOpaqueComputeMismatchedBatchCount = context.computeMismatchedBatchCount;
+				this.lastOpaqueComputeSkipMismatchCount = context.computeSkipMismatchCount;
+				this.lastOpaqueComputeCommandCountMismatchCount = context.computeCommandCountMismatchCount;
+				this.lastOpaqueComputeVisibleSectionMismatchCount = context.computeVisibleSectionMismatchCount;
+				this.lastOpaqueComputeCommandMismatchCount = context.computeCommandMismatchCount;
+				this.lastOpaqueComputeMismatchReason = context.lastComputeMismatchReason;
+				this.lastOpaqueComputeGeneratedBatchCount = context.computeGeneratedBatchCount;
+				this.lastOpaqueComputeGeneratedCommandCount = context.computeGeneratedCommandCount;
+			}
 			if (this.lastPassFullyOverridden) {
 				this.overriddenPassCount++;
 			} else if (context.seenBatchCount > 0) {
@@ -1343,6 +1700,11 @@ public final class SodiumBridge {
 			lines.add("Generated commands: " + this.lastGeneratedCommandCount);
 			lines.add("Compute generated batches: " + this.lastComputeGeneratedBatchCount);
 			lines.add("Compute generated commands: " + this.lastComputeGeneratedCommandCount);
+			lines.add("Opaque compute enabled: " + this.lastOpaqueComputeCullingEnabled);
+			lines.add("Opaque compute dispatches: " + this.lastOpaqueComputeDispatchCount);
+			lines.add("Opaque compute failures: " + this.lastOpaqueComputeFailureCount);
+			lines.add("Opaque compute generated batches: " + this.lastOpaqueComputeGeneratedBatchCount);
+			lines.add("Opaque compute generated commands: " + this.lastOpaqueComputeGeneratedCommandCount);
 			lines.add("Generated skip batches: " + this.lastGeneratedSkipBatchCount);
 			lines.add("Translated batches: " + this.lastTranslatedBatchCount);
 			lines.add("Translated commands: " + this.lastTranslatedCommandCount);
@@ -1353,14 +1715,6 @@ public final class SodiumBridge {
 			lines.add("Sync generated batches: " + this.lastSyncGeneratedBatchCount);
 			lines.add("Compute dispatches: " + this.lastComputeDispatchCount);
 			lines.add("Compute failures: " + this.lastComputeFailureCount);
-			lines.add("Compute compared batches: " + this.lastComputeComparedBatchCount);
-			lines.add("Compute matched batches: " + this.lastComputeMatchedBatchCount);
-			lines.add("Compute mismatched batches: " + this.lastComputeMismatchedBatchCount);
-			lines.add("Last compute mismatch: " + this.lastComputeMismatchReason);
-			lines.add("Draw compared batches: " + this.lastDrawComparedBatchCount);
-			lines.add("Draw matched batches: " + this.lastDrawMatchedBatchCount);
-			lines.add("Draw mismatched batches: " + this.lastDrawMismatchedBatchCount);
-			lines.add("Last draw mismatch: " + this.lastDrawMismatchReason);
 			lines.add("Visible regions: " + this.lastVisibleRegionCount);
 			lines.add("Frustum tested regions: " + this.lastFrustumTestedRegionCount);
 			lines.add("Frustum culled regions: " + this.lastFrustumCulledRegionCount);
@@ -1426,6 +1780,19 @@ public final class SodiumBridge {
 			this.lastFrustumTestedSectionCount = 0;
 			this.lastFrustumVisibleSectionCount = 0;
 			this.lastFrustumCulledSectionCount = 0;
+			this.lastOpaqueComputeCullingEnabled = false;
+			this.lastOpaqueComputeDispatchCount = 0;
+			this.lastOpaqueComputeFailureCount = 0;
+			this.lastOpaqueComputeComparedBatchCount = 0;
+			this.lastOpaqueComputeMatchedBatchCount = 0;
+			this.lastOpaqueComputeMismatchedBatchCount = 0;
+			this.lastOpaqueComputeSkipMismatchCount = 0;
+			this.lastOpaqueComputeCommandCountMismatchCount = 0;
+			this.lastOpaqueComputeVisibleSectionMismatchCount = 0;
+			this.lastOpaqueComputeCommandMismatchCount = 0;
+			this.lastOpaqueComputeMismatchReason = "none";
+			this.lastOpaqueComputeGeneratedBatchCount = 0;
+			this.lastOpaqueComputeGeneratedCommandCount = 0;
 			this.overriddenPassCount = 0L;
 			this.fallbackPassCount = 0L;
 			this.completedPassCount = 0L;
@@ -1479,6 +1846,8 @@ public final class SodiumBridge {
 		int frustumVisibleSectionCount,
 		int frustumCulledSectionCount
 	) {
+		private static final ByteBuffer EMPTY_COMMANDS = ByteBuffer.allocate(0);
+
 		private static GeneratedCommandBatch draw(
 			ByteBuffer commands,
 			int commandCount,
@@ -1573,7 +1942,7 @@ public final class SodiumBridge {
 			int frustumCulledSectionCount
 		) {
 			return new GeneratedCommandBatch(
-				ByteBuffer.allocate(0),
+				EMPTY_COMMANDS,
 				0,
 				0,
 				0L,

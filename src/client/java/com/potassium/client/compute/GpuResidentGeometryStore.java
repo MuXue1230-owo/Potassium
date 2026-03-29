@@ -50,6 +50,11 @@ final class GpuResidentGeometryStore {
 		boundStorageBinding = binding;
 	}
 
+	static void preallocateSlotCapacity(int requiredRegionSlots) {
+		initialize();
+		ensureCapacity(requiredRegionSlots);
+	}
+
 	static void unbindAsStorage(int binding) {
 		GL30C.glBindBufferBase(GL43C.GL_SHADER_STORAGE_BUFFER, binding, 0);
 		if (boundStorageBinding == binding) {
@@ -81,6 +86,10 @@ final class GpuResidentGeometryStore {
 		for (int sectionIndex = start; sectionIndex < endExclusive; sectionIndex++) {
 			uploadSectionRecord(metadata, sectionIndex);
 		}
+	}
+
+	static long capacityBytes() {
+		return (long) regionSlotCapacity * regionStrideBytes();
 	}
 
 	private static void uploadSectionRecord(GpuResidentSectionMetadataStore.CachedRegionMetadata metadata, int sectionIndex) {

@@ -202,8 +202,10 @@ void main() {
 	if (sectionLocalIndex >= region.sectionCount) {
 		return;
 	}
-
 	SectionCommandInput section = sections[region.sectionBase + sectionLocalIndex];
+	if (section.regionInfo.y == 0u) {
+		return;
+	}
 	if (!isSectionVisibleFrustum(section.sphere.xyz - uCameraPosition)) {
 		return;
 	}

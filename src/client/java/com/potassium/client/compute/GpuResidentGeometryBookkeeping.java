@@ -38,6 +38,7 @@ public final class GpuResidentGeometryBookkeeping {
 			!Arrays.equals(existingRecord.sectionPresenceBits(), sectionPresenceBits);
 		metadata.assignSceneIds(sceneId, sectionSceneIdsByLocalSection);
 		GpuResidentGeometryStore.syncRegion(metadata, fullSync);
+		metadata.markUploaded();
 		RECORDS.put(
 			storage,
 			new ResidentRegionRecord(

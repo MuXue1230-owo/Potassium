@@ -135,10 +135,10 @@ public final class SectionVisibilityCompute {
 			enabled = true;
 			disableReason = "none";
 			PotassiumClientMod.LOGGER.info(
-				"Section visibility compute shader ready (preallocated regionSlots={}, regionDescriptors={}, sectionBuffer={} MiB)",
-				regionSlotCapacity,
+				"Section visibility compute shader ready (preallocated regionSlots={}, regionDescriptors={}, geometryBuffer={} MiB)",
+				GpuMemoryBudget.current().computeRegionSlots(),
 				regionDescriptorCapacity,
-				sectionBufferBytes(regionSlotCapacity) / (1024L * 1024L)
+				GpuResidentGeometryStore.capacityBytes() / (1024L * 1024L)
 			);
 		} catch (RuntimeException exception) {
 			disable("initialization failed", exception);
@@ -223,9 +223,8 @@ public final class SectionVisibilityCompute {
 		ByteBuffer descriptorView = thisFrameRegionDescriptorView(regionCount);
 		for (int regionIndex = 0; regionIndex < regionCount; regionIndex++) {
 			GpuResidentSectionMetadataStore.CachedRegionMetadata cachedMetadata = cachedMetadatas[regionIndex];
-			GpuResidentSectionMetadataStore.uploadIfDirty(cachedMetadata);
 			descriptorView.putInt(cachedMetadata.sectionBaseIndex());
-			descriptorView.putInt(cachedMetadata.sectionCount());
+			descriptorView.putInt(MAX_REGION_SECTION_COUNT);
 			descriptorView.putInt(regionInputs.get(regionIndex).firstCommandIndex());
 			descriptorView.putInt(0);
 		}
@@ -234,7 +233,7 @@ public final class SectionVisibilityCompute {
 		resetCounters(regionCount);
 
 		int previousProgram = GL11C.glGetInteger(GL20C.GL_CURRENT_PROGRAM);
-		GpuResidentSectionMetadataStore.bindAsStorage(0);
+		GpuResidentGeometryStore.bindAsStorage(0);
 		GL30C.glBindBufferBase(GL43C.GL_SHADER_STORAGE_BUFFER, 1, regionDescriptorBufferHandle);
 		GL30C.glBindBufferBase(GL43C.GL_SHADER_STORAGE_BUFFER, 2, counterBufferHandle);
 		commandBuffer.bindAsStorage(3);
@@ -263,7 +262,7 @@ public final class SectionVisibilityCompute {
 			);
 		} finally {
 			GL20C.glUseProgram(previousProgram);
-			GL30C.glBindBufferBase(GL43C.GL_SHADER_STORAGE_BUFFER, 0, 0);
+			GpuResidentGeometryStore.unbindAsStorage(0);
 			GL30C.glBindBufferBase(GL43C.GL_SHADER_STORAGE_BUFFER, 1, 0);
 			GL30C.glBindBufferBase(GL43C.GL_SHADER_STORAGE_BUFFER, 2, 0);
 			GL30C.glBindBufferBase(GL43C.GL_SHADER_STORAGE_BUFFER, 3, 0);
@@ -768,6 +767,7 @@ public final class SectionVisibilityCompute {
 	private static boolean tryPreallocateBudget(GpuMemoryBudget.Budget budget) {
 		try {
 			GpuResidentSectionMetadataStore.preallocateSlotCapacity(budget.computeRegionSlots());
+			GpuResidentGeometryStore.preallocateSlotCapacity(budget.computeRegionSlots());
 			ensureDynamicCapacity(budget.computeRegionDescriptors());
 			return true;
 		} catch (RuntimeException exception) {

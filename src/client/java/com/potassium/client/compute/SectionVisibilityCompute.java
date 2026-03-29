@@ -26,7 +26,9 @@ import org.lwjgl.opengl.GL20C;
 import org.lwjgl.opengl.GL30C;
 import org.lwjgl.opengl.GL42C;
 import org.lwjgl.opengl.GL43C;
+import org.lwjgl.opengl.GL46C;
 import org.lwjgl.opengl.GL45C;
+import org.lwjgl.opengl.ARBIndirectParameters;
 import org.lwjgl.system.MemoryUtil;
 
 public final class SectionVisibilityCompute {
@@ -124,7 +126,8 @@ public final class SectionVisibilityCompute {
 		CameraTransform cameraTransform,
 		float[] frustumPlanes,
 		boolean useBlockFaceCulling,
-		boolean preferLocalIndices
+		boolean preferLocalIndices,
+		boolean readBackCounters
 	) {
 		if (!enabled || regionInputs.isEmpty()) {
 			return ComputePassResult.empty();
@@ -184,10 +187,22 @@ public final class SectionVisibilityCompute {
 			GL30C.glBindBufferBase(GL43C.GL_SHADER_STORAGE_BUFFER, 2, 0);
 		}
 
+		if (!readBackCounters) {
+			return new ComputePassResult(true, false, testedSectionCounts, new int[regionInputs.size()], new int[regionInputs.size()]);
+		}
+
 		int[] commandCounts = new int[regionInputs.size()];
 		int[] visibleSectionCounts = new int[regionInputs.size()];
 		readCounters(regionInputs, commandCounts, visibleSectionCounts);
-		return new ComputePassResult(true, testedSectionCounts, commandCounts, visibleSectionCounts);
+		return new ComputePassResult(true, true, testedSectionCounts, commandCounts, visibleSectionCounts);
+	}
+
+	public static void bindCountersAsParameterBuffer() {
+		GL15C.glBindBuffer(parameterBufferTarget(), counterBufferHandle);
+	}
+
+	public static long commandCountOffsetBytes(int regionIndex) {
+		return (long) ((regionIndex * COUNTERS_PER_REGION) + REGION_COMMAND_COUNT_OFFSET) * Integer.BYTES;
 	}
 
 	public static void shutdown() {
@@ -446,6 +461,10 @@ public final class SectionVisibilityCompute {
 		disableReason = reason;
 	}
 
+	private static int parameterBufferTarget() {
+		return GLCapabilities.isVersion46() ? GL46C.GL_PARAMETER_BUFFER : ARBIndirectParameters.GL_PARAMETER_BUFFER_ARB;
+	}
+
 	public record RegionBatchInput(
 		RenderRegion region,
 		SectionRenderDataStorage storage,
@@ -458,11 +477,12 @@ public final class SectionVisibilityCompute {
 
 	public record ComputePassResult(
 		boolean dispatched,
+		boolean countersReadBack,
 		int[] testedSectionCounts,
 		int[] commandCounts,
 		int[] visibleSectionCounts
 	) {
-		private static final ComputePassResult EMPTY = new ComputePassResult(false, new int[0], new int[0], new int[0]);
+		private static final ComputePassResult EMPTY = new ComputePassResult(false, false, new int[0], new int[0], new int[0]);
 
 		public static ComputePassResult empty() {
 			return EMPTY;
@@ -473,7 +493,7 @@ public final class SectionVisibilityCompute {
 				return EMPTY;
 			}
 
-			return new ComputePassResult(false, new int[regionCount], new int[regionCount], new int[regionCount]);
+			return new ComputePassResult(false, false, new int[regionCount], new int[regionCount], new int[regionCount]);
 		}
 	}
 }

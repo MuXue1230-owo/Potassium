@@ -15,6 +15,7 @@ public final class GLCapabilities {
 	private static int majorVersion;
 	private static int minorVersion;
 	private static boolean hasIndirectDraw;
+	private static boolean hasIndirectCount;
 	private static boolean hasComputeShader;
 	private static boolean hasSSBO;
 	private static boolean hasPersistentMapping;
@@ -61,6 +62,7 @@ public final class GLCapabilities {
 		}
 
 		hasIndirectDraw = caps.GL_ARB_multi_draw_indirect || isAtLeast(4, 3);
+		hasIndirectCount = caps.GL_ARB_indirect_parameters || isAtLeast(4, 6);
 		hasComputeShader = caps.GL_ARB_compute_shader || isAtLeast(4, 3);
 		hasSSBO = caps.GL_ARB_shader_storage_buffer_object || isAtLeast(4, 3);
 		hasPersistentMapping = caps.GL_ARB_buffer_storage || isAtLeast(4, 4);
@@ -79,6 +81,7 @@ public final class GLCapabilities {
 		PotassiumClientMod.LOGGER.info("Raw OpenGL version string: {}", version);
 		PotassiumClientMod.LOGGER.info("OpenGL version: {}.{}", majorVersion, minorVersion);
 		PotassiumClientMod.LOGGER.info("Indirect draw: {}", hasIndirectDraw);
+		PotassiumClientMod.LOGGER.info("Indirect count: {}", hasIndirectCount);
 		PotassiumClientMod.LOGGER.info("Compute shader: {}", hasComputeShader);
 		PotassiumClientMod.LOGGER.info("SSBO: {}", hasSSBO);
 		PotassiumClientMod.LOGGER.info("Persistent mapping: {}", hasPersistentMapping);
@@ -107,6 +110,10 @@ public final class GLCapabilities {
 
 	public static boolean hasComputeShader() {
 		return hasComputeShader;
+	}
+
+	public static boolean hasIndirectCount() {
+		return hasIndirectCount;
 	}
 
 	public static boolean hasSSBO() {

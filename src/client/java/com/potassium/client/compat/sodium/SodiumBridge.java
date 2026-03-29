@@ -4,6 +4,7 @@ import com.potassium.client.PotassiumClientMod;
 import com.potassium.client.compute.SectionVisibilityCompute;
 import com.potassium.client.compute.SectionVisibilityCompute.ComputePassResult;
 import com.potassium.client.compute.SectionVisibilityCompute.RegionBatchInput;
+import com.potassium.client.gl.GLCapabilities;
 import com.potassium.client.render.indirect.IndexedCommandScratchBuffer;
 import com.potassium.client.render.indirect.IndexedIndirectCommandBuffer;
 import com.potassium.client.render.indirect.IndirectBackend;
@@ -37,8 +38,11 @@ import net.caffeinemc.mods.sodium.client.render.chunk.terrain.TerrainRenderPass;
 import net.caffeinemc.mods.sodium.client.render.viewport.CameraTransform;
 import net.caffeinemc.mods.sodium.client.render.viewport.Viewport;
 import net.caffeinemc.mods.sodium.client.util.iterator.ByteIterator;
+import org.lwjgl.opengl.ARBIndirectParameters;
 import org.lwjgl.opengl.GL11C;
+import org.lwjgl.opengl.GL15C;
 import org.lwjgl.opengl.GL43C;
+import org.lwjgl.opengl.GL46C;
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.system.Pointer;
 
@@ -262,17 +266,29 @@ public final class SodiumBridge {
 
 			try (DrawCommandList ignored = commandList.beginTessellating(tessellation)) {
 				context.commandBuffer.bindForDraw();
-				GL43C.glMultiDrawElementsIndirect(
-					tessellation.getPrimitiveType().getId(),
-					GL11C.GL_UNSIGNED_INT,
-					context.commandBuffer.drawOffsetBytes(preparedBatch.firstCommandIndex()),
-					preparedBatch.commandCount(),
-					IndexedIndirectCommandBuffer.COMMAND_STRIDE_BYTES
-				);
+				if (preparedBatch.gpuCounted()) {
+					SectionVisibilityCompute.bindCountersAsParameterBuffer();
+					drawIndexedIndirectCount(
+						tessellation,
+						context.commandBuffer.drawOffsetBytes(preparedBatch.firstCommandIndex()),
+						preparedBatch.drawCountOffsetBytes(),
+						preparedBatch.commandCount()
+					);
+				} else {
+					GL43C.glMultiDrawElementsIndirect(
+						tessellation.getPrimitiveType().getId(),
+						GL11C.GL_UNSIGNED_INT,
+						context.commandBuffer.drawOffsetBytes(preparedBatch.firstCommandIndex()),
+						preparedBatch.commandCount(),
+						IndexedIndirectCommandBuffer.COMMAND_STRIDE_BYTES
+					);
+				}
 			}
 
 			context.executedBatchCount++;
-			context.executedCommandCount += preparedBatch.commandCount();
+			if (!preparedBatch.gpuCounted()) {
+				context.executedCommandCount += preparedBatch.commandCount();
+			}
 			recordOverrideSuccess();
 			return true;
 		} catch (RuntimeException exception) {
@@ -375,6 +391,7 @@ public final class SodiumBridge {
 	) {
 		boolean useBlockFaceCulling = SodiumClientMod.options().performance.useBlockFaceCulling;
 		boolean preferLocalIndices = renderPass.isTranslucent() && fragmentDiscard;
+		boolean useGpuDrawCount = GLCapabilities.hasIndirectCount();
 		List<RegionBatchInput> regionInputs = new ArrayList<>();
 		int nextFirstCommandIndex = 0;
 
@@ -429,7 +446,8 @@ public final class SodiumBridge {
 				cameraTransform,
 				context.computeFrustumPlanes,
 				useBlockFaceCulling,
-				preferLocalIndices
+				preferLocalIndices,
+				!useGpuDrawCount
 			);
 			if (computePassResult.dispatched()) {
 				context.computeDispatchCount++;
@@ -439,25 +457,39 @@ public final class SodiumBridge {
 			for (int regionIndex = 0; regionIndex < regionInputs.size(); regionIndex++) {
 				RegionBatchInput regionInput = regionInputs.get(regionIndex);
 				int testedSectionCount = computePassResult.testedSectionCounts()[regionIndex];
-				int commandCount = computePassResult.commandCounts()[regionIndex];
-				int visibleSectionCount = computePassResult.visibleSectionCounts()[regionIndex];
-				GeneratedCommandBatch generatedBatch = commandCount > 0
-					? GeneratedCommandBatch.compute(
+				GeneratedCommandBatch generatedBatch;
+				if (useGpuDrawCount) {
+					generatedBatch = GeneratedCommandBatch.computeCounted(
 						regionInput.firstCommandIndex(),
-						commandCount,
+						regionInput.maxCommandCount(),
+						SectionVisibilityCompute.commandCountOffsetBytes(regionIndex),
 						context.viewport != null ? 1 : 0,
 						0,
 						testedSectionCount,
-						visibleSectionCount,
-						testedSectionCount - visibleSectionCount
-					)
-					: GeneratedCommandBatch.skip(
-						context.viewport != null ? 1 : 0,
 						0,
-						testedSectionCount,
-						visibleSectionCount,
-						testedSectionCount - visibleSectionCount
+						0
 					);
+				} else {
+					int commandCount = computePassResult.commandCounts()[regionIndex];
+					int visibleSectionCount = computePassResult.visibleSectionCounts()[regionIndex];
+					generatedBatch = commandCount > 0
+						? GeneratedCommandBatch.compute(
+							regionInput.firstCommandIndex(),
+							commandCount,
+							context.viewport != null ? 1 : 0,
+							0,
+							testedSectionCount,
+							visibleSectionCount,
+							testedSectionCount - visibleSectionCount
+						)
+						: GeneratedCommandBatch.skip(
+							context.viewport != null ? 1 : 0,
+							0,
+							testedSectionCount,
+							visibleSectionCount,
+							testedSectionCount - visibleSectionCount
+						);
+				}
 				context.preparedGeneratedBatches.put(regionInput.region(), generatedBatch);
 			}
 		} catch (RuntimeException exception) {
@@ -489,12 +521,19 @@ public final class SodiumBridge {
 
 		PreparedBatch preparedBatch;
 		if (generatedBatch.gpuGenerated()) {
-			preparedBatch = PreparedBatch.draw(
-				generatedBatch.firstCommandIndex(),
-				generatedBatch.commandCount(),
-				CommandSource.GENERATED_COMPUTE,
-				false
-			);
+			preparedBatch = generatedBatch.gpuCounted()
+				? PreparedBatch.drawCounted(
+					generatedBatch.firstCommandIndex(),
+					generatedBatch.commandCount(),
+					generatedBatch.drawCountOffsetBytes(),
+					CommandSource.GENERATED_COMPUTE
+				)
+				: PreparedBatch.draw(
+					generatedBatch.firstCommandIndex(),
+					generatedBatch.commandCount(),
+					CommandSource.GENERATED_COMPUTE,
+					false
+				);
 		} else {
 			int firstCommandIndex = context.commandBuffer.appendCommands(
 				generatedBatch.commands(),
@@ -635,7 +674,9 @@ public final class SodiumBridge {
 
 	private static void recordMirroredBatch(RenderPassContext context, PreparedBatch preparedBatch) {
 		context.mirroredBatchCount++;
-		context.mirroredCommandCount += preparedBatch.commandCount();
+		if (!preparedBatch.gpuCounted()) {
+			context.mirroredCommandCount += preparedBatch.commandCount();
+		}
 
 		if (preparedBatch.source() == CommandSource.TRANSLATED) {
 			context.translatedBatchCount++;
@@ -644,10 +685,14 @@ public final class SodiumBridge {
 		}
 
 		context.generatedBatchCount++;
-		context.generatedCommandCount += preparedBatch.commandCount();
-		if (preparedBatch.source() == CommandSource.GENERATED_COMPUTE) {
+		if (!preparedBatch.gpuCounted()) {
+			context.generatedCommandCount += preparedBatch.commandCount();
+		}
+		if (preparedBatch.source() == CommandSource.GENERATED_COMPUTE && !preparedBatch.gpuCounted()) {
 			context.computeGeneratedBatchCount++;
 			context.computeGeneratedCommandCount += preparedBatch.commandCount();
+		} else if (preparedBatch.source() == CommandSource.GENERATED_COMPUTE) {
+			context.computeGeneratedBatchCount++;
 		}
 	}
 
@@ -656,7 +701,7 @@ public final class SodiumBridge {
 			int executedCommandCount = context.executedCommandCount;
 			context.commandBuffer.rewindToCommandCount(executedCommandCount);
 			context.mirroredCommandCount = Math.max(context.mirroredCommandCount - preparedBatch.commandCount(), executedCommandCount);
-		} else {
+		} else if (!preparedBatch.gpuCounted()) {
 			context.mirroredCommandCount = Math.max(context.mirroredCommandCount - preparedBatch.commandCount(), 0);
 		}
 
@@ -669,10 +714,14 @@ public final class SodiumBridge {
 		}
 
 		context.generatedBatchCount = Math.max(context.generatedBatchCount - 1, 0);
-		context.generatedCommandCount = Math.max(context.generatedCommandCount - preparedBatch.commandCount(), 0);
-		if (preparedBatch.source() == CommandSource.GENERATED_COMPUTE) {
+		if (!preparedBatch.gpuCounted()) {
+			context.generatedCommandCount = Math.max(context.generatedCommandCount - preparedBatch.commandCount(), 0);
+		}
+		if (preparedBatch.source() == CommandSource.GENERATED_COMPUTE && !preparedBatch.gpuCounted()) {
 			context.computeGeneratedBatchCount = Math.max(context.computeGeneratedBatchCount - 1, 0);
 			context.computeGeneratedCommandCount = Math.max(context.computeGeneratedCommandCount - preparedBatch.commandCount(), 0);
+		} else if (preparedBatch.source() == CommandSource.GENERATED_COMPUTE) {
+			context.computeGeneratedBatchCount = Math.max(context.computeGeneratedBatchCount - 1, 0);
 		}
 	}
 
@@ -742,6 +791,34 @@ public final class SodiumBridge {
 
 			previousVisible = currentVisible;
 		}
+	}
+
+	private static void drawIndexedIndirectCount(
+		GlTessellation tessellation,
+		long indirectOffsetBytes,
+		long drawCountOffsetBytes,
+		int maxDrawCount
+	) {
+		if (GLCapabilities.isVersion46()) {
+			GL46C.glMultiDrawElementsIndirectCount(
+				tessellation.getPrimitiveType().getId(),
+				GL11C.GL_UNSIGNED_INT,
+				indirectOffsetBytes,
+				drawCountOffsetBytes,
+				maxDrawCount,
+				IndexedIndirectCommandBuffer.COMMAND_STRIDE_BYTES
+			);
+			return;
+		}
+
+		ARBIndirectParameters.glMultiDrawElementsIndirectCountARB(
+			tessellation.getPrimitiveType().getId(),
+			GL11C.GL_UNSIGNED_INT,
+			indirectOffsetBytes,
+			drawCountOffsetBytes,
+			maxDrawCount,
+			IndexedIndirectCommandBuffer.COMMAND_STRIDE_BYTES
+		);
 	}
 
 	private static boolean isRegionVisible(Viewport viewport, RenderRegion region) {
@@ -1082,16 +1159,27 @@ public final class SodiumBridge {
 	private record PreparedBatch(
 		int firstCommandIndex,
 		int commandCount,
+		long drawCountOffsetBytes,
 		CommandSource source,
 		boolean skipDraw,
-		boolean needsUpload
+		boolean needsUpload,
+		boolean gpuCounted
 	) {
 		private static PreparedBatch draw(int firstCommandIndex, int commandCount, CommandSource source, boolean needsUpload) {
-			return new PreparedBatch(firstCommandIndex, commandCount, source, false, needsUpload);
+			return new PreparedBatch(firstCommandIndex, commandCount, 0L, source, false, needsUpload, false);
+		}
+
+		private static PreparedBatch drawCounted(
+			int firstCommandIndex,
+			int maxCommandCount,
+			long drawCountOffsetBytes,
+			CommandSource source
+		) {
+			return new PreparedBatch(firstCommandIndex, maxCommandCount, drawCountOffsetBytes, source, false, false, true);
 		}
 
 		private static PreparedBatch skip(CommandSource source) {
-			return new PreparedBatch(0, 0, source, true, false);
+			return new PreparedBatch(0, 0, 0L, source, true, false, false);
 		}
 	}
 
@@ -1099,8 +1187,10 @@ public final class SodiumBridge {
 		ByteBuffer commands,
 		int firstCommandIndex,
 		int commandCount,
+		long drawCountOffsetBytes,
 		boolean skipDraw,
 		boolean gpuGenerated,
+		boolean gpuCounted,
 		int frustumTestedRegionCount,
 		int frustumCulledRegionCount,
 		int frustumTestedSectionCount,
@@ -1120,6 +1210,8 @@ public final class SodiumBridge {
 				commands,
 				0,
 				commandCount,
+				0L,
+				false,
 				false,
 				false,
 				frustumTestedRegionCount,
@@ -1153,7 +1245,35 @@ public final class SodiumBridge {
 				null,
 				firstCommandIndex,
 				commandCount,
+				0L,
 				false,
+				true,
+				false,
+				frustumTestedRegionCount,
+				frustumCulledRegionCount,
+				frustumTestedSectionCount,
+				frustumVisibleSectionCount,
+				frustumCulledSectionCount
+			);
+		}
+
+		private static GeneratedCommandBatch computeCounted(
+			int firstCommandIndex,
+			int maxCommandCount,
+			long drawCountOffsetBytes,
+			int frustumTestedRegionCount,
+			int frustumCulledRegionCount,
+			int frustumTestedSectionCount,
+			int frustumVisibleSectionCount,
+			int frustumCulledSectionCount
+		) {
+			return new GeneratedCommandBatch(
+				null,
+				firstCommandIndex,
+				maxCommandCount,
+				drawCountOffsetBytes,
+				false,
+				true,
 				true,
 				frustumTestedRegionCount,
 				frustumCulledRegionCount,
@@ -1174,7 +1294,9 @@ public final class SodiumBridge {
 				ByteBuffer.allocate(0),
 				0,
 				0,
+				0L,
 				true,
+				false,
 				false,
 				frustumTestedRegionCount,
 				frustumCulledRegionCount,

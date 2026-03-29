@@ -41,6 +41,7 @@ public final class PotassiumClientMod implements ClientModInitializer {
 		LOGGER.info("Potassium initialized");
 		LOGGER.info("OpenGL version: {}.{}", GLCapabilities.getMajorVersion(), GLCapabilities.getMinorVersion());
 		LOGGER.info("Indirect draw: {}", GLCapabilities.hasIndirectDraw());
+		LOGGER.info("Indirect count: {}", GLCapabilities.hasIndirectCount());
 		LOGGER.info("Compute shader: {}", GLCapabilities.hasComputeShader());
 		LOGGER.info("Persistent mapping: {}", GLCapabilities.hasPersistentMapping());
 		LOGGER.info("Section visibility compute: {}", SectionVisibilityCompute.isEnabled());

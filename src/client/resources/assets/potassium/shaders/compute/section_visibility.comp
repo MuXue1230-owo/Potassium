@@ -26,20 +26,30 @@ struct SectionCommandInput {
 	uvec4 regionInfo;
 };
 
+struct RegionDescriptor {
+	uint sectionBase;
+	uint sectionCount;
+	uint commandBase;
+	uint padding;
+};
+
 layout(std430, binding = 0) readonly buffer SectionInputs {
 	SectionCommandInput sections[];
 };
 
-layout(std430, binding = 1) buffer CommandCounters {
+layout(std430, binding = 1) readonly buffer ActiveRegions {
+	RegionDescriptor regions[];
+};
+
+layout(std430, binding = 2) buffer CommandCounters {
 	uint counterValues[];
 };
 
-layout(std430, binding = 2) buffer IndirectCommands {
+layout(std430, binding = 3) buffer IndirectCommands {
 	uint commandWords[];
 };
 
 uniform vec4 uFrustumPlanes[6];
-uniform uint uSectionCount;
 uniform vec3 uCameraPosition;
 uniform ivec3 uCameraBlockPosition;
 uniform uint uUseBlockFaceCulling;
@@ -123,7 +133,7 @@ void writeCommand(uint slot, uint count, uint firstIndex, uint baseVertex) {
 	commandWords[commandWordIndex + 4u] = 0u;
 }
 
-void emitLocalCommands(SectionCommandInput section, uint regionIndex, uint regionCommandBase, uint visibleFaces) {
+void emitLocalCommands(SectionCommandInput section, uint regionIndex, uint commandBase, uint visibleFaces) {
 	uint baseElement = section.drawInfo.x;
 	uint baseVertex = section.drawInfo.y;
 
@@ -132,7 +142,7 @@ void emitLocalCommands(SectionCommandInput section, uint regionIndex, uint regio
 		uint elementCount = (vertexCount >> 2u) * 6u;
 
 		if (((visibleFaces >> facing) & 1u) != 0u) {
-			uint slot = regionCommandBase + atomicAdd(counterValues[regionCounterIndex(regionIndex, REGION_COMMAND_COUNT_OFFSET)], 1u);
+			uint slot = commandBase + atomicAdd(counterValues[regionCounterIndex(regionIndex, REGION_COMMAND_COUNT_OFFSET)], 1u);
 			writeCommand(slot, elementCount, baseElement, baseVertex);
 		}
 
@@ -141,7 +151,7 @@ void emitLocalCommands(SectionCommandInput section, uint regionIndex, uint regio
 	}
 }
 
-void emitSharedCommands(SectionCommandInput section, uint regionIndex, uint regionCommandBase, uint visibleFaces) {
+void emitSharedCommands(SectionCommandInput section, uint regionIndex, uint commandBase, uint visibleFaces) {
 	uint baseElement = section.drawInfo.x;
 	uint currentBaseVertex = section.drawInfo.y;
 	uint visibleRunVertexCount = 0u;
@@ -166,7 +176,7 @@ void emitSharedCommands(SectionCommandInput section, uint regionIndex, uint regi
 				}
 
 				uint elementCount = (visibleRunVertexCount >> 2u) * 6u;
-				uint slot = regionCommandBase + atomicAdd(counterValues[regionCounterIndex(regionIndex, REGION_COMMAND_COUNT_OFFSET)], 1u);
+				uint slot = commandBase + atomicAdd(counterValues[regionCounterIndex(regionIndex, REGION_COMMAND_COUNT_OFFSET)], 1u);
 				writeCommand(slot, elementCount, baseElement, currentBaseVertex);
 				currentBaseVertex += visibleRunVertexCount;
 				visibleRunVertexCount = 0u;
@@ -182,18 +192,18 @@ void emitSharedCommands(SectionCommandInput section, uint regionIndex, uint regi
 }
 
 void main() {
-	uint index = gl_GlobalInvocationID.x;
-	if (index >= uSectionCount) {
+	uint regionIndex = gl_WorkGroupID.x;
+	RegionDescriptor region = regions[regionIndex];
+	uint sectionLocalIndex = (gl_WorkGroupID.y * gl_WorkGroupSize.x) + gl_LocalInvocationID.x;
+	if (sectionLocalIndex >= region.sectionCount) {
 		return;
 	}
 
-	SectionCommandInput section = sections[index];
+	SectionCommandInput section = sections[region.sectionBase + sectionLocalIndex];
 	if (!isSphereVisible(section.sphere)) {
 		return;
 	}
 
-	uint regionIndex = section.regionInfo.x;
-	uint regionCommandBase = section.regionInfo.y;
 	atomicAdd(counterValues[regionCounterIndex(regionIndex, REGION_VISIBLE_SECTION_COUNT_OFFSET)], 1u);
 	uint visibleFaces = computeVisibleFaces(section.sectionInfo.xyz) & uint(section.sectionInfo.w);
 	if (visibleFaces == 0u) {
@@ -201,8 +211,8 @@ void main() {
 	}
 
 	if ((section.regionInfo.z & FLAG_USE_LOCAL_INDEX) != 0u) {
-		emitLocalCommands(section, regionIndex, regionCommandBase, visibleFaces);
+		emitLocalCommands(section, regionIndex, region.commandBase, visibleFaces);
 	} else {
-		emitSharedCommands(section, regionIndex, regionCommandBase, visibleFaces);
+		emitSharedCommands(section, regionIndex, region.commandBase, visibleFaces);
 	}
 }

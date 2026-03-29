@@ -121,7 +121,9 @@ public final class SodiumBridge {
 			return;
 		}
 
-		if (context.computeCullingEnabled) {
+		boolean useComputePath = context.computeCullingEnabled && !renderPass.isTranslucent();
+		context.computeCullingEnabled = useComputePath;
+		if (useComputePath) {
 			SectionVisibilityCompute.captureFrustumPlanes(matrices, context.computeFrustumPlanes);
 			scheduleComputeGeneratedBatches(
 				context,

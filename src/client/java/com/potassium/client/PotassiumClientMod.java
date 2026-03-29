@@ -2,6 +2,8 @@ package com.potassium.client;
 
 import com.potassium.client.compat.sodium.SodiumBridge;
 import com.potassium.client.compute.SectionVisibilityCompute;
+import com.potassium.client.config.PotassiumConfig;
+import com.potassium.client.config.PotassiumFeatures;
 import com.potassium.client.gl.GLCapabilities;
 import com.potassium.client.render.indirect.IndirectBackend;
 import net.fabricmc.api.ClientModInitializer;
@@ -16,6 +18,8 @@ public final class PotassiumClientMod implements ClientModInitializer {
 
 	@Override
 	public void onInitializeClient() {
+		PotassiumConfig.load();
+
 		if (!FabricLoader.getInstance().isModLoaded("sodium")) {
 			throw new IllegalStateException(
 				"Potassium needs Sodium to run. Install Sodium from https://modrinth.com/mod/sodium"
@@ -35,6 +39,7 @@ public final class PotassiumClientMod implements ClientModInitializer {
 		LOGGER.info("Potassium is initializing");
 
 		GLCapabilities.initialize();
+		PotassiumFeatures.clampToCurrentGlCapabilities();
 		IndirectBackend.register();
 		SectionVisibilityCompute.initialize();
 
@@ -45,5 +50,15 @@ public final class PotassiumClientMod implements ClientModInitializer {
 		LOGGER.info("Compute shader: {}", GLCapabilities.hasComputeShader());
 		LOGGER.info("Persistent mapping: {}", GLCapabilities.hasPersistentMapping());
 		LOGGER.info("Section visibility compute: {}", SectionVisibilityCompute.isEnabled());
+		LOGGER.info(
+			"Feature toggles: enabled={}, persistentMapping={}, threadedFill={}, frustumCulling={}, opaqueCompute={}, translucentOverride={}, gpuIndirectCount={}",
+			PotassiumFeatures.modEnabled(),
+			PotassiumFeatures.persistentMappingEnabled(),
+			PotassiumFeatures.threadedCommandFillEnabled(),
+			PotassiumFeatures.frustumCullingEnabled(),
+			PotassiumFeatures.opaqueComputeCullingEnabled(),
+			PotassiumFeatures.translucentBatchOverrideEnabled(),
+			PotassiumFeatures.gpuIndirectCountEnabled()
+		);
 	}
 }

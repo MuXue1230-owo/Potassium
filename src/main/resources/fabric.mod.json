@@ -8,8 +8,8 @@
 		"MUXUE1230"
 	],
 	"contact": {
-		"homepage": "https://fabricmc.net/",
-		"sources": "https://github.com/FabricMC/fabric-example-mod"
+		"sources": "https://github.com/MuXue1230-owo/Potassium.git",
+		"issues": "https://github.com/MuXue1230-owo/Potassium/issues"
 	},
 	"license": "LGPL-3.0",
 	"icon": "assets/potassium/icon.png",
@@ -17,6 +17,12 @@
 	"entrypoints": {
 		"client": [
 			"com.potassium.client.PotassiumClientMod"
+		],
+		"sodium:config_api_user": [
+			"com.potassium.client.config.PotassiumSodiumConfigEntryPoint"
+		],
+		"modmenu": [
+			"com.potassium.client.compat.modmenu.PotassiumModMenuApi"
 		]
 	},
 	"mixins": [
@@ -28,5 +34,8 @@
 		"java": ">=25",
 		"fabric-api": "*",
 		"sodium": ">=0.8.7+mc26.1"
+	},
+	"suggests": {
+		"modmenu": "*"
 	}
 }

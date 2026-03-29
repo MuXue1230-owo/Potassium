@@ -19,6 +19,11 @@ repositories {
 		}
 	}
 
+	maven {
+		name = "TerraformersMC"
+		url = "https://maven.terraformersmc.com/"
+	}
+
 	// JitPack (Backup)
 	// maven {
 	// 	name = "JitPack"
@@ -54,6 +59,8 @@ dependencies {
 	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
 
 	implementation "maven.modrinth:sodium:${project.sodium_version}"
+	compileOnly "com.terraformersmc:modmenu:${project.modmenu_version}"
+	localRuntime "com.terraformersmc:modmenu:${project.modmenu_version}"
 
 	include "org.lwjgl:lwjgl:${project.lwjgl_version}"
 	include "org.lwjgl:lwjgl-opengl:${project.lwjgl_version}"

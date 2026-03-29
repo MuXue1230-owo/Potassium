@@ -1,5 +1,6 @@
 package com.potassium.client.render.indirect;
 
+import com.potassium.client.config.PotassiumFeatures;
 import com.potassium.client.gl.GLCapabilities;
 import com.potassium.client.gl.GpuMemoryBudget;
 import com.potassium.client.PotassiumClientMod;
@@ -20,7 +21,7 @@ public final class IndirectBackend {
 		}
 
 		boolean persistentMappingSupported = GLCapabilities.hasPersistentMapping();
-		boolean persistentMappingEnabled = persistentMappingSupported;
+		boolean persistentMappingEnabled = PotassiumFeatures.persistentMappingEnabled();
 		GpuMemoryBudget.Budget requestedBudget = GpuMemoryBudget.current();
 		GpuMemoryBudget.Budget appliedBudget = requestedBudget;
 		int persistentSegmentCount = persistentMappingEnabled ? requestedBudget.persistentSegments() : 1;

@@ -52,9 +52,14 @@ layout(std430, binding = 3) buffer IndirectCommands {
 uniform vec4 uFrustumPlanes[6];
 uniform vec3 uCameraPosition;
 uniform ivec3 uCameraBlockPosition;
+uniform uint uUseFrustumCulling;
 uniform uint uUseBlockFaceCulling;
 
 bool isSectionVisibleFrustum(vec3 relativeSectionCenter) {
+	if (uUseFrustumCulling == 0u) {
+		return true;
+	}
+
 	for (int planeIndex = 0; planeIndex < 6; planeIndex++) {
 		vec4 plane = uFrustumPlanes[planeIndex];
 		if (dot(plane.xyz, relativeSectionCenter) < plane.w) {

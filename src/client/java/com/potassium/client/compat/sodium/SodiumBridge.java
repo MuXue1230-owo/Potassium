@@ -4,6 +4,8 @@ import com.potassium.client.PotassiumClientMod;
 import com.potassium.client.compute.SectionVisibilityCompute;
 import com.potassium.client.compute.SectionVisibilityCompute.ComputePassResult;
 import com.potassium.client.compute.SectionVisibilityCompute.RegionBatchInput;
+import com.potassium.client.config.PotassiumConfig;
+import com.potassium.client.config.PotassiumFeatures;
 import com.potassium.client.gl.GLCapabilities;
 import com.potassium.client.render.indirect.IndexedCommandScratchBuffer;
 import com.potassium.client.render.indirect.IndexedIndirectCommandBuffer;
@@ -107,12 +109,17 @@ public final class SodiumBridge {
 	}
 
 	public static void beginRenderPass(TerrainRenderPass pass, ChunkRenderListIterable renderLists) {
+		if (!PotassiumFeatures.modEnabled()) {
+			ACTIVE_PASS.remove();
+			return;
+		}
+
 		RenderPassContext context = PASS_CONTEXT_POOL.get();
 		context.begin(pass, currentViewport);
 		IndexedIndirectCommandBuffer commandBuffer = IndirectBackend.indexedCommandBuffer();
 		commandBuffer.beginFrame();
 		context.commandBuffer = commandBuffer;
-		context.computeCullingEnabled = SectionVisibilityCompute.isEnabled() && currentViewport != null;
+		context.computeCullingEnabled = isComputeGeneratedBatchesEnabled() && SectionVisibilityCompute.isEnabled();
 		context.persistentMappingEnabled = commandBuffer.usesPersistentMapping();
 		ACTIVE_PASS.set(context);
 	}
@@ -136,7 +143,7 @@ public final class SodiumBridge {
 		) {
 			return;
 		}
-		if (renderPass.isTranslucent() && !ENABLE_TRANSLUCENT_BATCH_OVERRIDE) {
+		if (renderPass.isTranslucent() && !isTranslucentBatchOverrideEnabled()) {
 			context.preparedBatchesScheduled = true;
 			return;
 		}
@@ -146,12 +153,14 @@ public final class SodiumBridge {
 		}
 
 		boolean useComputePath =
-			ENABLE_COMPUTE_GENERATED_BATCHES &&
+			isComputeGeneratedBatchesEnabled() &&
 			context.computeCullingEnabled &&
 			shouldUseComputeSubmission(renderPass, fragmentDiscard);
 		context.computeCullingEnabled = useComputePath;
 		if (useComputePath) {
-			SectionVisibilityCompute.captureFrustumPlanes(matrices, context.computeFrustumPlanes);
+			if (isFrustumCullingEnabled()) {
+				SectionVisibilityCompute.captureFrustumPlanes(matrices, context.computeFrustumPlanes);
+			}
 			scheduleComputeGeneratedBatches(
 				context,
 				renderLists,
@@ -163,8 +172,14 @@ public final class SodiumBridge {
 			return;
 		}
 
+		if (!isThreadedCommandFillEnabled()) {
+			context.preparedBatchesScheduled = true;
+			return;
+		}
+
 		boolean useBlockFaceCulling = SodiumClientMod.options().performance.useBlockFaceCulling;
 		boolean preferLocalIndices = renderPass.isTranslucent() && fragmentDiscard;
+		Viewport cullingViewport = effectiveViewport(context.viewport);
 
 		for (java.util.Iterator<ChunkRenderList> iterator = renderLists.iterator(renderPass.isTranslucent()); iterator.hasNext(); ) {
 			ChunkRenderList renderList = iterator.next();
@@ -175,7 +190,7 @@ public final class SodiumBridge {
 			}
 
 			context.scheduledBatchCount++;
-			if (context.viewport != null && !isRegionVisible(context.viewport, region)) {
+			if (cullingViewport != null && !isRegionVisible(cullingViewport, region)) {
 				context.scheduledGeneratedBatches.put(region, REGION_FRUSTUM_CULLED_FUTURE);
 				continue;
 			}
@@ -191,7 +206,7 @@ public final class SodiumBridge {
 						renderPass,
 						useBlockFaceCulling,
 						preferLocalIndices,
-						context.viewport
+						cullingViewport
 					),
 					COMMAND_FILL_EXECUTOR
 				)
@@ -216,7 +231,7 @@ public final class SodiumBridge {
 			!drawOverrideEnabled ||
 			FORCE_TRANSLATED_BATCH_SUBMISSION ||
 			(renderPass != null && shouldForceTranslatedSubmission(renderPass, fragmentDiscard)) ||
-			(context.pass.isTranslucent() && !ENABLE_TRANSLUCENT_BATCH_OVERRIDE) ||
+			(context.pass.isTranslucent() && !isTranslucentBatchOverrideEnabled()) ||
 			region == null ||
 			storage == null ||
 			renderList == null ||
@@ -253,7 +268,7 @@ public final class SodiumBridge {
 				renderPass,
 				useBlockFaceCulling,
 				preferLocalIndices,
-				context.viewport
+				effectiveViewport(context.viewport)
 			);
 		}
 
@@ -289,6 +304,30 @@ public final class SodiumBridge {
 		return renderPass != null && !renderPass.isTranslucent() && !fragmentDiscard;
 	}
 
+	private static boolean isComputeGeneratedBatchesEnabled() {
+		return ENABLE_COMPUTE_GENERATED_BATCHES && PotassiumFeatures.opaqueComputeCullingEnabled();
+	}
+
+	private static boolean isTranslucentBatchOverrideEnabled() {
+		return ENABLE_TRANSLUCENT_BATCH_OVERRIDE && PotassiumFeatures.translucentBatchOverrideEnabled();
+	}
+
+	private static boolean isThreadedCommandFillEnabled() {
+		return PotassiumFeatures.threadedCommandFillEnabled();
+	}
+
+	private static boolean isFrustumCullingEnabled() {
+		return PotassiumFeatures.frustumCullingEnabled();
+	}
+
+	private static boolean isGpuIndirectCountEnabled() {
+		return USE_GPU_INDIRECT_COUNT && PotassiumFeatures.gpuIndirectCountEnabled();
+	}
+
+	private static Viewport effectiveViewport(Viewport viewport) {
+		return isFrustumCullingEnabled() ? viewport : null;
+	}
+
 	public static boolean tryDrawIndexedBatch(CommandList commandList, GlTessellation tessellation, MultiDrawBatch batch) {
 		RenderPassContext context = ACTIVE_PASS.get();
 		if (context == null || batch == null || batch.isEmpty()) {
@@ -299,7 +338,7 @@ public final class SodiumBridge {
 		context.seenCommandCount += batch.size;
 		drawOverrideAttemptCount++;
 
-		if (context.pass.isTranslucent() && !ENABLE_TRANSLUCENT_BATCH_OVERRIDE) {
+		if (context.pass.isTranslucent() && !isTranslucentBatchOverrideEnabled()) {
 			recordFallback(context, batch, "translucent override disabled");
 			return false;
 		}
@@ -412,7 +451,35 @@ public final class SodiumBridge {
 	}
 
 	public static List<String> getDebugLines() {
+		if (!PotassiumFeatures.modEnabled()) {
+			return List.of();
+		}
+
+		boolean showSummary = PotassiumConfig.showF3Summary();
+		boolean showOverrideStats = PotassiumConfig.showF3OverrideStats();
+		boolean showGenerationStats = PotassiumConfig.showF3GenerationStats();
+		boolean showComputeStats = PotassiumConfig.showF3ComputeStats();
+		boolean showCullingStats = PotassiumConfig.showF3CullingStats();
+		boolean showBufferStats = PotassiumConfig.showF3BufferStats();
+		boolean showFallbackStats = PotassiumConfig.showF3FallbackStats();
+		if (!showSummary &&
+			!showOverrideStats &&
+			!showGenerationStats &&
+			!showComputeStats &&
+			!showCullingStats &&
+			!showBufferStats &&
+			!showFallbackStats) {
+			return List.of();
+		}
+
 		return DEBUG_STATS.toDebugLines(
+			showSummary,
+			showOverrideStats,
+			showGenerationStats,
+			showComputeStats,
+			showCullingStats,
+			showBufferStats,
+			showFallbackStats,
 			installed,
 			drawOverrideEnabled,
 			drawOverrideDisableReason,
@@ -475,7 +542,8 @@ public final class SodiumBridge {
 	) {
 		boolean useBlockFaceCulling = SodiumClientMod.options().performance.useBlockFaceCulling;
 		boolean preferLocalIndices = renderPass.isTranslucent() && fragmentDiscard;
-		boolean useGpuDrawCount = USE_GPU_INDIRECT_COUNT && GLCapabilities.hasIndirectCount();
+		boolean useGpuDrawCount = isGpuIndirectCountEnabled();
+		Viewport cullingViewport = effectiveViewport(context.viewport);
 		List<RegionBatchInput> regionInputs = context.regionInputs;
 		int regionInputCount = 0;
 		int nextFirstCommandIndex = 0;
@@ -489,7 +557,7 @@ public final class SodiumBridge {
 			}
 
 			context.scheduledBatchCount++;
-			if (context.viewport != null && !isRegionVisible(context.viewport, region)) {
+			if (cullingViewport != null && !isRegionVisible(cullingViewport, region)) {
 				context.preparedGeneratedBatches.put(region, GeneratedCommandBatch.skip(1, 1, 0, 0, 0));
 				continue;
 			}
@@ -498,7 +566,7 @@ public final class SodiumBridge {
 			if (expectedSectionCount <= 0) {
 				context.preparedGeneratedBatches.put(
 					region,
-					GeneratedCommandBatch.skip(context.viewport != null ? 1 : 0, 0, 0, 0, 0)
+					GeneratedCommandBatch.skip(cullingViewport != null ? 1 : 0, 0, 0, 0, 0)
 				);
 				continue;
 			}
@@ -539,6 +607,7 @@ public final class SodiumBridge {
 				renderPass.isTranslucent(),
 				cameraTransform,
 				context.computeFrustumPlanes,
+				cullingViewport != null,
 				useBlockFaceCulling,
 				preferLocalIndices,
 				!useGpuDrawCount
@@ -557,7 +626,7 @@ public final class SodiumBridge {
 						regionInput.firstCommandIndex(),
 						regionInput.maxCommandCount(),
 						SectionVisibilityCompute.commandCountOffsetBytes(regionIndex),
-						context.viewport != null ? 1 : 0,
+						cullingViewport != null ? 1 : 0,
 						0,
 						testedSectionCount,
 						0,
@@ -570,14 +639,14 @@ public final class SodiumBridge {
 						? GeneratedCommandBatch.compute(
 							regionInput.firstCommandIndex(),
 							commandCount,
-							context.viewport != null ? 1 : 0,
+							cullingViewport != null ? 1 : 0,
 							0,
 							testedSectionCount,
 							visibleSectionCount,
 							testedSectionCount - visibleSectionCount
 						)
 						: GeneratedCommandBatch.skip(
-							context.viewport != null ? 1 : 0,
+							cullingViewport != null ? 1 : 0,
 							0,
 							testedSectionCount,
 							visibleSectionCount,
@@ -762,6 +831,7 @@ public final class SodiumBridge {
 			computeBlockFaceCullingEnabled,
 			preferLocalIndices,
 			context.viewport
+			// debug path intentionally uses the live viewport state
 		);
 		String mismatchReason = compareGeneratedBatches(context.commandBuffer, computeBatch, cpuBatch);
 		if (mismatchReason == null) {
@@ -1679,6 +1749,13 @@ public final class SodiumBridge {
 		}
 
 		private List<String> toDebugLines(
+			boolean showSummary,
+			boolean showOverrideStats,
+			boolean showGenerationStats,
+			boolean showComputeStats,
+			boolean showCullingStats,
+			boolean showBufferStats,
+			boolean showFallbackStats,
 			boolean bridgeInstalled,
 			boolean overrideEnabled,
 			String overrideDisableReason,
@@ -1689,58 +1766,72 @@ public final class SodiumBridge {
 		) {
 			List<String> lines = new ArrayList<>();
 			lines.add("Potassium [Sodium Bridge]");
-			lines.add("Bridge installed: " + bridgeInstalled);
-			lines.add("Draw override: " + overrideEnabled);
-			lines.add("Override disable reason: " + overrideDisableReason);
-			lines.add("Override attempts: " + overrideAttemptCount);
-			lines.add("Override successes: " + overrideSuccessCount);
-			lines.add("Override failures: " + overrideFailureCount);
-			lines.add("Consecutive override failures: " + consecutiveOverrideFailureCount);
-			lines.add("Command fill workers: " + COMMAND_FILL_WORKER_COUNT);
-			lines.add("Persistent mapping: " + this.lastPersistentMappingEnabled);
-			lines.add("Compute culling: " + this.lastComputeCullingEnabled);
-			lines.add("Last pass: " + this.lastPass);
-			lines.add("Last pass fully overridden: " + this.lastPassFullyOverridden);
-			lines.add("Seen batches: " + this.lastSeenBatchCount);
-			lines.add("Seen commands: " + this.lastSeenCommandCount);
-			lines.add("Mirrored batches: " + this.lastBatchCount);
-			lines.add("Mirrored commands: " + this.lastCommandCount);
-			lines.add("Generated batches: " + this.lastGeneratedBatchCount);
-			lines.add("Generated commands: " + this.lastGeneratedCommandCount);
-			lines.add("Compute generated batches: " + this.lastComputeGeneratedBatchCount);
-			lines.add("Compute generated commands: " + this.lastComputeGeneratedCommandCount);
-			lines.add("Opaque compute enabled: " + this.lastOpaqueComputeCullingEnabled);
-			lines.add("Opaque compute dispatches: " + this.lastOpaqueComputeDispatchCount);
-			lines.add("Opaque compute failures: " + this.lastOpaqueComputeFailureCount);
-			lines.add("Opaque compute generated batches: " + this.lastOpaqueComputeGeneratedBatchCount);
-			lines.add("Opaque compute generated commands: " + this.lastOpaqueComputeGeneratedCommandCount);
-			lines.add("Generated skip batches: " + this.lastGeneratedSkipBatchCount);
-			lines.add("Translated batches: " + this.lastTranslatedBatchCount);
-			lines.add("Translated commands: " + this.lastTranslatedCommandCount);
-			lines.add("Scheduled batches: " + this.lastScheduledBatchCount);
-			lines.add("Async ready batches: " + this.lastAsyncReadyBatchCount);
-			lines.add("Async waited batches: " + this.lastAsyncWaitedBatchCount);
-			lines.add("Async failed batches: " + this.lastAsyncFailedBatchCount);
-			lines.add("Sync generated batches: " + this.lastSyncGeneratedBatchCount);
-			lines.add("Compute dispatches: " + this.lastComputeDispatchCount);
-			lines.add("Compute failures: " + this.lastComputeFailureCount);
-			lines.add("Visible regions: " + this.lastVisibleRegionCount);
-			lines.add("Frustum tested regions: " + this.lastFrustumTestedRegionCount);
-			lines.add("Frustum culled regions: " + this.lastFrustumCulledRegionCount);
-			lines.add("Frustum tested sections: " + this.lastFrustumTestedSectionCount);
-			lines.add("Frustum visible sections: " + this.lastFrustumVisibleSectionCount);
-			lines.add("Frustum culled sections: " + this.lastFrustumCulledSectionCount);
-			lines.add("Indexed indirect buffer: " + this.lastCommandCount + "/" + this.lastBufferCapacity + " commands");
-			lines.add("Indexed command bytes: " + this.lastBufferBytes);
-			lines.add("Potassium batches: " + this.lastExecutedBatchCount);
-			lines.add("Potassium commands: " + this.lastExecutedCommandCount);
-			lines.add("Culled batches: " + this.lastCulledBatchCount);
-			lines.add("Fallback batches: " + this.lastFallbackBatchCount);
-			lines.add("Fallback commands: " + this.lastFallbackCommandCount);
-			lines.add("Last fallback reason: " + this.lastFallbackReason);
-			lines.add("Overridden passes: " + this.overriddenPassCount);
-			lines.add("Fallback passes: " + this.fallbackPassCount);
-			lines.add("Completed mirrored passes: " + this.completedPassCount);
+			if (showSummary) {
+				lines.add("Bridge installed: " + bridgeInstalled);
+				lines.add("Draw override: " + overrideEnabled);
+				lines.add("Last pass: " + this.lastPass);
+				lines.add("Last pass fully overridden: " + this.lastPassFullyOverridden);
+				lines.add("Completed mirrored passes: " + this.completedPassCount);
+			}
+			if (showOverrideStats) {
+				lines.add("Override attempts: " + overrideAttemptCount);
+				lines.add("Override successes: " + overrideSuccessCount);
+				lines.add("Override failures: " + overrideFailureCount);
+				lines.add("Consecutive override failures: " + consecutiveOverrideFailureCount);
+			}
+			if (showGenerationStats) {
+				lines.add("Seen batches: " + this.lastSeenBatchCount);
+				lines.add("Seen commands: " + this.lastSeenCommandCount);
+				lines.add("Mirrored batches: " + this.lastBatchCount);
+				lines.add("Mirrored commands: " + this.lastCommandCount);
+				lines.add("Generated batches: " + this.lastGeneratedBatchCount);
+				lines.add("Generated commands: " + this.lastGeneratedCommandCount);
+				lines.add("Compute generated batches: " + this.lastComputeGeneratedBatchCount);
+				lines.add("Compute generated commands: " + this.lastComputeGeneratedCommandCount);
+				lines.add("Translated batches: " + this.lastTranslatedBatchCount);
+				lines.add("Translated commands: " + this.lastTranslatedCommandCount);
+				lines.add("Scheduled batches: " + this.lastScheduledBatchCount);
+				lines.add("Async ready batches: " + this.lastAsyncReadyBatchCount);
+				lines.add("Async waited batches: " + this.lastAsyncWaitedBatchCount);
+				lines.add("Async failed batches: " + this.lastAsyncFailedBatchCount);
+				lines.add("Sync generated batches: " + this.lastSyncGeneratedBatchCount);
+				lines.add("Potassium batches: " + this.lastExecutedBatchCount);
+				lines.add("Potassium commands: " + this.lastExecutedCommandCount);
+			}
+			if (showComputeStats) {
+				lines.add("Compute culling: " + this.lastComputeCullingEnabled);
+				lines.add("Opaque compute enabled: " + this.lastOpaqueComputeCullingEnabled);
+				lines.add("Opaque compute dispatches: " + this.lastOpaqueComputeDispatchCount);
+				lines.add("Opaque compute failures: " + this.lastOpaqueComputeFailureCount);
+				lines.add("Opaque compute generated batches: " + this.lastOpaqueComputeGeneratedBatchCount);
+				lines.add("Opaque compute generated commands: " + this.lastOpaqueComputeGeneratedCommandCount);
+				lines.add("Compute dispatches: " + this.lastComputeDispatchCount);
+				lines.add("Compute failures: " + this.lastComputeFailureCount);
+			}
+			if (showCullingStats) {
+				lines.add("Visible regions: " + this.lastVisibleRegionCount);
+				lines.add("Generated skip batches: " + this.lastGeneratedSkipBatchCount);
+				lines.add("Culled batches: " + this.lastCulledBatchCount);
+				lines.add("Frustum tested regions: " + this.lastFrustumTestedRegionCount);
+				lines.add("Frustum culled regions: " + this.lastFrustumCulledRegionCount);
+				lines.add("Frustum tested sections: " + this.lastFrustumTestedSectionCount);
+				lines.add("Frustum visible sections: " + this.lastFrustumVisibleSectionCount);
+				lines.add("Frustum culled sections: " + this.lastFrustumCulledSectionCount);
+			}
+			if (showBufferStats) {
+				lines.add("Command fill workers: " + COMMAND_FILL_WORKER_COUNT);
+				lines.add("Persistent mapping: " + this.lastPersistentMappingEnabled);
+				lines.add("Indexed indirect buffer: " + this.lastCommandCount + "/" + this.lastBufferCapacity + " commands");
+				lines.add("Indexed command bytes: " + this.lastBufferBytes);
+			}
+			if (showFallbackStats) {
+				lines.add("Override disable reason: " + overrideDisableReason);
+				lines.add("Fallback batches: " + this.lastFallbackBatchCount);
+				lines.add("Fallback commands: " + this.lastFallbackCommandCount);
+				lines.add("Last fallback reason: " + this.lastFallbackReason);
+				lines.add("Overridden passes: " + this.overriddenPassCount);
+				lines.add("Fallback passes: " + this.fallbackPassCount);
+			}
 			return lines;
 		}
 

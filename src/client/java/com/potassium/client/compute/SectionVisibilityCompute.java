@@ -72,6 +72,7 @@ public final class SectionVisibilityCompute {
 	private static int frustumPlanesLocation = -1;
 	private static int cameraPositionLocation = -1;
 	private static int cameraBlockPositionLocation = -1;
+	private static int useFrustumCullingLocation = -1;
 	private static int useBlockFaceCullingLocation = -1;
 	private static int regionSlotCapacity;
 	private static int regionDescriptorCapacity;
@@ -102,6 +103,7 @@ public final class SectionVisibilityCompute {
 			frustumPlanesLocation = GL20C.glGetUniformLocation(programHandle, "uFrustumPlanes");
 			cameraPositionLocation = GL20C.glGetUniformLocation(programHandle, "uCameraPosition");
 			cameraBlockPositionLocation = GL20C.glGetUniformLocation(programHandle, "uCameraBlockPosition");
+			useFrustumCullingLocation = GL20C.glGetUniformLocation(programHandle, "uUseFrustumCulling");
 			useBlockFaceCullingLocation = GL20C.glGetUniformLocation(programHandle, "uUseBlockFaceCulling");
 			counterClearValue = MemoryUtil.memCallocInt(1);
 			preallocateWorkingSet();
@@ -165,6 +167,7 @@ public final class SectionVisibilityCompute {
 		boolean translucentPass,
 		CameraTransform cameraTransform,
 		float[] frustumPlanes,
+		boolean useFrustumCulling,
 		boolean useBlockFaceCulling,
 		boolean preferLocalIndices,
 		boolean readBackCounters
@@ -223,8 +226,9 @@ public final class SectionVisibilityCompute {
 				cameraTransform.intY,
 				cameraTransform.intZ
 			);
+			GL30C.glUniform1ui(useFrustumCullingLocation, useFrustumCulling ? 1 : 0);
 			GL30C.glUniform1ui(useBlockFaceCullingLocation, useBlockFaceCulling ? 1 : 0);
-			GL43C.glDispatchCompute(regionInputs.size(), REGION_DISPATCH_GROUP_COUNT_Y, 1);
+			GL43C.glDispatchCompute(regionCount, REGION_DISPATCH_GROUP_COUNT_Y, 1);
 			GL42C.glMemoryBarrier(
 				GL43C.GL_SHADER_STORAGE_BARRIER_BIT |
 				GL43C.GL_COMMAND_BARRIER_BIT |

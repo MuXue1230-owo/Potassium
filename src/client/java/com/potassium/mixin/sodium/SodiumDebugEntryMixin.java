@@ -1,6 +1,9 @@
 package com.potassium.mixin.sodium;
 
 import com.potassium.client.compat.sodium.SodiumBridge;
+import com.potassium.client.config.PotassiumConfig;
+import com.potassium.client.config.PotassiumFeatures;
+import java.util.List;
 import net.caffeinemc.mods.sodium.client.gui.SodiumDebugEntry;
 import net.minecraft.ChatFormatting;
 import net.minecraft.client.gui.components.debug.DebugScreenDisplayer;
@@ -31,11 +34,15 @@ public abstract class SodiumDebugEntryMixin {
 		index = 1
 	)
 	private String potassium$appendPatchedMarker(String line) {
-		if (line.contains("PotassiumPatched")) {
+		if (!PotassiumFeatures.modEnabled() || !PotassiumConfig.showF3PatchedMarker()) {
 			return line;
 		}
 
-		return line + " " + ChatFormatting.RED + "PotassiumPatched";
+		if (line.contains("Potassium Patched")) {
+			return line;
+		}
+
+		return line + ChatFormatting.WHITE + " - " + ChatFormatting.RED + "Potassium Patched";
 	}
 
 	@Inject(method = "display", at = @At("TAIL"))
@@ -46,6 +53,9 @@ public abstract class SodiumDebugEntryMixin {
 		LevelChunk serverChunk,
 		CallbackInfo ci
 	) {
-		displayer.addToGroup(DEBUG_GROUP, SodiumBridge.getDebugLines());
+		List<String> debugLines = SodiumBridge.getDebugLines();
+		if (!debugLines.isEmpty()) {
+			displayer.addToGroup(DEBUG_GROUP, debugLines);
+		}
 	}
 }

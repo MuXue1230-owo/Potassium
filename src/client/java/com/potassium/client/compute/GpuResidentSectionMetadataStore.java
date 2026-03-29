@@ -74,6 +74,7 @@ final class GpuResidentSectionMetadataStore {
 		if (sectionBufferHandle == 0) {
 			sectionBufferHandle = GL45C.glCreateBuffers();
 		}
+		GpuResidentGeometryStore.initialize();
 		GpuSceneDataStore.initialize();
 	}
 
@@ -85,6 +86,7 @@ final class GpuResidentSectionMetadataStore {
 
 		REGION_METADATA_CACHE.clear();
 		GpuResidentGeometryBookkeeping.reset();
+		GpuResidentGeometryStore.shutdown();
 		GpuSceneDataStore.shutdown();
 		nextRegionSlot = 0;
 		regionSlotCapacity = 0;
@@ -472,6 +474,10 @@ final class GpuResidentSectionMetadataStore {
 			return this.packedSectionSceneIds[sectionIndex];
 		}
 
+		int localSectionIndex(int sectionIndex) {
+			return Byte.toUnsignedInt(this.sectionOrderSnapshot[sectionIndex]);
+		}
+
 		int localIndexSectionCount() {
 			return this.localIndexSectionCount;
 		}
@@ -543,6 +549,14 @@ final class GpuResidentSectionMetadataStore {
 			destination.putFloat(0.0f);
 			destination.putFloat(0.0f);
 			destination.putFloat(0.0f);
+		}
+
+		void writeGeometryRecord(ByteBuffer destination, int destinationOffsetBytes, int sectionIndex) {
+			int metadataOffsetBytes = sectionIndex * INPUT_STRIDE_BYTES;
+			destination.position(destinationOffsetBytes);
+			for (int wordIndex = 0; wordIndex < INPUT_STRIDE_BYTES / Integer.BYTES; wordIndex++) {
+				destination.putInt(this.templateView.getInt(metadataOffsetBytes + (wordIndex * Integer.BYTES)));
+			}
 		}
 
 		boolean isDirty() {

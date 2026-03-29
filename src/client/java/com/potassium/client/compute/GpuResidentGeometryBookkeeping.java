@@ -1,5 +1,6 @@
 package com.potassium.client.compute;
 
+import java.util.Arrays;
 import java.util.Map;
 import java.util.WeakHashMap;
 import net.caffeinemc.mods.sodium.client.render.chunk.data.SectionRenderDataStorage;
@@ -30,7 +31,13 @@ public final class GpuResidentGeometryBookkeeping {
 		}
 
 		int sceneId = existingRecord != null ? existingRecord.sceneId() : nextSceneId++;
+		long[] sectionPresenceBits = buildSectionPresenceBits(metadata.sectionOrderSnapshot());
+		boolean fullSync =
+			existingRecord == null ||
+			existingRecord.regionSlot() != metadata.regionSlot() ||
+			!Arrays.equals(existingRecord.sectionPresenceBits(), sectionPresenceBits);
 		metadata.assignSceneIds(sceneId, sectionSceneIdsByLocalSection);
+		GpuResidentGeometryStore.syncRegion(metadata, fullSync);
 		RECORDS.put(
 			storage,
 			new ResidentRegionRecord(
@@ -42,7 +49,8 @@ public final class GpuResidentGeometryBookkeeping {
 				metadata.localIndexSectionCount(),
 				metadata.sharedIndexSectionCount(),
 				metadata.metadataBytes(),
-				sectionSceneIdsByLocalSection
+				sectionSceneIdsByLocalSection,
+				sectionPresenceBits
 			)
 		);
 	}
@@ -93,7 +101,8 @@ public final class GpuResidentGeometryBookkeeping {
 		int localIndexSectionCount,
 		int sharedIndexSectionCount,
 		int metadataBytes,
-		int[] sectionSceneIdsByLocalSection
+		int[] sectionSceneIdsByLocalSection,
+		long[] sectionPresenceBits
 	) {
 		private int maxSectionSceneId() {
 			int maxSectionSceneId = 0;
@@ -102,6 +111,15 @@ public final class GpuResidentGeometryBookkeeping {
 			}
 			return maxSectionSceneId;
 		}
+	}
+
+	private static long[] buildSectionPresenceBits(byte[] sectionOrderSnapshot) {
+		long[] sectionPresenceBits = new long[(GpuResidentSectionMetadataStore.MAX_REGION_SECTION_COUNT + Long.SIZE - 1) / Long.SIZE];
+		for (byte sectionIndexByte : sectionOrderSnapshot) {
+			int localSectionIndex = Byte.toUnsignedInt(sectionIndexByte);
+			sectionPresenceBits[localSectionIndex >>> 6] |= 1L << (localSectionIndex & 63);
+		}
+		return sectionPresenceBits;
 	}
 
 	public record Snapshot(

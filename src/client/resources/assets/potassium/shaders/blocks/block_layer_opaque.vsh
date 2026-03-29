@@ -20,9 +20,6 @@ uniform vec2 u_TexCoordShrink;
 
 uniform sampler2D u_LightTex;
 
-uniform int u_CurrentTime;
-uniform float u_FadePeriodInv;
-
 uvec3 _get_relative_chunk_coord(uint pos) {
     return uvec3(pos) >> uvec3(5u, 0u, 2u) & uvec3(7u, 3u, 7u);
 }

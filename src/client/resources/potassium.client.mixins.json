@@ -1,0 +1,19 @@
+{
+	"required": true,
+	"package": "com.potassium.mixin",
+	"compatibilityLevel": "JAVA_25",
+	"client": [
+		"GlBackendWindowHintsMixin",
+		"WindowContextFallbackMixin",
+		"sodium.DefaultChunkRendererBatchMixin",
+		"sodium.DefaultChunkRendererRenderMixin",
+		"sodium.SodiumDebugEntryMixin",
+		"sodium.RenderSectionManagerMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	},
+	"overwrites": {
+		"requireAnnotations": true
+	}
+}

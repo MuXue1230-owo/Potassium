@@ -288,7 +288,7 @@ See [LICENSE](LICENSE) file for details.
 
 <div align="center">
 
-**Made with ⚡ by 木雪 1230**
+**Made with ⚡ by MuXue1230**
 
 [⭐ Star](../../stargazers) · [🍴 Fork](../../forks) · [🐛 Issues](../../issues)
 

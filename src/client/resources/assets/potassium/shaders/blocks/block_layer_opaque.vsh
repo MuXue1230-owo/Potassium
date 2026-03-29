@@ -37,7 +37,7 @@ void main() {
     bool useSceneData = _potassium_use_scene_data();
     PotassiumSceneSection sceneSection = useSceneData
         ? _potassium_get_scene_section()
-        : PotassiumSceneSection(0, 0, int(_draw_id), 0, 0, 0, 0, 0, vec4(0.0));
+        : PotassiumSceneSection(0, 0, int(_draw_id), 0, 0, 0, 0, 0, vec4(0.0), vec4(1.0, 0.0, 0.0, 0.0));
     vec3 translation = u_RegionOffset + (
         useSceneData
             ? _potassium_draw_translation(sceneSection)

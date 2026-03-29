@@ -475,7 +475,7 @@ public final class SodiumBridge {
 
 		context.commandBuffer.upload();
 		context.commandBuffer.endFrame();
-		GL30C.glBindBufferBase(GL43C.GL_SHADER_STORAGE_BUFFER, GRAPHICS_SCENE_DATA_BINDING, 0);
+		GpuSceneDataStore.unbindAsStorage(GRAPHICS_SCENE_DATA_BINDING);
 		DEBUG_STATS.recordPass(context);
 
 		if (context.commandBuffer.commandCount() > 0 || context.culledBatchCount > 0) {

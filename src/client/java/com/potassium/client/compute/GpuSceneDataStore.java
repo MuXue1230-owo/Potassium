@@ -18,6 +18,7 @@ public final class GpuSceneDataStore {
 
 	private static int bufferHandle;
 	private static int sceneCapacity;
+	private static int boundStorageBinding = -1;
 	private static ByteBuffer uploadRecordView;
 	private static ByteBuffer uploadVisibilityView;
 
@@ -37,6 +38,7 @@ public final class GpuSceneDataStore {
 		}
 
 		sceneCapacity = 0;
+		boundStorageBinding = -1;
 		if (uploadRecordView != null) {
 			MemoryUtil.memFree(uploadRecordView);
 			uploadRecordView = null;
@@ -50,6 +52,14 @@ public final class GpuSceneDataStore {
 	public static void bindAsStorage(int binding) {
 		initialize();
 		GL30C.glBindBufferBase(GL43C.GL_SHADER_STORAGE_BUFFER, binding, bufferHandle);
+		boundStorageBinding = binding;
+	}
+
+	public static void unbindAsStorage(int binding) {
+		GL30C.glBindBufferBase(GL43C.GL_SHADER_STORAGE_BUFFER, binding, 0);
+		if (boundStorageBinding == binding) {
+			boundStorageBinding = -1;
+		}
 	}
 
 	static void uploadDirtySections(GpuResidentSectionMetadataStore.CachedRegionMetadata metadata) {
@@ -153,7 +163,27 @@ public final class GpuSceneDataStore {
 			newCapacity <<= 1;
 		}
 
-		GL45C.glNamedBufferData(bufferHandle, (long) newCapacity * SCENE_STRIDE_BYTES, GL15C.GL_DYNAMIC_DRAW);
+		int previousHandle = bufferHandle;
+		int newHandle = GL45C.glCreateBuffers();
+		GL45C.glNamedBufferData(newHandle, (long) newCapacity * SCENE_STRIDE_BYTES, GL15C.GL_DYNAMIC_DRAW);
+		if (previousHandle != 0 && sceneCapacity > 0) {
+			GL45C.glCopyNamedBufferSubData(
+				previousHandle,
+				newHandle,
+				0L,
+				0L,
+				(long) sceneCapacity * SCENE_STRIDE_BYTES
+			);
+		}
+
+		bufferHandle = newHandle;
 		sceneCapacity = newCapacity;
+		if (boundStorageBinding >= 0) {
+			GL30C.glBindBufferBase(GL43C.GL_SHADER_STORAGE_BUFFER, boundStorageBinding, bufferHandle);
+		}
+
+		if (previousHandle != 0) {
+			GL15C.glDeleteBuffers(previousHandle);
+		}
 	}
 }

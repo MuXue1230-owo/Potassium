@@ -3,6 +3,7 @@ package com.potassium.client.gl;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import org.lwjgl.opengl.GL15C;
+import org.lwjgl.opengl.GL30C;
 import org.lwjgl.opengl.GL32C;
 import org.lwjgl.opengl.GL45C;
 
@@ -97,6 +98,14 @@ public final class PersistentBuffer implements AutoCloseable {
 
 	public void bind() {
 		GL15C.glBindBuffer(this.target, this.handle);
+	}
+
+	public void bindRange(int target, int binding, long offsetBytes, long sizeBytes) {
+		if (sizeBytes <= 0L) {
+			throw new IllegalArgumentException("Buffer range size must be positive.");
+		}
+
+		GL30C.glBindBufferRange(target, binding, this.handle, offsetBytes, sizeBytes);
 	}
 
 	public int handle() {

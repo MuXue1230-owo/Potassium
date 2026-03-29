@@ -5,6 +5,7 @@ import com.potassium.client.gl.PersistentBuffer;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import org.lwjgl.opengl.GL40C;
+import org.lwjgl.opengl.GL43C;
 import org.lwjgl.system.MemoryUtil;
 
 public final class IndexedIndirectCommandBuffer implements AutoCloseable {
@@ -21,6 +22,7 @@ public final class IndexedIndirectCommandBuffer implements AutoCloseable {
 	private int capacityCommands;
 	private int commandCount;
 	private boolean dirty;
+	private boolean gpuGeneratedCommandsPresent;
 
 	public IndexedIndirectCommandBuffer(int initialCapacityCommands, boolean persistentMappingEnabled) {
 		this.capacityCommands = Math.max(initialCapacityCommands, 1);
@@ -36,6 +38,7 @@ public final class IndexedIndirectCommandBuffer implements AutoCloseable {
 		this.gpuBuffer.beginFrame();
 		this.commandCount = 0;
 		this.dirty = true;
+		this.gpuGeneratedCommandsPresent = false;
 	}
 
 	public void endFrame() {
@@ -135,6 +138,31 @@ public final class IndexedIndirectCommandBuffer implements AutoCloseable {
 		this.gpuBuffer.bind();
 	}
 
+	public int reserveGpuCommandRange(int maxCommandCount) {
+		if (maxCommandCount < 0) {
+			throw new IllegalArgumentException("maxCommandCount must be non-negative.");
+		}
+
+		this.ensureCommandCapacity(this.commandCount + maxCommandCount);
+		return this.commandCount;
+	}
+
+	public void bindCommandRangeAsStorage(int binding, int firstCommandIndex, int commandCapacity) {
+		if (firstCommandIndex < 0 || firstCommandIndex > this.capacityCommands) {
+			throw new IllegalArgumentException("firstCommandIndex is out of range.");
+		}
+		if (commandCapacity <= 0 || firstCommandIndex + commandCapacity > this.capacityCommands) {
+			throw new IllegalArgumentException("commandCapacity is out of range.");
+		}
+
+		this.gpuBuffer.bindRange(
+			GL43C.GL_SHADER_STORAGE_BUFFER,
+			binding,
+			this.drawOffsetBytes(firstCommandIndex),
+			(long) commandCapacity * COMMAND_STRIDE_BYTES
+		);
+	}
+
 	public long drawOffsetBytes(int firstCommandIndex) {
 		if (firstCommandIndex < 0 || firstCommandIndex > this.commandCount) {
 			throw new IllegalArgumentException("firstCommandIndex is out of range.");
@@ -145,6 +173,19 @@ public final class IndexedIndirectCommandBuffer implements AutoCloseable {
 
 	public int commandCount() {
 		return this.commandCount;
+	}
+
+	public void commitGpuGeneratedCommands(int firstCommandIndex, int actualCommandCount) {
+		if (firstCommandIndex < 0 || firstCommandIndex > this.capacityCommands) {
+			throw new IllegalArgumentException("firstCommandIndex is out of range.");
+		}
+		if (actualCommandCount < 0 || firstCommandIndex + actualCommandCount > this.capacityCommands) {
+			throw new IllegalArgumentException("actualCommandCount is out of range.");
+		}
+
+		this.commandCount = firstCommandIndex + actualCommandCount;
+		this.dirty = false;
+		this.gpuGeneratedCommandsPresent = true;
 	}
 
 	public void rewindToCommandCount(int commandCount) {
@@ -198,6 +239,10 @@ public final class IndexedIndirectCommandBuffer implements AutoCloseable {
 		int newCapacity = previousCapacity;
 		while (newCapacity < requiredCommands) {
 			newCapacity <<= 1;
+		}
+
+		if (this.gpuGeneratedCommandsPresent) {
+			throw new IllegalStateException("Cannot resize the indirect command buffer after GPU-generated commands were written this frame.");
 		}
 
 		ByteBuffer newCommandStream = allocateCommandStream(newCapacity);

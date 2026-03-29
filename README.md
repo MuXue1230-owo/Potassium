@@ -2,7 +2,7 @@
 
 <div align="center">
 
-![Potassium Logo](https://via.placeholder.com/128x128/8B5CF6/FFFFFF?text=K)
+![Potassium Logo](./src/main/resources/assets/potassium/icon.png)
 
 **Advanced Indirect Rendering Backend Extension for Sodium**
 

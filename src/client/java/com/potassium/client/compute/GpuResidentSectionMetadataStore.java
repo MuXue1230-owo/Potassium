@@ -75,6 +75,7 @@ final class GpuResidentSectionMetadataStore {
 			sectionBufferHandle = GL45C.glCreateBuffers();
 		}
 		GpuResidentGeometryStore.initialize();
+		GpuGeometryIndirectionStore.initialize();
 		GpuSceneDataStore.initialize();
 	}
 
@@ -87,6 +88,7 @@ final class GpuResidentSectionMetadataStore {
 		REGION_METADATA_CACHE.clear();
 		GpuResidentGeometryBookkeeping.reset();
 		GpuResidentGeometryStore.shutdown();
+		GpuGeometryIndirectionStore.shutdown();
 		GpuSceneDataStore.shutdown();
 		nextRegionSlot = 0;
 		regionSlotCapacity = 0;
@@ -559,6 +561,28 @@ final class GpuResidentSectionMetadataStore {
 			for (int wordIndex = 0; wordIndex < INPUT_STRIDE_BYTES / Integer.BYTES; wordIndex++) {
 				destination.putInt(this.templateView.getInt(metadataOffsetBytes + (wordIndex * Integer.BYTES)));
 			}
+		}
+
+		void writeGeometryIndirectionRecord(
+			ByteBuffer destination,
+			int destinationOffsetBytes,
+			int sectionIndex,
+			int geometrySourceId
+		) {
+			int metadataOffsetBytes = sectionIndex * INPUT_STRIDE_BYTES;
+			destination.position(destinationOffsetBytes);
+			destination.putInt(geometrySourceId);
+			destination.putInt(this.regionSceneId);
+			destination.putInt(this.packedSectionSceneIds[sectionIndex]);
+			destination.putInt(this.templateView.getInt(metadataOffsetBytes + (REGION_INFO_LOCAL_SECTION_INDEX_OFFSET * Integer.BYTES)));
+			destination.putInt(this.templateView.getInt(metadataOffsetBytes + (REGION_INFO_FLAGS_OFFSET * Integer.BYTES)));
+			destination.putInt(this.templateView.getInt(metadataOffsetBytes + (SECTION_CHUNK_X_OFFSET * Integer.BYTES)));
+			destination.putInt(this.templateView.getInt(metadataOffsetBytes + (SECTION_CHUNK_Y_OFFSET * Integer.BYTES)));
+			destination.putInt(this.templateView.getInt(metadataOffsetBytes + (SECTION_CHUNK_Z_OFFSET * Integer.BYTES)));
+			destination.putInt(this.templateView.getInt(metadataOffsetBytes + (SLICE_MASK_OFFSET * Integer.BYTES)));
+			destination.putInt(this.templateView.getInt(metadataOffsetBytes + (8 * Integer.BYTES)));
+			destination.putInt(this.templateView.getInt(metadataOffsetBytes + (9 * Integer.BYTES)));
+			destination.putInt(this.regionSlot);
 		}
 
 		boolean isDirty() {

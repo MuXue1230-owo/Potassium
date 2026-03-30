@@ -1,6 +1,7 @@
 package com.potassium.client.compat.sodium;
 
 import com.potassium.client.PotassiumClientMod;
+import com.potassium.client.compute.GpuGeometryIndirectionStore;
 import com.potassium.client.compute.GpuResidentGeometryStore;
 import com.potassium.client.compute.GpuSceneDataStore;
 import com.potassium.client.compute.SectionVisibilityCompute;
@@ -58,6 +59,7 @@ import org.lwjgl.system.Pointer;
 public final class SodiumBridge {
 	private static final int MAX_CONSECUTIVE_OVERRIDE_FAILURES = 8;
 	private static final int GRAPHICS_SCENE_DATA_BINDING = 4;
+	private static final int GRAPHICS_GEOMETRY_INDIRECTION_BINDING = 5;
 	private static final boolean ENABLE_COMPUTE_DEBUG_COMPARISON = false;
 	private static final boolean ENABLE_DRAW_DEBUG_COMPARISON = false;
 	private static final int MAX_COMPUTE_DEBUG_BATCHES_PER_PASS = 8;
@@ -95,6 +97,7 @@ public final class SodiumBridge {
 	private static final ThreadLocal<RenderPassContext> ACTIVE_PASS = new ThreadLocal<>();
 	private static final BridgeDebugStats DEBUG_STATS = new BridgeDebugStats();
 	private static volatile Viewport currentViewport;
+	private static volatile CameraTransform currentCameraTransform;
 	private static boolean installed;
 	private static boolean drawOverrideEnabled = true;
 	private static String drawOverrideDisableReason = "none";
@@ -131,9 +134,14 @@ public final class SodiumBridge {
 		currentViewport = viewport;
 	}
 
-	public static void beginRenderPass(TerrainRenderPass pass, ChunkRenderListIterable renderLists) {
+	public static void beginRenderPass(
+		TerrainRenderPass pass,
+		ChunkRenderListIterable renderLists,
+		CameraTransform cameraTransform
+	) {
 		if (!PotassiumFeatures.modEnabled()) {
 			ACTIVE_PASS.remove();
+			currentCameraTransform = cameraTransform;
 			return;
 		}
 
@@ -143,10 +151,16 @@ public final class SodiumBridge {
 		commandBuffer.beginFrame();
 		GpuResidentGeometryBookkeeping.flushPendingUploads();
 		GpuSceneDataStore.bindAsStorage(GRAPHICS_SCENE_DATA_BINDING);
+		GpuGeometryIndirectionStore.bindAsStorage(GRAPHICS_GEOMETRY_INDIRECTION_BINDING);
 		context.commandBuffer = commandBuffer;
 		context.computeCullingEnabled = isComputeGeneratedBatchesEnabled() && SectionVisibilityCompute.isEnabled();
 		context.persistentMappingEnabled = commandBuffer.usesPersistentMapping();
+		currentCameraTransform = cameraTransform;
 		ACTIVE_PASS.set(context);
+	}
+
+	public static CameraTransform currentCameraTransform() {
+		return currentCameraTransform;
 	}
 
 	public static void schedulePreparedBatches(
@@ -273,14 +287,6 @@ public final class SodiumBridge {
 				rollbackBatch(context, context.pendingPreparedBatch);
 			}
 			context.pendingPreparedBatch = null;
-		}
-
-		if (context.computeCullingEnabled && !renderPass.isTranslucent() && context.compactedComputeBatch != null) {
-			if (!context.compactedComputeBatchPrepared && !context.compactedComputeBatchDrawn) {
-				applyGeneratedBatch(context, context.compactedComputeBatch);
-				context.compactedComputeBatchPrepared = true;
-			}
-			return;
 		}
 
 		SectionVisibilityCompute.SectionSceneIds sceneIds = SectionVisibilityCompute.resolveSceneIds(
@@ -411,18 +417,9 @@ public final class SodiumBridge {
 			return false;
 		}
 
-		if (context.compactedComputeBatch != null && context.compactedComputeBatchDrawn) {
-			recordOverrideSuccess();
-			return true;
-		}
-
 		PreparedBatch preparedBatch = consumePreparedBatch(context);
 		try {
 			if (preparedBatch != null && preparedBatch.skipDraw()) {
-				if (context.compactedComputeBatchPrepared) {
-					context.compactedComputeBatchPrepared = false;
-					context.compactedComputeBatchDrawn = true;
-				}
 				context.culledBatchCount++;
 				recordOverrideSuccess();
 				return true;
@@ -474,18 +471,9 @@ public final class SodiumBridge {
 			if (!preparedBatch.gpuCounted()) {
 				context.executedCommandCount += preparedBatch.commandCount();
 			}
-			if (context.compactedComputeBatchPrepared) {
-				context.compactedComputeBatchPrepared = false;
-				context.compactedComputeBatchDrawn = true;
-			}
 			recordOverrideSuccess();
 			return true;
 		} catch (RuntimeException exception) {
-			if (context.compactedComputeBatchPrepared) {
-				context.compactedComputeBatch = null;
-				context.compactedComputeBatchPrepared = false;
-				context.compactedComputeBatchDrawn = false;
-			}
 			if (preparedBatch != null && !preparedBatch.skipDraw()) {
 				rollbackBatch(context, preparedBatch);
 			}
@@ -499,12 +487,15 @@ public final class SodiumBridge {
 	public static void endRenderPass() {
 		RenderPassContext context = ACTIVE_PASS.get();
 		if (context == null) {
+			currentCameraTransform = null;
 			return;
 		}
 
 		context.commandBuffer.upload();
 		context.commandBuffer.endFrame();
 		GpuSceneDataStore.unbindAsStorage(GRAPHICS_SCENE_DATA_BINDING);
+		GpuGeometryIndirectionStore.unbindAsStorage(GRAPHICS_GEOMETRY_INDIRECTION_BINDING);
+		currentCameraTransform = null;
 		DEBUG_STATS.recordPass(context);
 
 		if (context.commandBuffer.commandCount() > 0 || context.culledBatchCount > 0) {
@@ -569,6 +560,7 @@ public final class SodiumBridge {
 		PASS_CONTEXT_POOL.remove();
 		DEBUG_STATS.reset();
 		currentViewport = null;
+		currentCameraTransform = null;
 		installed = false;
 		drawOverrideEnabled = true;
 		drawOverrideDisableReason = "none";
@@ -621,25 +613,23 @@ public final class SodiumBridge {
 		List<GpuResidentGeometryBookkeeping.ResidentBatchInput> residentRegions =
 			GpuResidentGeometryBookkeeping.snapshotResidentRegions(false);
 		int regionInputCount = 0;
-		int totalMaxCommandCount = 0;
-		int frustumTestedRegionCount = 0;
-		int frustumCulledRegionCount = 0;
-		int firstCommandIndex = context.commandBuffer.commandCount();
+		int nextFirstCommandIndex = 0;
 
 		for (GpuResidentGeometryBookkeeping.ResidentBatchInput residentRegion : residentRegions) {
 			RenderRegion region = residentRegion.region();
 			SectionRenderDataStorage storage = residentRegion.storage();
 			context.scheduledBatchCount++;
-			if (cullingViewport != null) {
-				frustumTestedRegionCount++;
-			}
 			if (cullingViewport != null && !isRegionVisible(cullingViewport, region)) {
-				frustumCulledRegionCount++;
+				context.preparedGeneratedBatches.put(region, GeneratedCommandBatch.skip(1, 1, 0, 0, 0));
 				continue;
 			}
 
 			int expectedSectionCount = residentRegion.sectionCount();
 			if (expectedSectionCount <= 0) {
+				context.preparedGeneratedBatches.put(
+					region,
+					GeneratedCommandBatch.skip(cullingViewport != null ? 1 : 0, 0, 0, 0, 0)
+				);
 				continue;
 			}
 
@@ -655,29 +645,21 @@ public final class SodiumBridge {
 				region,
 				storage,
 				null,
-				firstCommandIndex,
+				nextFirstCommandIndex,
 				maxCommandCount,
 				expectedSectionCount
 			);
 			regionInputCount++;
-			totalMaxCommandCount = Math.addExact(totalMaxCommandCount, maxCommandCount);
+			nextFirstCommandIndex = Math.addExact(nextFirstCommandIndex, maxCommandCount);
 		}
 
-		context.visibleRegionCount = regionInputCount;
 		if (regionInputCount == 0) {
-			context.compactedComputeBatch = GeneratedCommandBatch.skip(
-				frustumTestedRegionCount,
-				frustumCulledRegionCount,
-				0,
-				0,
-				0
-			);
-			context.compactedComputeBatchPrepared = false;
-			context.compactedComputeBatchDrawn = false;
+			context.visibleRegionCount = context.scheduledBatchCount;
 			return;
 		}
 
-		context.commandBuffer.reserveGpuCommandRange(totalMaxCommandCount);
+		context.visibleRegionCount = context.scheduledBatchCount;
+		context.commandBuffer.reserveGpuCommandRange(nextFirstCommandIndex);
 
 		try {
 			ComputePassResult computePassResult = SectionVisibilityCompute.generateIndexedCommands(
@@ -694,51 +676,50 @@ public final class SodiumBridge {
 			);
 			if (computePassResult.dispatched()) {
 				context.computeDispatchCount++;
-				context.commandBuffer.commitGpuGeneratedCommands(
-					firstCommandIndex,
-					useGpuDrawCount ? totalMaxCommandCount : computePassResult.totalCommandCount()
-				);
+				context.commandBuffer.commitGpuGeneratedCommands(0, nextFirstCommandIndex);
 			}
 
-			int testedSectionCount = sumCounts(computePassResult.testedSectionCounts(), regionInputCount);
-			int visibleSectionCount = computePassResult.countersReadBack()
-				? sumCounts(computePassResult.visibleSectionCounts(), regionInputCount)
-				: 0;
-			context.compactedComputeBatch = useGpuDrawCount
-				? GeneratedCommandBatch.computeCounted(
-					firstCommandIndex,
-					totalMaxCommandCount,
-					SectionVisibilityCompute.totalCommandCountOffsetBytes(),
-					frustumTestedRegionCount,
-					frustumCulledRegionCount,
-					testedSectionCount,
-					visibleSectionCount,
-					testedSectionCount - visibleSectionCount
-				)
-				: computePassResult.totalCommandCount() > 0
-					? GeneratedCommandBatch.compute(
-						firstCommandIndex,
-						computePassResult.totalCommandCount(),
-						frustumTestedRegionCount,
-						frustumCulledRegionCount,
+			for (int regionIndex = 0; regionIndex < regionInputCount; regionIndex++) {
+				RegionBatchInput regionInput = regionInputs.get(regionIndex);
+				int testedSectionCount = computePassResult.testedSectionCounts()[regionIndex];
+				GeneratedCommandBatch generatedBatch;
+				if (useGpuDrawCount) {
+					generatedBatch = GeneratedCommandBatch.computeCounted(
+						regionInput.firstCommandIndex(),
+						regionInput.maxCommandCount(),
+						SectionVisibilityCompute.commandCountOffsetBytes(regionIndex),
+						cullingViewport != null ? 1 : 0,
+						0,
 						testedSectionCount,
-						visibleSectionCount,
-						testedSectionCount - visibleSectionCount
-					)
-					: GeneratedCommandBatch.skip(
-						frustumTestedRegionCount,
-						frustumCulledRegionCount,
-						testedSectionCount,
-						visibleSectionCount,
-						testedSectionCount - visibleSectionCount
+						0,
+						0
 					);
-			context.compactedComputeBatchPrepared = false;
-			context.compactedComputeBatchDrawn = false;
+				} else {
+					int commandCount = computePassResult.commandCounts()[regionIndex];
+					int visibleSectionCount = computePassResult.visibleSectionCounts()[regionIndex];
+					generatedBatch = commandCount > 0
+						? GeneratedCommandBatch.compute(
+							regionInput.firstCommandIndex(),
+							commandCount,
+							cullingViewport != null ? 1 : 0,
+							0,
+							testedSectionCount,
+							visibleSectionCount,
+							testedSectionCount - visibleSectionCount
+						)
+						: GeneratedCommandBatch.skip(
+							cullingViewport != null ? 1 : 0,
+							0,
+							testedSectionCount,
+							visibleSectionCount,
+							testedSectionCount - visibleSectionCount
+						);
+				}
+				context.preparedGeneratedBatches.put(regionInput.region(), generatedBatch);
+			}
 		} catch (RuntimeException exception) {
 			context.computeFailureCount++;
-			context.compactedComputeBatch = null;
-			context.compactedComputeBatchPrepared = false;
-			context.compactedComputeBatchDrawn = false;
+			context.preparedGeneratedBatches.clear();
 			PotassiumClientMod.LOGGER.warn(
 				"Potassium compute command generation failed for one render pass. Falling back to CPU generation.",
 				exception
@@ -1411,14 +1392,6 @@ public final class SodiumBridge {
 		return preparedSceneIds != null ? preparedSceneIds : PreparedTranslatedSceneIds.EMPTY;
 	}
 
-	private static int sumCounts(int[] values, int count) {
-		int total = 0;
-		for (int index = 0; index < count; index++) {
-			total = Math.addExact(total, values[index]);
-		}
-		return total;
-	}
-
 	private static void recordMirroredBatch(RenderPassContext context, PreparedBatch preparedBatch) {
 		context.mirroredBatchCount++;
 		if (!preparedBatch.gpuCounted()) {
@@ -1880,9 +1853,6 @@ public final class SodiumBridge {
 		private final ArrayDeque<PreparedTranslatedSceneIds> preparedTranslatedSceneIds = new ArrayDeque<>();
 		private IndexedIndirectCommandBuffer commandBuffer;
 		private PreparedBatch pendingPreparedBatch;
-		private GeneratedCommandBatch compactedComputeBatch;
-		private boolean compactedComputeBatchPrepared;
-		private boolean compactedComputeBatchDrawn;
 		private boolean preparedBatchesScheduled;
 		private boolean persistentMappingEnabled;
 		private boolean computeCullingEnabled;
@@ -1937,9 +1907,6 @@ public final class SodiumBridge {
 			this.viewport = viewport;
 			this.commandBuffer = null;
 			this.pendingPreparedBatch = null;
-			this.compactedComputeBatch = null;
-			this.compactedComputeBatchPrepared = false;
-			this.compactedComputeBatchDrawn = false;
 			this.preparedBatchesScheduled = false;
 			this.persistentMappingEnabled = false;
 			this.computeCullingEnabled = false;
@@ -1992,9 +1959,6 @@ public final class SodiumBridge {
 		private void finish() {
 			this.pendingPreparedBatch = null;
 			this.commandBuffer = null;
-			this.compactedComputeBatch = null;
-			this.compactedComputeBatchPrepared = false;
-			this.compactedComputeBatchDrawn = false;
 			this.preparedGeneratedBatches.clear();
 			this.scheduledGeneratedBatches.clear();
 			this.preparedTranslatedSceneIds.clear();

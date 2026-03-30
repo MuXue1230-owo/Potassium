@@ -27,7 +27,7 @@ final class PotassiumSodiumChunkRenderer implements ChunkRenderer {
 		boolean fragmentDiscard,
 		GpuSampler sampler
 	) {
-		SodiumBridge.beginRenderPass(renderPass, renderLists);
+		SodiumBridge.beginRenderPass(renderPass, renderLists, cameraTransform);
 
 		try {
 			this.delegate.render(

@@ -39,6 +39,7 @@ public final class PotassiumChunkShaderInterface implements ChunkShaderInterface
 	private final GlUniformMatrix4f uniformModelViewMatrix;
 	private final GlUniformMatrix4f uniformProjectionMatrix;
 	private final GlUniformFloat3v uniformRegionOffset;
+	private final GlUniformFloat3v uniformCameraPosition;
 	private final GlUniformFloat2v uniformTexCoordShrink;
 	private final GlUniformFloat2v uniformTexelSize;
 	private final GlUniformBool uniformRGSS;
@@ -48,6 +49,7 @@ public final class PotassiumChunkShaderInterface implements ChunkShaderInterface
 		this.uniformModelViewMatrix = context.bindUniform("u_ModelViewMatrix", GlUniformMatrix4f::new);
 		this.uniformProjectionMatrix = context.bindUniform("u_ProjectionMatrix", GlUniformMatrix4f::new);
 		this.uniformRegionOffset = context.bindUniform("u_RegionOffset", GlUniformFloat3v::new);
+		this.uniformCameraPosition = context.bindUniform("u_CameraPosition", GlUniformFloat3v::new);
 		this.uniformTexCoordShrink = context.bindUniform("u_TexCoordShrink", GlUniformFloat2v::new);
 		this.uniformTexelSize = context.bindUniform("u_TexelSize", GlUniformFloat2v::new);
 		this.uniformRGSS = context.bindUniform("u_UseRGSS", GlUniformBool::new);
@@ -89,6 +91,16 @@ public final class PotassiumChunkShaderInterface implements ChunkShaderInterface
 		this.uniformRGSS.setBool(
 			minecraft.options.textureFiltering().get() == TextureFilteringMethod.RGSS
 		);
+		var cameraTransform = SodiumBridge.currentCameraTransform();
+		if (cameraTransform != null) {
+			this.uniformCameraPosition.set(
+				cameraTransform.intX + cameraTransform.fracX,
+				cameraTransform.intY + cameraTransform.fracY,
+				cameraTransform.intZ + cameraTransform.fracZ
+			);
+		} else {
+			this.uniformCameraPosition.set(0.0f, 0.0f, 0.0f);
+		}
 		this.fogShader.setup(fogParameters);
 	}
 

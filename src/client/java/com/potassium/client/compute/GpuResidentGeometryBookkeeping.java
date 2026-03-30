@@ -16,6 +16,7 @@ public final class GpuResidentGeometryBookkeeping {
 	private static long nextGeneration = 1L;
 	private static int nextSceneId = 1;
 	private static int nextSectionId = 1;
+	private static int nextGeometrySourceId = 1;
 
 	private GpuResidentGeometryBookkeeping() {
 	}
@@ -27,6 +28,7 @@ public final class GpuResidentGeometryBookkeeping {
 		GpuResidentSectionMetadataStore.CachedRegionMetadata metadata
 	) {
 		ResidentRegionRecord existingRecord = RECORDS.get(storage);
+		int geometrySourceId = existingRecord != null ? existingRecord.geometrySourceId() : nextGeometrySourceId++;
 		int[] sectionSceneIdsByLocalSection = existingRecord != null
 			? existingRecord.sectionSceneIdsByLocalSection()
 			: new int[GpuResidentSectionMetadataStore.MAX_REGION_SECTION_COUNT];
@@ -46,10 +48,11 @@ public final class GpuResidentGeometryBookkeeping {
 			!Arrays.equals(existingRecord.sectionPresenceBits(), sectionPresenceBits);
 		metadata.assignSceneIds(sceneId, sectionSceneIdsByLocalSection);
 		GpuResidentGeometryStore.syncCpuMirror(metadata, fullSync);
-		queuePendingUpload(metadata, fullSync);
+		queuePendingUpload(metadata, fullSync, geometrySourceId);
 		RECORDS.put(
 			storage,
 			new ResidentRegionRecord(
+				geometrySourceId,
 				sceneId,
 				nextGeneration++,
 				region,
@@ -95,6 +98,7 @@ public final class GpuResidentGeometryBookkeeping {
 			GpuResidentSectionMetadataStore.CachedRegionMetadata metadata = entry.getKey();
 			PendingUpload pendingUpload = entry.getValue();
 			GpuResidentGeometryStore.flushPendingUpload(metadata, pendingUpload.fullSync());
+			GpuGeometryIndirectionStore.flushPendingUpload(metadata, pendingUpload.geometrySourceId());
 			GpuSceneDataStore.flushPendingUpload(metadata);
 			metadata.markUploaded();
 		}
@@ -137,22 +141,28 @@ public final class GpuResidentGeometryBookkeeping {
 		nextGeneration = 1L;
 		nextSceneId = 1;
 		nextSectionId = 1;
+		nextGeometrySourceId = 1;
 		PENDING_UPLOADS.clear();
 	}
 
-	private static void queuePendingUpload(GpuResidentSectionMetadataStore.CachedRegionMetadata metadata, boolean fullSync) {
+	private static void queuePendingUpload(
+		GpuResidentSectionMetadataStore.CachedRegionMetadata metadata,
+		boolean fullSync,
+		int geometrySourceId
+	) {
 		PendingUpload existing = PENDING_UPLOADS.get(metadata);
 		if (existing == null) {
-			PENDING_UPLOADS.put(metadata, new PendingUpload(fullSync));
+			PENDING_UPLOADS.put(metadata, new PendingUpload(fullSync, geometrySourceId));
 			return;
 		}
 
 		if (fullSync && !existing.fullSync()) {
-			PENDING_UPLOADS.put(metadata, new PendingUpload(true));
+			PENDING_UPLOADS.put(metadata, new PendingUpload(true, geometrySourceId));
 		}
 	}
 
 	private record ResidentRegionRecord(
+		int geometrySourceId,
 		int sceneId,
 		long generation,
 		RenderRegion region,
@@ -175,7 +185,7 @@ public final class GpuResidentGeometryBookkeeping {
 		}
 	}
 
-	private record PendingUpload(boolean fullSync) {
+	private record PendingUpload(boolean fullSync, int geometrySourceId) {
 	}
 
 	public record ResidentBatchInput(

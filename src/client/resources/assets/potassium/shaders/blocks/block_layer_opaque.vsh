@@ -16,6 +16,7 @@ out float fadeFactor;
 #endif
 
 uniform vec3 u_RegionOffset;
+uniform vec3 u_CameraPosition;
 uniform vec2 u_TexCoordShrink;
 
 uniform sampler2D u_LightTex;
@@ -35,11 +36,12 @@ void main() {
     PotassiumSceneSection sceneSection = useSceneData
         ? _potassium_get_scene_section()
         : PotassiumSceneSection(0, 0, int(_draw_id), 0, 0, 0, 0, 0, vec4(0.0), vec4(1.0, 0.0, 0.0, 0.0));
-    vec3 translation = u_RegionOffset + (
-        useSceneData
-            ? _potassium_draw_translation(sceneSection)
-            : _get_draw_translation(_draw_id)
-    );
+    PotassiumGeometrySection geometrySection = useSceneData
+        ? _potassium_get_geometry_section()
+        : PotassiumGeometrySection(0, 0, int(_draw_id), int(_draw_id), 0, 0, 0, 0, 0, 0, 0, 0);
+    vec3 translation = useSceneData
+        ? (_potassium_world_translation(geometrySection) - u_CameraPosition)
+        : (u_RegionOffset + _get_draw_translation(_draw_id));
     vec3 position = _vert_position + translation;
 
 #ifdef USE_FOG

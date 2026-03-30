@@ -535,22 +535,9 @@ final class GpuResidentSectionMetadataStore {
 		}
 
 		void writeSceneRecord(ByteBuffer destination, int destinationOffsetBytes, int sectionIndex) {
-			int metadataOffsetBytes = sectionIndex * INPUT_STRIDE_BYTES;
 			destination.position(destinationOffsetBytes);
-			destination.putInt(this.regionSceneId);
-			destination.putInt(this.packedSectionSceneIds[sectionIndex]);
-			destination.putInt(this.templateView.getInt(metadataOffsetBytes + (REGION_INFO_LOCAL_SECTION_INDEX_OFFSET * Integer.BYTES)));
-			destination.putInt(this.templateView.getInt(metadataOffsetBytes + (REGION_INFO_FLAGS_OFFSET * Integer.BYTES)));
-			destination.putInt(this.templateView.getInt(metadataOffsetBytes + (SLICE_MASK_OFFSET * Integer.BYTES)));
-			destination.putInt(this.templateView.getInt(metadataOffsetBytes + (SECTION_CHUNK_X_OFFSET * Integer.BYTES)));
-			destination.putInt(this.templateView.getInt(metadataOffsetBytes + (SECTION_CHUNK_Y_OFFSET * Integer.BYTES)));
-			destination.putInt(this.templateView.getInt(metadataOffsetBytes + (SECTION_CHUNK_Z_OFFSET * Integer.BYTES)));
-			destination.putFloat(this.templateView.getFloat(metadataOffsetBytes + (CENTER_X_OFFSET * Float.BYTES)));
-			destination.putFloat(this.templateView.getFloat(metadataOffsetBytes + (CENTER_Y_OFFSET * Float.BYTES)));
-			destination.putFloat(this.templateView.getFloat(metadataOffsetBytes + (CENTER_Z_OFFSET * Float.BYTES)));
-			destination.putFloat(this.templateView.getFloat(metadataOffsetBytes + (BOUNDING_RADIUS_OFFSET * Float.BYTES)));
 			destination.putFloat(1.0f);
-			destination.putFloat(0.0f);
+			destination.putFloat(1.0f);
 			destination.putFloat(0.0f);
 			destination.putFloat(0.0f);
 		}

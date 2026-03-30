@@ -35,7 +35,7 @@ void main() {
     bool useSceneData = _potassium_use_scene_data();
     PotassiumSceneSection sceneSection = useSceneData
         ? _potassium_get_scene_section()
-        : PotassiumSceneSection(0, 0, int(_draw_id), 0, 0, 0, 0, 0, vec4(0.0), vec4(1.0, 0.0, 0.0, 0.0));
+        : PotassiumSceneSection(vec4(1.0, 1.0, 0.0, 0.0));
     PotassiumGeometrySection geometrySection = useSceneData
         ? _potassium_get_geometry_section()
         : PotassiumGeometrySection(0, 0, int(_draw_id), int(_draw_id), 0, 0, 0, 0, 0, 0, 0, 0);
@@ -46,7 +46,7 @@ void main() {
 
 #ifdef USE_FOG
     v_FragDistance = getFragDistance(position);
-    fadeFactor = 1.0;
+    fadeFactor = useSceneData ? sceneSection.dynamicData.x : 1.0;
 #endif
 
     gl_Position = u_ProjectionMatrix * u_ModelViewMatrix * vec4(position, 1.0);

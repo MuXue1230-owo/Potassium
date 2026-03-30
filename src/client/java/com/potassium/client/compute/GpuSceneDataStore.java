@@ -14,8 +14,8 @@ import org.lwjgl.opengl.GL45C;
 import org.lwjgl.system.MemoryUtil;
 
 public final class GpuSceneDataStore {
-	static final int SCENE_STRIDE_BYTES = Integer.BYTES * 8 + Float.BYTES * 8;
-	private static final int VISIBILITY_OFFSET_BYTES = (Integer.BYTES * 8) + (Float.BYTES * 4);
+	static final int SCENE_STRIDE_BYTES = Float.BYTES * 4;
+	private static final int VISIBILITY_OFFSET_BYTES = 0;
 	private static final int LOD_SCALE_OFFSET_BYTES = VISIBILITY_OFFSET_BYTES + Float.BYTES;
 	private static final int BUFFER_COUNT = configuredBufferCount();
 

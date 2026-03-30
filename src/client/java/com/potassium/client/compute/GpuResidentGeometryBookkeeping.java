@@ -13,10 +13,16 @@ public final class GpuResidentGeometryBookkeeping {
 	private static final Map<SectionRenderDataStorage, ResidentRegionRecord> RECORDS = new WeakHashMap<>();
 	private static final Map<GpuResidentSectionMetadataStore.CachedRegionMetadata, PendingUpload> PENDING_UPLOADS =
 		new IdentityHashMap<>();
+	private static ResidentBatchSnapshot opaqueSnapshot = ResidentBatchSnapshot.empty();
+	private static ResidentBatchSnapshot translucentSnapshot = ResidentBatchSnapshot.empty();
+	private static int snapshotRecordCount = -1;
+	private static boolean residentSnapshotsDirty = true;
+	private static long nextSnapshotVersion = 1L;
 	private static long nextGeneration = 1L;
 	private static int nextSceneId = 1;
 	private static int nextSectionId = 1;
 	private static int nextGeometrySourceId = 1;
+	private static int nextCommandBase = 0;
 
 	private GpuResidentGeometryBookkeeping() {
 	}
@@ -41,14 +47,36 @@ public final class GpuResidentGeometryBookkeeping {
 		}
 
 		int sceneId = existingRecord != null ? existingRecord.sceneId() : nextSceneId++;
+		int maxCommandCount = Math.max(metadata.sectionCount() * 7, 1);
+		int commandBase;
+		if (existingRecord != null && existingRecord.maxCommandCount() >= maxCommandCount) {
+			commandBase = existingRecord.commandBase();
+		} else {
+			commandBase = nextCommandBase;
+			nextCommandBase = Math.addExact(nextCommandBase, maxCommandCount);
+		}
 		long[] sectionPresenceBits = buildSectionPresenceBits(metadata.sectionOrderSnapshot());
 		boolean fullSync =
 			existingRecord == null ||
 			existingRecord.regionSlot() != metadata.regionSlot() ||
 			!Arrays.equals(existingRecord.sectionPresenceBits(), sectionPresenceBits);
 		metadata.assignSceneIds(sceneId, sectionSceneIdsByLocalSection);
+		GpuResidentRegionStore.ResidentRegionDescriptor regionDescriptor = GpuResidentRegionStore.createDescriptor(
+			sceneId,
+			geometrySourceId,
+			region,
+			translucentPass,
+			metadata.regionSlot(),
+			metadata.sectionBaseIndex(),
+			metadata.sectionCount(),
+			metadata.localIndexSectionCount(),
+			metadata.sharedIndexSectionCount(),
+			commandBase,
+			maxCommandCount
+		);
+		GpuResidentRegionStore.syncCpuMirror(regionDescriptor);
 		GpuResidentGeometryStore.syncCpuMirror(metadata, fullSync);
-		queuePendingUpload(metadata, fullSync, geometrySourceId);
+		queuePendingUpload(metadata, fullSync, geometrySourceId, regionDescriptor);
 		RECORDS.put(
 			storage,
 			new ResidentRegionRecord(
@@ -62,31 +90,23 @@ public final class GpuResidentGeometryBookkeeping {
 				metadata.sectionCount(),
 				metadata.localIndexSectionCount(),
 				metadata.sharedIndexSectionCount(),
+				commandBase,
+				maxCommandCount,
 				metadata.metadataBytes(),
 				sectionSceneIdsByLocalSection,
 				sectionPresenceBits
 			)
 		);
+		invalidateResidentSnapshots();
 	}
 
-	public static synchronized List<ResidentBatchInput> snapshotResidentRegions(boolean translucentPass) {
-		List<ResidentBatchInput> residentBatchInputs = new ArrayList<>(RECORDS.size());
-		for (Map.Entry<SectionRenderDataStorage, ResidentRegionRecord> entry : RECORDS.entrySet()) {
-			ResidentRegionRecord record = entry.getValue();
-			if (record.translucentPass() != translucentPass || record.region() == null) {
-				continue;
-			}
-
-			residentBatchInputs.add(
-				new ResidentBatchInput(
-					record.region(),
-					entry.getKey(),
-					record.sectionCount(),
-					record.sectionCount() * 7
-				)
-			);
+	public static synchronized ResidentBatchSnapshot snapshotResidentRegions(boolean translucentPass) {
+		int currentRecordCount = RECORDS.size();
+		if (residentSnapshotsDirty || currentRecordCount != snapshotRecordCount) {
+			rebuildResidentSnapshots(currentRecordCount);
 		}
-		return residentBatchInputs;
+
+		return translucentPass ? translucentSnapshot : opaqueSnapshot;
 	}
 
 	public static synchronized void flushPendingUploads() {
@@ -97,6 +117,7 @@ public final class GpuResidentGeometryBookkeeping {
 		for (Map.Entry<GpuResidentSectionMetadataStore.CachedRegionMetadata, PendingUpload> entry : PENDING_UPLOADS.entrySet()) {
 			GpuResidentSectionMetadataStore.CachedRegionMetadata metadata = entry.getKey();
 			PendingUpload pendingUpload = entry.getValue();
+			GpuResidentRegionStore.flushPendingUpload(pendingUpload.regionDescriptor());
 			GpuResidentGeometryStore.flushPendingUpload(metadata, pendingUpload.fullSync());
 			GpuGeometryIndirectionStore.flushPendingUpload(metadata, pendingUpload.geometrySourceId());
 			GpuSceneDataStore.flushPendingUpload(metadata);
@@ -138,27 +159,83 @@ public final class GpuResidentGeometryBookkeeping {
 
 	static synchronized void reset() {
 		RECORDS.clear();
+		nextSnapshotVersion = 1L;
 		nextGeneration = 1L;
 		nextSceneId = 1;
 		nextSectionId = 1;
 		nextGeometrySourceId = 1;
+		nextCommandBase = 0;
 		PENDING_UPLOADS.clear();
+		opaqueSnapshot = ResidentBatchSnapshot.empty();
+		translucentSnapshot = ResidentBatchSnapshot.empty();
+		snapshotRecordCount = 0;
+		residentSnapshotsDirty = false;
 	}
 
 	private static void queuePendingUpload(
 		GpuResidentSectionMetadataStore.CachedRegionMetadata metadata,
 		boolean fullSync,
-		int geometrySourceId
+		int geometrySourceId,
+		GpuResidentRegionStore.ResidentRegionDescriptor regionDescriptor
 	) {
 		PendingUpload existing = PENDING_UPLOADS.get(metadata);
 		if (existing == null) {
-			PENDING_UPLOADS.put(metadata, new PendingUpload(fullSync, geometrySourceId));
+			PENDING_UPLOADS.put(metadata, new PendingUpload(fullSync, geometrySourceId, regionDescriptor));
 			return;
 		}
 
-		if (fullSync && !existing.fullSync()) {
-			PENDING_UPLOADS.put(metadata, new PendingUpload(true, geometrySourceId));
+		PENDING_UPLOADS.put(
+			metadata,
+			new PendingUpload(fullSync || existing.fullSync(), geometrySourceId, regionDescriptor)
+		);
+	}
+
+	private static void invalidateResidentSnapshots() {
+		residentSnapshotsDirty = true;
+	}
+
+	private static void rebuildResidentSnapshots(int currentRecordCount) {
+		ResidentBatchInput[] opaqueEntries = new ResidentBatchInput[currentRecordCount];
+		ResidentBatchInput[] translucentEntries = new ResidentBatchInput[currentRecordCount];
+		int[] opaqueSceneIds = new int[currentRecordCount];
+		int[] translucentSceneIds = new int[currentRecordCount];
+		int opaqueCount = 0;
+		int translucentCount = 0;
+
+		for (Map.Entry<SectionRenderDataStorage, ResidentRegionRecord> entry : RECORDS.entrySet()) {
+			ResidentRegionRecord record = entry.getValue();
+			RenderRegion region = record.region();
+			if (region == null) {
+				continue;
+			}
+
+			ResidentBatchInput residentBatchInput = new ResidentBatchInput(
+				region,
+				entry.getKey(),
+				record.sceneId(),
+				record.sectionCount(),
+				record.commandBase(),
+				record.maxCommandCount()
+			);
+			if (record.translucentPass()) {
+				translucentEntries[translucentCount++] = residentBatchInput;
+				translucentSceneIds[translucentCount - 1] = record.sceneId();
+			} else {
+				opaqueEntries[opaqueCount++] = residentBatchInput;
+				opaqueSceneIds[opaqueCount - 1] = record.sceneId();
+			}
 		}
+
+		long snapshotVersion = nextSnapshotVersion++;
+		opaqueSnapshot = ResidentBatchSnapshot.of(opaqueEntries, opaqueSceneIds, opaqueCount, snapshotVersion);
+		translucentSnapshot = ResidentBatchSnapshot.of(
+			translucentEntries,
+			translucentSceneIds,
+			translucentCount,
+			snapshotVersion
+		);
+		snapshotRecordCount = RECORDS.size();
+		residentSnapshotsDirty = false;
 	}
 
 	private record ResidentRegionRecord(
@@ -172,6 +249,8 @@ public final class GpuResidentGeometryBookkeeping {
 		int sectionCount,
 		int localIndexSectionCount,
 		int sharedIndexSectionCount,
+		int commandBase,
+		int maxCommandCount,
 		int metadataBytes,
 		int[] sectionSceneIdsByLocalSection,
 		long[] sectionPresenceBits
@@ -185,15 +264,69 @@ public final class GpuResidentGeometryBookkeeping {
 		}
 	}
 
-	private record PendingUpload(boolean fullSync, int geometrySourceId) {
+	private record PendingUpload(
+		boolean fullSync,
+		int geometrySourceId,
+		GpuResidentRegionStore.ResidentRegionDescriptor regionDescriptor
+	) {
 	}
 
 	public record ResidentBatchInput(
 		RenderRegion region,
 		SectionRenderDataStorage storage,
+		int regionSceneId,
 		int sectionCount,
+		int commandBase,
 		int maxCommandCount
 	) {
+	}
+
+	public static final class ResidentBatchSnapshot {
+		private static final ResidentBatchSnapshot EMPTY =
+			new ResidentBatchSnapshot(new ResidentBatchInput[0], new int[0], 0L);
+
+		private final ResidentBatchInput[] entries;
+		private final int[] regionSceneIds;
+		private final long version;
+
+		private ResidentBatchSnapshot(ResidentBatchInput[] entries, int[] regionSceneIds, long version) {
+			this.entries = entries;
+			this.regionSceneIds = regionSceneIds;
+			this.version = version;
+		}
+
+		private static ResidentBatchSnapshot empty() {
+			return EMPTY;
+		}
+
+		private static ResidentBatchSnapshot of(
+			ResidentBatchInput[] entries,
+			int[] regionSceneIds,
+			int count,
+			long version
+		) {
+			if (count == 0) {
+				return EMPTY;
+			}
+
+			return new ResidentBatchSnapshot(Arrays.copyOf(entries, count), Arrays.copyOf(regionSceneIds, count), version);
+		}
+
+		public int size() {
+			return this.entries.length;
+		}
+
+		public ResidentBatchInput get(int index) {
+			return this.entries[index];
+		}
+
+		public int regionSceneId(int index) {
+			return this.regionSceneIds[index];
+		}
+
+		public long version() {
+			return this.version;
+		}
 	}
 
 	private static long[] buildSectionPresenceBits(byte[] sectionOrderSnapshot) {

@@ -9,7 +9,22 @@ import org.lwjgl.opengl.GL45C;
 import org.lwjgl.system.MemoryUtil;
 
 public final class GpuGeometryIndirectionStore {
-	static final int RECORD_STRIDE_BYTES = Integer.BYTES * 12;
+	static final int RECORD_STRIDE_BYTES = Integer.BYTES * 21;
+	private static final int GEOMETRY_SOURCE_ID_OFFSET_BYTES = 0;
+	private static final int REGION_SCENE_ID_OFFSET_BYTES = Integer.BYTES;
+	private static final int SECTION_SCENE_ID_OFFSET_BYTES = Integer.BYTES * 2;
+	private static final int LOCAL_SECTION_INDEX_OFFSET_BYTES = Integer.BYTES * 3;
+	private static final int FLAGS_OFFSET_BYTES = Integer.BYTES * 4;
+	private static final int SECTION_CHUNK_X_OFFSET_BYTES = Integer.BYTES * 5;
+	private static final int SECTION_CHUNK_Y_OFFSET_BYTES = Integer.BYTES * 6;
+	private static final int SECTION_CHUNK_Z_OFFSET_BYTES = Integer.BYTES * 7;
+	private static final int SLICE_MASK_OFFSET_BYTES = Integer.BYTES * 8;
+	private static final int BASE_ELEMENT_OFFSET_BYTES = Integer.BYTES * 9;
+	private static final int BASE_VERTEX_OFFSET_BYTES = Integer.BYTES * 10;
+	private static final int FACING_LIST_LOW_OFFSET_BYTES = Integer.BYTES * 11;
+	private static final int FACING_LIST_HIGH_OFFSET_BYTES = Integer.BYTES * 12;
+	private static final int VERTEX_COUNT_BASE_OFFSET_BYTES = Integer.BYTES * 13;
+	private static final int REGION_SLOT_OFFSET_BYTES = Integer.BYTES * 20;
 
 	private static int bufferHandle;
 	private static int recordCapacity;
@@ -97,18 +112,24 @@ public final class GpuGeometryIndirectionStore {
 		}
 
 		int offsetBytes = sectionSceneId * RECORD_STRIDE_BYTES;
-		destination.geometrySourceId = cpuMirrorView.getInt(offsetBytes);
-		destination.regionSceneId = cpuMirrorView.getInt(offsetBytes + Integer.BYTES);
-		destination.sectionSceneId = cpuMirrorView.getInt(offsetBytes + (Integer.BYTES * 2));
-		destination.localSectionIndex = cpuMirrorView.getInt(offsetBytes + (Integer.BYTES * 3));
-		destination.flags = cpuMirrorView.getInt(offsetBytes + (Integer.BYTES * 4));
-		destination.sectionChunkX = cpuMirrorView.getInt(offsetBytes + (Integer.BYTES * 5));
-		destination.sectionChunkY = cpuMirrorView.getInt(offsetBytes + (Integer.BYTES * 6));
-		destination.sectionChunkZ = cpuMirrorView.getInt(offsetBytes + (Integer.BYTES * 7));
-		destination.sliceMask = cpuMirrorView.getInt(offsetBytes + (Integer.BYTES * 8));
-		destination.baseElement = cpuMirrorView.getInt(offsetBytes + (Integer.BYTES * 9));
-		destination.baseVertex = cpuMirrorView.getInt(offsetBytes + (Integer.BYTES * 10));
-		destination.regionSlot = cpuMirrorView.getInt(offsetBytes + (Integer.BYTES * 11));
+		destination.geometrySourceId = cpuMirrorView.getInt(offsetBytes + GEOMETRY_SOURCE_ID_OFFSET_BYTES);
+		destination.regionSceneId = cpuMirrorView.getInt(offsetBytes + REGION_SCENE_ID_OFFSET_BYTES);
+		destination.sectionSceneId = cpuMirrorView.getInt(offsetBytes + SECTION_SCENE_ID_OFFSET_BYTES);
+		destination.localSectionIndex = cpuMirrorView.getInt(offsetBytes + LOCAL_SECTION_INDEX_OFFSET_BYTES);
+		destination.flags = cpuMirrorView.getInt(offsetBytes + FLAGS_OFFSET_BYTES);
+		destination.sectionChunkX = cpuMirrorView.getInt(offsetBytes + SECTION_CHUNK_X_OFFSET_BYTES);
+		destination.sectionChunkY = cpuMirrorView.getInt(offsetBytes + SECTION_CHUNK_Y_OFFSET_BYTES);
+		destination.sectionChunkZ = cpuMirrorView.getInt(offsetBytes + SECTION_CHUNK_Z_OFFSET_BYTES);
+		destination.sliceMask = cpuMirrorView.getInt(offsetBytes + SLICE_MASK_OFFSET_BYTES);
+		destination.baseElement = cpuMirrorView.getInt(offsetBytes + BASE_ELEMENT_OFFSET_BYTES);
+		destination.baseVertex = cpuMirrorView.getInt(offsetBytes + BASE_VERTEX_OFFSET_BYTES);
+		long facingListLow = Integer.toUnsignedLong(cpuMirrorView.getInt(offsetBytes + FACING_LIST_LOW_OFFSET_BYTES));
+		long facingListHigh = Integer.toUnsignedLong(cpuMirrorView.getInt(offsetBytes + FACING_LIST_HIGH_OFFSET_BYTES));
+		destination.facingList = facingListLow | (facingListHigh << Integer.SIZE);
+		for (int facing = 0; facing < destination.vertexCounts.length; facing++) {
+			destination.vertexCounts[facing] = cpuMirrorView.getInt(offsetBytes + VERTEX_COUNT_BASE_OFFSET_BYTES + (facing * Integer.BYTES));
+		}
+		destination.regionSlot = cpuMirrorView.getInt(offsetBytes + REGION_SLOT_OFFSET_BYTES);
 		return destination.sectionSceneId != 0;
 	}
 
@@ -187,6 +208,7 @@ public final class GpuGeometryIndirectionStore {
 	}
 
 	public static final class GeometryRecord {
+		private final int[] vertexCounts = new int[7];
 		private int geometrySourceId;
 		private int regionSceneId;
 		private int sectionSceneId;
@@ -198,6 +220,7 @@ public final class GpuGeometryIndirectionStore {
 		private int sliceMask;
 		private int baseElement;
 		private int baseVertex;
+		private long facingList;
 		private int regionSlot;
 
 		public int geometrySourceId() {
@@ -242,6 +265,18 @@ public final class GpuGeometryIndirectionStore {
 
 		public int baseVertex() {
 			return this.baseVertex;
+		}
+
+		public long facingList() {
+			return this.facingList;
+		}
+
+		public int vertexCount(int facing) {
+			return this.vertexCounts[facing];
+		}
+
+		public boolean usesLocalIndex() {
+			return (this.flags & GpuResidentSectionMetadataStore.FLAG_USE_LOCAL_INDEX) != 0;
 		}
 
 		public int regionSlot() {

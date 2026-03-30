@@ -14,6 +14,15 @@ struct PotassiumGeometrySection {
     int sliceMask;
     int baseElement;
     int baseVertex;
+    int facingListLow;
+    int facingListHigh;
+    int vertexCount0;
+    int vertexCount1;
+    int vertexCount2;
+    int vertexCount3;
+    int vertexCount4;
+    int vertexCount5;
+    int vertexCount6;
     int regionSlot;
 };
 

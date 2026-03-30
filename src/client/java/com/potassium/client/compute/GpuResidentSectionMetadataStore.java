@@ -74,6 +74,7 @@ final class GpuResidentSectionMetadataStore {
 		if (sectionBufferHandle == 0) {
 			sectionBufferHandle = GL45C.glCreateBuffers();
 		}
+		GpuResidentRegionStore.initialize();
 		GpuResidentGeometryStore.initialize();
 		GpuGeometryIndirectionStore.initialize();
 		GpuSceneDataStore.initialize();
@@ -87,6 +88,7 @@ final class GpuResidentSectionMetadataStore {
 
 		REGION_METADATA_CACHE.clear();
 		GpuResidentGeometryBookkeeping.reset();
+		GpuResidentRegionStore.shutdown();
 		GpuResidentGeometryStore.shutdown();
 		GpuGeometryIndirectionStore.shutdown();
 		GpuSceneDataStore.shutdown();
@@ -569,6 +571,11 @@ final class GpuResidentSectionMetadataStore {
 			destination.putInt(this.templateView.getInt(metadataOffsetBytes + (SLICE_MASK_OFFSET * Integer.BYTES)));
 			destination.putInt(this.templateView.getInt(metadataOffsetBytes + (8 * Integer.BYTES)));
 			destination.putInt(this.templateView.getInt(metadataOffsetBytes + (9 * Integer.BYTES)));
+			destination.putInt(this.templateView.getInt(metadataOffsetBytes + (10 * Integer.BYTES)));
+			destination.putInt(this.templateView.getInt(metadataOffsetBytes + (11 * Integer.BYTES)));
+			for (int facing = 0; facing < 7; facing++) {
+				destination.putInt(this.templateView.getInt(metadataOffsetBytes + ((12 + facing) * Integer.BYTES)));
+			}
 			destination.putInt(this.regionSlot);
 		}
 

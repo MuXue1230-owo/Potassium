@@ -26,26 +26,39 @@ struct SectionCommandInput {
 	uvec4 regionInfo;
 };
 
-struct RegionDescriptor {
-	uint sectionBase;
+struct ResidentRegionDescriptor {
+	uint regionSceneId;
+	uint geometrySourceId;
+	uint regionSlot;
+	uint sectionBaseIndex;
 	uint sectionCount;
+	uint localIndexSectionCount;
+	uint sharedIndexSectionCount;
+	uint flags;
 	uint commandBase;
-	uint padding;
+	uint maxCommandCount;
+	uint padding0;
+	uint padding1;
+	vec4 centerAndRadius;
 };
 
 layout(std430, binding = 0) readonly buffer SectionInputs {
 	SectionCommandInput sections[];
 };
 
-layout(std430, binding = 1) readonly buffer ActiveRegions {
-	RegionDescriptor regions[];
+layout(std430, binding = 1) readonly buffer ResidentRegions {
+	ResidentRegionDescriptor residentRegions[];
 };
 
-layout(std430, binding = 2) buffer CommandCounters {
+layout(std430, binding = 2) readonly buffer ActiveRegions {
+	uint activeRegionIds[];
+};
+
+layout(std430, binding = 3) buffer CommandCounters {
 	uint counterValues[];
 };
 
-layout(std430, binding = 3) buffer IndirectCommands {
+layout(std430, binding = 4) buffer IndirectCommands {
 	uint commandWords[];
 };
 
@@ -63,6 +76,23 @@ bool isSectionVisibleFrustum(vec3 relativeSectionCenter) {
 	for (int planeIndex = 0; planeIndex < 6; planeIndex++) {
 		vec4 plane = uFrustumPlanes[planeIndex];
 		if (dot(plane.xyz, relativeSectionCenter) < plane.w) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+bool isRegionVisibleFrustum(ResidentRegionDescriptor region) {
+	if (uUseFrustumCulling == 0u) {
+		return true;
+	}
+
+	vec3 relativeRegionCenter = region.centerAndRadius.xyz - uCameraPosition;
+	float regionRadius = region.centerAndRadius.w;
+	for (int planeIndex = 0; planeIndex < 6; planeIndex++) {
+		vec4 plane = uFrustumPlanes[planeIndex];
+		if (dot(plane.xyz, relativeRegionCenter) < (plane.w - regionRadius)) {
 			return false;
 		}
 	}
@@ -197,12 +227,19 @@ void emitSharedCommands(SectionCommandInput section, uint regionIndex, uint comm
 
 void main() {
 	uint regionIndex = gl_WorkGroupID.x;
-	RegionDescriptor region = regions[regionIndex];
+	uint regionSceneId = activeRegionIds[regionIndex];
+	ResidentRegionDescriptor region = residentRegions[regionSceneId];
+	if (region.regionSceneId == 0u) {
+		return;
+	}
+	if (!isRegionVisibleFrustum(region)) {
+		return;
+	}
 	uint sectionLocalIndex = (gl_WorkGroupID.y * gl_WorkGroupSize.x) + gl_LocalInvocationID.x;
 	if (sectionLocalIndex >= region.sectionCount) {
 		return;
 	}
-	SectionCommandInput section = sections[region.sectionBase + sectionLocalIndex];
+	SectionCommandInput section = sections[region.sectionBaseIndex + sectionLocalIndex];
 	if (section.regionInfo.y == 0u) {
 		return;
 	}

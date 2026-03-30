@@ -38,7 +38,29 @@ void main() {
         : PotassiumSceneSection(vec4(1.0, 1.0, 0.0, 0.0));
     PotassiumGeometrySection geometrySection = useSceneData
         ? _potassium_get_geometry_section()
-        : PotassiumGeometrySection(0, 0, int(_draw_id), int(_draw_id), 0, 0, 0, 0, 0, 0, 0, 0);
+        : PotassiumGeometrySection(
+            0,
+            0,
+            int(_draw_id),
+            int(_draw_id),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+        );
     vec3 translation = useSceneData
         ? (_potassium_world_translation(geometrySection) - u_CameraPosition)
         : (u_RegionOffset + _get_draw_translation(_draw_id));

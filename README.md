@@ -4,7 +4,7 @@ Potassium is an independent GPU-driven rendering engine project for Minecraft on
 
 ## Status
 
-- Version: `v0.0.1`
+- Version: `v0.1.0-Alpha`
 - Stage: `Phase 1 Early`
 - Current focus: build a stable resident world-data pipeline on the GPU before real GPU meshing and indirect rendering replace vanilla rendering
 

@@ -1,0 +1,16 @@
+{
+	"required": true,
+	"package": "com.potassium.mixin",
+	"compatibilityLevel": "JAVA_25",
+	"client": [
+		"WindowContextMixin",
+		"WindowContextFallbackMixin",
+		"ChunkLifecycleMixin",
+		"BlockChangeMixin",
+		"WorldRenderMixin",
+		"MinecraftClientMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	}
+}

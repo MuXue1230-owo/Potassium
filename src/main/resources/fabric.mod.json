@@ -3,7 +3,7 @@
 	"id": "potassium",
 	"version": "${version}",
 	"name": "Potassium",
-	"description": "Advanced indirect rendering backend for Sodium. Requires OpenGL 4.5+.",
+	"description": "Independent GPU-driven rendering engine for Minecraft. Requires OpenGL 4.5+.",
 	"authors": [
 		"MUXUE1230"
 	],
@@ -16,26 +16,16 @@
 	"environment": "client",
 	"entrypoints": {
 		"client": [
-			"com.potassium.client.PotassiumClientMod"
-		],
-		"sodium:config_api_user": [
-			"com.potassium.client.config.PotassiumSodiumConfigEntryPoint"
-		],
-		"modmenu": [
-			"com.potassium.client.compat.modmenu.PotassiumModMenuApi"
+			"com.potassium.core.PotassiumEngine"
 		]
 	},
 	"mixins": [
-		"potassium.client.mixins.json"
+		"potassium.mixins.json"
 	],
 	"depends": {
 		"fabricloader": ">=0.18.5",
 		"minecraft": "~26.1",
 		"java": ">=25",
-		"fabric-api": "*",
-		"sodium": ">=0.8.7+mc26.1"
-	},
-	"suggests": {
-		"modmenu": "*"
+		"fabric-api": "*"
 	}
 }

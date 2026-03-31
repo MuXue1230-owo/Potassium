@@ -1,295 +1,179 @@
 # Potassium
 
-<div align="center">
+Potassium is an independent GPU-driven rendering engine project for Minecraft on Fabric. It no longer depends on Sodium.
 
-![Potassium Logo](./src/main/resources/assets/potassium/icon.png)
+## Status
 
-**Advanced Indirect Rendering Backend Extension for Sodium**
+- Version: `v0.0.1`
+- Stage: `Phase 1 Early`
+- Current focus: build a stable resident world-data pipeline on the GPU before real GPU meshing and indirect rendering replace vanilla rendering
 
-[![Minecraft](https://img.shields.io/badge/Minecraft-26.1-green?style=flat-square)](https://minecraft.net)
-[![Fabric](https://img.shields.io/badge/Fabric-Latest-blue?style=flat-square)](https://fabricmc.net)
-[![OpenGL](https://img.shields.io/badge/OpenGL-4.5+-red?style=flat-square)](https://opengl.org)
-[![License](https://img.shields.io/badge/License-LGPL--3.0-orange?style=flat-square)](LICENSE)
+## What Works Today
 
-[Download](../../releases) · [Wiki](../../wiki) · [Issues](../../issues)
+### Independent engine bootstrap
 
-</div>
+- All Sodium dependencies, mixins, compat code, shaders, and config hooks have been removed.
+- Potassium now initializes as its own client-side engine entrypoint.
+- Startup initializes:
+  - config loading
+  - OpenGL context negotiation
+  - OpenGL capability checks
+  - optional OpenGL debug output
+  - the current render pipeline skeleton
 
----
+### OpenGL context and capability handling
 
-## 📖 Introduction
+- Potassium prefers an `OpenGL 4.6` context.
+- If `4.6` creation fails, it falls back to `OpenGL 4.5`.
+- If the system cannot provide at least `OpenGL 4.5`, startup fails hard.
+- The current build checks:
+  - shader storage buffer objects
+  - persistent mapped buffers
+  - indirect draw support
+  - indirect count support
+  - compute shader support
+  - direct state access
+  - debug output support
 
-**Potassium (K)** is an advanced extension module designed for the [Sodium](https://github.com/CaffeineMC/sodium-fabric) rendering engine. It leverages modern OpenGL (4.5+) features to implement **Indirect Drawing** and **GPU Driven Rendering**, aiming to突破 the rendering performance bottlenecks of Minecraft Java Edition.
+### Shader loading and compilation
 
-### 🧪 Naming Origin
+- `ShaderProgram` and `ComputeShader` are implemented.
+- The current runtime compiles placeholder shaders for:
+  - chunk vertex/fragment rendering
+  - mesh generation compute
+  - frustum culling compute
+  - occlusion culling compute
+
+### Resident world-data pipeline
+
+- A dedicated world-data SSBO layout exists.
+- `WorldDataBuffer` is configured dynamically from the active level height.
+- Chunk data is serialized from `LevelChunk` into packed block data and uploaded into fixed resident slots in GPU memory.
+- Chunk unload events release resident slots.
+- A fixed memory-budget model is in place for resident chunk storage.
+
+### Incremental block update sync
+
+- Client-side block updates are tracked every tick.
+- For chunks that are already resident in the GPU world buffer, block changes are written back directly to the matching buffer offset.
+- The current block payload is a packed `uint` containing block-state-oriented data.
+
+### Event hooks already connected
+
+- OpenGL window hint override
+- OpenGL context fallback path
+- chunk load hook
+- chunk unload hook
+- block change hook
+- world render begin/end hook
+- client tick hook
 
-| Element       | Symbol | Role                                                                                |
-|:--------------|:-------|:------------------------------------------------------------------------------------|
-| **Sodium**    | Na     | Base rendering optimization, high-performance foundation                            |
-| **Potassium** | K      | **This Mod**: Provides more "reactive" advanced rendering features on top of Sodium |
-| **Lithium**   | Li     | Logic layer optimization (physics/entities), complementary to rendering             |
+## Runtime Expectations
 
-> 💡 **Chemistry Pun**: Potassium lies below Sodium in the periodic table, both belonging to **alkali metals**. Potassium is more chemically reactive—just as this mod introduces more aggressive GPU features on top of Sodium!
+### On game startup
 
----
+You should expect the following:
 
-## ✨ Core Features
+- Potassium installs its own client bootstrap path.
+- The game attempts to create an OpenGL 4.6 context first, then 4.5 if needed.
+- Potassium logs OpenGL version, vendor, renderer, and capability details.
+- The render pipeline allocates its baseline GPU buffers and compiles placeholder shaders.
 
-### 🚀 Performance Improvements
+### After entering a world
 
-| Feature                | Description                                                  | Expected Gain                              |
-|:-----------------------|:-------------------------------------------------------------|:-------------------------------------------|
-| **Indirect Drawing**   | Batch submit draw commands using `glMultiDrawArraysIndirect` | Draw Calls reduced 10-100x                 |
-| **GPU Culling**        | Frustum/Occlusion culling on GPU using Compute Shaders       | CPU rendering overhead reduced 50%+        |
-| **Persistent Mapping** | Reduce CPU-GPU sync wait using `glBufferStorage`             | More stable frame times, less stutter      |
-| **DSA Support**        | Direct State Access reduces state binding overhead           | More efficient code, lower driver overhead |
+You should expect the following:
 
-### 📊 Performance Comparison (Expected)
+- Potassium detects the active world height layout and configures the resident world-data buffer for that layout.
+- Already loaded chunks near the player are queued for upload.
+- The current loader uploads up to `8` chunks per tick.
+- The current unload path releases up to `32` chunks per tick.
+- Block changes are queued as incremental sync work.
+- If a changed block belongs to a resident chunk, the corresponding GPU buffer entry is updated directly.
 
-| Scenario                       | Sodium Native | Potassium | Improvement     |
-|:-------------------------------|:--------------|:----------|:----------------|
-| Chunk Render Draw Calls        | ~500/frame    | ~5/frame  | **99% ↓**       |
-| CPU Render Time                | ~8ms          | ~2ms      | **75% ↓**       |
-| Ultra Far View (32+ chunks)    | 30-40 FPS     | 60-80 FPS | **2x+**         |
-| Complex Terrain Frame Variance | ±15 FPS       | ±5 FPS    | **More Stable** |
+### What you should not expect yet
 
-> ⚠️ Data above is theoretical expectation. Actual performance depends on hardware configuration and game scene.
+This build does **not** yet provide the end-user rendering results the final project is targeting:
 
----
+- it does not replace vanilla terrain rendering yet
+- it does not perform real GPU mesh generation yet
+- it does not reduce draw calls to the final target range yet
+- it does not provide validated FPS improvements yet
+- it does not perform full GPU frustum or occlusion culling for actual terrain submission yet
+- it does not include a complete debug overlay or config UI yet
 
-## 🖥️ System Requirements
+In short: the world-data path into GPU memory exists, but the full GPU-driven rendering path does not exist yet.
 
-### Hard Requirements (Will not run if not met)
+## Current Limitations
 
-| Component     | Requirement     | Note                              |
-|:--------------|:----------------|:----------------------------------|
-| **Minecraft** | 26.1            | Based on Fabric Loader            |
-| **Java**      | 25+             | 64-bit JVM required               |
-| **Sodium**    | 1.8.7+          | Must be installed as a dependency |
-| **OpenGL**    | **4.5+**        | **Core requirement, NO fallback** |
-| **OS**        | Windows / Linux | **macOS NOT supported**           |
+- This is still a development build, not a usable performance mod release.
+- Resident world storage currently uses a fixed slot allocator, not a full streaming or eviction system.
+- The world buffer currently stores packed block data only.
+- The following systems are still placeholders or skeletons:
+  - GPU meshing
+  - LOD selection
+  - indirect draw submission
+  - real frustum/occlusion driven draw generation
+  - shader compatibility layers
+  - Iris compatibility
+  - config screen
+  - polished debug overlay
 
-### Recommended Configuration
+## Key Files
 
-| Component  | Recommended                                      |
-|:-----------|:-------------------------------------------------|
-| **GPU**    | NVIDIA GTX 1060+ / AMD RX 580+ / Intel Arc A380+ |
-| **VRAM**   | 4GB+                                             |
-| **Driver** | Latest version (released after 2023)             |
-| **RAM**    | 8GB+ (4GB+ allocated to Minecraft)               |
+### Core
 
-### ❌ Unsupported Devices
+- `src/main/java/com/potassium/core/PotassiumEngine.java`
+- `src/main/java/com/potassium/core/PotassiumConfig.java`
+- `src/main/java/com/potassium/core/PotassiumLogger.java`
 
-- **macOS any version** (Apple supports OpenGL up to 4.1 only)
-- **Intel Integrated Graphics** (Pre-10th Gen, incomplete driver support)
-- **NVIDIA GeForce 600/700 Series** (Some models lack GL version)
-- **AMD Radeon HD 7000 Series & older** (Poor Compute Shader support)
+### OpenGL and buffers
 
----
+- `src/main/java/com/potassium/gl/GLCapabilities.java`
+- `src/main/java/com/potassium/gl/GLDebug.java`
+- `src/main/java/com/potassium/gl/buffer/PersistentBuffer.java`
+- `src/main/java/com/potassium/gl/buffer/WorldDataBuffer.java`
+- `src/main/java/com/potassium/gl/buffer/IndirectCommandBuffer.java`
 
-## 📦 Installation
+### World data
 
-### Prerequisites
+- `src/main/java/com/potassium/world/ChunkLoader.java`
+- `src/main/java/com/potassium/world/ChunkManager.java`
+- `src/main/java/com/potassium/world/MemoryManager.java`
+- `src/main/java/com/potassium/world/WorldChangeTracker.java`
+- `src/main/java/com/potassium/world/data/ChunkSerializer.java`
+- `src/main/java/com/potassium/world/data/ChunkSnapshot.java`
+- `src/main/resources/shaders/common/world_data.glsl`
 
-1. Install [Fabric Loader](https://fabricmc.net/use/)
-2. Install [Sodium](https://modrinth.com/mod/sodium)
-3. (Optional) Install [Lithium](https://modrinth.com/mod/lithium) for game logic optimization
+### Mixins
 
-### Steps
+- `src/main/java/com/potassium/mixin/WindowContextMixin.java`
+- `src/main/java/com/potassium/mixin/WindowContextFallbackMixin.java`
+- `src/main/java/com/potassium/mixin/ChunkLifecycleMixin.java`
+- `src/main/java/com/potassium/mixin/BlockChangeMixin.java`
+- `src/main/java/com/potassium/mixin/WorldRenderMixin.java`
+- `src/main/java/com/potassium/mixin/MinecraftClientMixin.java`
 
-1. Download the latest `potassium-{version}.jar`
-2. Place the file into `.minecraft/mods/` directory
-3. Launch the game and check logs for successful initialization
+## Requirements
 
-### Verify Installation
-
-After launching, check logs for the following output:
-
-```
-[main/INFO]: Potassium is initializing...
-[main/INFO]: ✓ Sodium detected
-[main/INFO]: OpenGL Version: 4.6
-[main/INFO]: Indirect Drawing: true
-[main/INFO]: Compute Shader: true
-[main/INFO]: ✓ Potassium initialized successfully!
-```
-
----
-
-## ⚙️ Configuration
-
-Config file located at `config/potassium.json`:
-
-```json
-{
-  "rendering": {
-    "enable_indirect_draw": true,
-    "enable_gpu_culling": true,
-    "enable_persistent_mapping": true,
-    "debug_overlay": false
-  },
-  "performance": {
-    "max_indirect_draw_count": 65536,
-    "buffer_size_mb": 256
-  }
-}
-```
-
-### Config Options
-
-| Option                      | Default | Description                                       |
-|:----------------------------|:--------|:--------------------------------------------------|
-| `enable_indirect_draw`      | true    | Enable Indirect Drawing (Core Feature)            |
-| `enable_gpu_culling`        | true    | Enable GPU-side culling (Requires Compute Shader) |
-| `enable_persistent_mapping` | true    | Enable Persistent Mapping Buffers                 |
-| `debug_overlay`             | false   | Show rendering debug info (F3 Screen)             |
-| `max_indirect_draw_count`   | 65536   | Max indirect draw command count                   |
-| `buffer_size_mb`            | 256     | Command buffer size (MB)                          |
-
----
-
-## 🏗️ Technical Architecture
-
-### Rendering Pipeline Comparison
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                    Sodium Native Pipeline                │
-├─────────────────────────────────────────────────────────┤
-│  CPU Frustum Culling → CPU Meshing → glDrawArrays (Multi)│
-│                      ↑                                  │
-│              CPU Bottleneck: Too Many Draw Calls         │
-└─────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────┐
-│                   Potassium Pipeline                     │
-├─────────────────────────────────────────────────────────┤
-│  GPU Compute Shader Culling → Write Indirect Buffer     │
-│                      ↓                                  │
-│  glMultiDrawArraysIndirect (Single Call)                │
-│                      ↑                                  │
-│              GPU Driven: Minimal CPU Overhead            │
-└─────────────────────────────────────────────────────────┘
-```
-
-### Core Modules
-
-| Module                  | Description                                        |
-|:------------------------|:---------------------------------------------------|
-| `GLCapabilities`        | OpenGL capability detection and version validation |
-| `IndirectCommandBuffer` | Indirect draw command buffer management            |
-| `GpuCullingPipeline`    | GPU-side culling compute pipeline                  |
-| `PersistentBuffer`      | Persistent mapping buffer wrapper                  |
-| `SodiumBridge`          | Sodium rendering backend adaptation layer          |
-
----
-
-## 📅 Roadmap
-
-### Phase 1 - Infrastructure (Current)
-- [x] Project initialization and build configuration
-- [x] OpenGL capability detection system
-- [x] Hard fail startup check
-- [ ] IndirectCommandBuffer implementation
-- [ ] CPU-side indirect drawing demo
-
-### Phase 2 - Core Features
-- [ ] Sodium rendering backend integration
-- [ ] Persistent mapping buffers
-- [ ] Chunk indirect drawing integration
-- [ ] Performance benchmarking tools
-
-### Phase 3 - GPU Driven
-- [ ] Compute Shader culling pipeline
-- [ ] GPU-based LOD system
-- [ ] Chained indirect drawing
-- [ ] Multi-GPU support experiment
-
-### Phase 4 - Optimization & Polish
-- [ ] Bindless Texture support
-- [ ] Shader compatibility layer
-- [ ] Performance analysis overlay
-- [ ] Documentation and examples
-
----
-
-## ❓ FAQ
-
-### Q: Why does it say "OpenGL Version Insufficient" on startup?
-**A:** Your GPU or driver does not support OpenGL 4.5+. Please try:
-1. Update GPU driver to the latest version
-2. Confirm GPU hardware supports OpenGL 4.5
-3. If using macOS, this mod cannot run (System limitation)
-
-### Q: Why is Sodium required?
-**A:** Potassium is an **extension** of Sodium, not a replacement. We reuse Sodium's meshing and memory management, only replacing the draw submission layer.
-
-### Q: Is it compatible with Iris Shaders?
-**A:** Currently experimental. Some shaders may not work correctly. We are developing a compatibility layer.
-
-### Q: What if performance doesn't improve?
-**A:** Please check:
-1. Logs confirm indirect drawing is enabled
-2. Use F3 to check if Draw Calls are reduced
-3. Try adjusting buffer size in config
-4. Submit a performance report on GitHub
-
-### Q: Will Forge/NeoForge be supported?
-**A:** Currently Fabric only. Due to architectural differences, Forge version requires redesign, no plans yet.
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome!
-
-### Dev Environment Setup
+- Minecraft: `26.1`
+- Fabric Loader: `0.18.5+`
+- Java: `25+`
+- OpenGL: `4.5+`
+- Operating systems: Windows and Linux are the intended targets
+
+## Build
+
 ```bash
-git clone https://github.com/yourusername/potassium.git
-cd potassium
-./gradlew setupDecompileWorkspace
-./gradlew genSources
+./gradlew build
 ```
 
-### Commit Convention
-- Feature: `feat: description`
-- Bug Fix: `fix: description`
-- Performance: `perf: description`
-- Docs: `docs: description`
+Current development builds in this workspace have been validated using Java 26.
 
-### Testing Requirements
-- All PRs must pass `./gradlew build`
-- Performance changes must include benchmark data
-- New features must update documentation
+## Next Steps
 
----
+The next high-value milestones are:
 
-## 📄 License
-
-This project is licensed under the **GNU Lesser General Public License v3.0**.
-
-- ✅ Personal use, modification, distribution allowed
-- ✅ Allowed as a dependency for other mods
-- ⚠️ Modified source code must be公开 (open sourced)
-- ⚠️ Original author attribution must be preserved
-
-See [LICENSE](LICENSE) file for details.
-
----
-
-## 🙏 Acknowledgements
-
-- [Sodium](https://github.com/CaffeineMC/sodium-fabric) - Base rendering engine
-- [Voxy](https://github.com/voxy-mod/voxy) - OpenGL advanced features reference
-- [LWJGL](https://www.lwjgl.org/) - Java OpenGL bindings
-- [FabricMC](https://fabricmc.net/) - Mod loader
-
----
-
-<div align="center">
-
-**Made with ⚡ by MuXue1230**
-
-[⭐ Star](../../stargazers) · [🍴 Fork](../../forks) · [🐛 Issues](../../issues)
-
-</div>
+1. feed dirty resident chunks into actual GPU mesh generation
+2. generate terrain meshes via compute shaders
+3. build indirect draw command generation and GPU culling
+4. replace the visible terrain rendering path with the new pipeline

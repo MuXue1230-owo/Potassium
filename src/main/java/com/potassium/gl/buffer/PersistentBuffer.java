@@ -3,6 +3,7 @@ package com.potassium.gl.buffer;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import org.lwjgl.opengl.GL15C;
+import org.lwjgl.opengl.GL11C;
 import org.lwjgl.opengl.GL30C;
 import org.lwjgl.opengl.GL32C;
 import org.lwjgl.opengl.GL45C;
@@ -10,6 +11,7 @@ import org.lwjgl.opengl.GL45C;
 public final class PersistentBuffer implements AutoCloseable {
 	private static final int DEFAULT_PERSISTENT_SEGMENT_COUNT = 3;
 	private static final long FENCE_POLL_TIMEOUT_NANOS = 1_000_000L;
+	private static final long MAX_MAPPED_VIEW_BYTES = Integer.MAX_VALUE;
 
 	private final int target;
 	private final boolean persistentMappingEnabled;
@@ -31,7 +33,7 @@ public final class PersistentBuffer implements AutoCloseable {
 	public PersistentBuffer(int target, long initialCapacityBytes, boolean persistentMappingEnabled, int persistentSegmentCount) {
 		this.target = target;
 		this.persistentMappingEnabled = persistentMappingEnabled;
-		this.segmentCount = persistentMappingEnabled ? Math.max(persistentSegmentCount, 2) : 1;
+		this.segmentCount = persistentMappingEnabled ? Math.max(persistentSegmentCount, 1) : 1;
 		this.segmentFences = new long[this.segmentCount];
 		this.allocateStorage(initialCapacityBytes);
 	}
@@ -41,7 +43,7 @@ public final class PersistentBuffer implements AutoCloseable {
 			return;
 		}
 
-		this.allocateStorage(nextCapacity(requiredCapacityBytes));
+		this.allocateStorage(requiredCapacityBytes);
 	}
 
 	public void beginFrame() {
@@ -138,31 +140,22 @@ public final class PersistentBuffer implements AutoCloseable {
 			return;
 		}
 
-		for (int i = 0; i < this.segmentFences.length; i++) {
-			if (this.segmentFences[i] != 0L) {
-				GL32C.glDeleteSync(this.segmentFences[i]);
-				this.segmentFences[i] = 0L;
-			}
-		}
-
-		if (this.mappedView != null) {
-			GL45C.glUnmapNamedBuffer(this.handle);
-			this.mappedView = null;
-		}
-
-		GL15C.glDeleteBuffers(this.handle);
-		this.handle = 0;
-		this.capacityBytes = 0L;
-		this.activeSegmentIndex = 0;
-		this.activeSegmentOffsetBytes = 0L;
-		this.frameOpen = false;
-		this.frameWritten = false;
+		this.clearFences();
+		this.releaseStorage();
+		this.resetRuntimeState();
 	}
 
 	private void allocateStorage(long requestedCapacityBytes) {
 		if (requestedCapacityBytes <= 0L) {
 			throw new IllegalArgumentException("Buffer capacity must be positive.");
 		}
+
+		int previousHandle = this.handle;
+		long previousCapacityBytes = this.capacityBytes;
+		ByteBuffer previousMappedView = this.mappedView;
+		boolean previousFrameOpen = this.frameOpen;
+		boolean previousFrameWritten = this.frameWritten;
+		int previousActiveSegmentIndex = this.activeSegmentIndex;
 
 		int newHandle = GL45C.glCreateBuffers();
 		int storageFlags = GL45C.GL_DYNAMIC_STORAGE_BIT;
@@ -171,23 +164,57 @@ public final class PersistentBuffer implements AutoCloseable {
 			storageFlags |= GL45C.GL_MAP_WRITE_BIT | GL45C.GL_MAP_PERSISTENT_BIT | GL45C.GL_MAP_COHERENT_BIT;
 		}
 
-		GL45C.glNamedBufferStorage(newHandle, requestedCapacityBytes * this.segmentCount, storageFlags);
+		long totalStorageBytes = Math.multiplyExact(requestedCapacityBytes, this.segmentCount);
+		if (this.persistentMappingEnabled && totalStorageBytes > MAX_MAPPED_VIEW_BYTES) {
+			GL15C.glDeleteBuffers(newHandle);
+			throw new IllegalArgumentException(
+				"Persistent mapped buffer exceeds the Java ByteBuffer limit. requested="
+					+ requestedCapacityBytes
+					+ ", segments="
+					+ this.segmentCount
+					+ ", total="
+					+ totalStorageBytes
+			);
+		}
+
+		GL45C.glNamedBufferStorage(newHandle, totalStorageBytes, storageFlags);
 
 		ByteBuffer newMappedView = null;
 		if (this.persistentMappingEnabled) {
-			newMappedView = GL45C.glMapNamedBufferRange(
+			ByteBuffer mappedView = GL45C.glMapNamedBufferRange(
 				newHandle,
 				0L,
-				requestedCapacityBytes * this.segmentCount,
+				totalStorageBytes,
 				GL45C.GL_MAP_WRITE_BIT | GL45C.GL_MAP_PERSISTENT_BIT | GL45C.GL_MAP_COHERENT_BIT
-			).order(ByteOrder.nativeOrder());
+			);
+			if (mappedView == null) {
+				int glError = GL11C.glGetError();
+				this.releaseStorage(newHandle, null);
+				throw new IllegalStateException(
+					"Failed to map persistent buffer storage after allocation. GL error=0x" + Integer.toHexString(glError)
+				);
+			}
+
+			newMappedView = mappedView.order(ByteOrder.nativeOrder());
 		}
 
-		this.close();
+		if (previousHandle != 0) {
+			long copyBytes = Math.min(previousCapacityBytes, requestedCapacityBytes) * this.segmentCount;
+			if (copyBytes > 0L) {
+				GL45C.glCopyNamedBufferSubData(previousHandle, newHandle, 0L, 0L, copyBytes);
+			}
+		}
+
+		this.clearFences();
+		this.releaseStorage(previousHandle, previousMappedView);
 
 		this.handle = newHandle;
 		this.capacityBytes = requestedCapacityBytes;
 		this.mappedView = newMappedView;
+		this.activeSegmentIndex = previousActiveSegmentIndex % this.segmentCount;
+		this.activeSegmentOffsetBytes = this.persistentMappingEnabled ? this.capacityBytes * this.activeSegmentIndex : 0L;
+		this.frameOpen = previousFrameOpen;
+		this.frameWritten = previousFrameWritten;
 	}
 
 	private void waitForSegment(int segmentIndex) {
@@ -210,12 +237,39 @@ public final class PersistentBuffer implements AutoCloseable {
 		}
 	}
 
-	private static long nextCapacity(long requiredCapacityBytes) {
-		long capacity = 1L;
-		while (capacity < requiredCapacityBytes) {
-			capacity <<= 1;
+	private void clearFences() {
+		for (int i = 0; i < this.segmentFences.length; i++) {
+			if (this.segmentFences[i] != 0L) {
+				GL32C.glDeleteSync(this.segmentFences[i]);
+				this.segmentFences[i] = 0L;
+			}
+		}
+	}
+
+	private void releaseStorage() {
+		this.releaseStorage(this.handle, this.mappedView);
+		this.handle = 0;
+		this.mappedView = null;
+		this.capacityBytes = 0L;
+	}
+
+	private void releaseStorage(int handle, ByteBuffer mappedView) {
+		if (handle == 0) {
+			return;
 		}
 
-		return capacity;
+		if (mappedView != null) {
+			GL45C.glUnmapNamedBuffer(handle);
+		}
+
+		GL15C.glDeleteBuffers(handle);
+	}
+
+	private void resetRuntimeState() {
+		this.capacityBytes = 0L;
+		this.activeSegmentIndex = 0;
+		this.activeSegmentOffsetBytes = 0L;
+		this.frameOpen = false;
+		this.frameWritten = false;
 	}
 }

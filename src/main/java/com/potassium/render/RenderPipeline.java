@@ -21,7 +21,11 @@ import com.potassium.world.data.ChunkData;
 import com.potassium.world.data.ChunkSnapshot;
 
 public final class RenderPipeline implements AutoCloseable {
+	private static final long MEBIBYTE_BYTES = 1024L * 1024L;
 	private static final int WORLD_DATA_BINDING = 0;
+	private static final int WORLD_DATA_GROWTH_MIN_MIB = 128;
+	private static final int WORLD_DATA_GROWTH_RESERVE_MIB = 512;
+	private static final int WORLD_DATA_FULL_WARN_INTERVAL = 64;
 
 	private final PotassiumConfig config;
 	private final ChunkManager chunkManager;
@@ -41,6 +45,8 @@ public final class RenderPipeline implements AutoCloseable {
 	private ClientLevel activeLevel;
 	private long lastUploadedWorldBytes;
 	private int lastSyncedChangeCount;
+	private int worldDataBufferFullFailures;
+	private int worldDataBufferExpansionFailures;
 
 	public RenderPipeline(PotassiumConfig config, ChunkManager chunkManager, WorldChangeTracker worldChangeTracker) {
 		this.config = config;
@@ -139,10 +145,11 @@ public final class RenderPipeline implements AutoCloseable {
 
 	public String summaryLine() {
 		return String.format(
-			"chunks=%d resident=%d/%d lastUpload=%dB trackedChanges=%d frustum=%s occlusion=%s",
+			"chunks=%d resident=%d/%d wdbPages=%d lastUpload=%dB trackedChanges=%d frustum=%s occlusion=%s",
 			this.chunkManager.size(),
 			this.memoryManager.residentChunks(),
 			this.memoryManager.capacityChunks(),
+			this.worldDataBuffer.pageCount(),
 			this.lastUploadedWorldBytes,
 			this.worldChangeTracker.pendingChangeCount(),
 			this.frustumCuller.isEnabled(),
@@ -163,6 +170,8 @@ public final class RenderPipeline implements AutoCloseable {
 		this.memoryManager.reset();
 		this.lastUploadedWorldBytes = 0L;
 		this.lastSyncedChangeCount = 0;
+		this.worldDataBufferFullFailures = 0;
+		this.worldDataBufferExpansionFailures = 0;
 
 		if (level == null) {
 			return;
@@ -174,11 +183,13 @@ public final class RenderPipeline implements AutoCloseable {
 		this.memoryManager.configure(this.worldDataBuffer.capacityBytes(), this.worldDataBuffer.bytesPerChunk());
 
 		PotassiumLogger.logger().info(
-			"Configured world data buffer for level layout: minSectionY={}, sections={}, bytesPerChunk={}, residentChunkCapacity={}",
+			"Configured world data buffer for level layout: minSectionY={}, sections={}, bytesPerChunk={}, residentChunkCapacity={}, pages={}, targetPageBytes={}",
 			minSectionY,
 			sectionsCount,
 			this.worldDataBuffer.bytesPerChunk(),
-			this.memoryManager.capacityChunks()
+			this.memoryManager.capacityChunks(),
+			this.worldDataBuffer.pageCount(),
+			this.worldDataBuffer.targetPageCapacityBytes()
 		);
 	}
 
@@ -201,19 +212,21 @@ public final class RenderPipeline implements AutoCloseable {
 
 		int residentSlot = chunkData.isResident() ? chunkData.residentSlot() : this.memoryManager.tryAcquireSlot();
 		if (residentSlot < 0) {
-			PotassiumLogger.logger().warn(
-				"World data buffer is full; could not resident chunk {}. Resident chunks={}/{}.",
-				snapshot.chunkPos(),
-				this.memoryManager.residentChunks(),
-				this.memoryManager.capacityChunks()
-			);
-			return false;
+			if (this.tryExpandWorldDataBuffer()) {
+				residentSlot = this.memoryManager.tryAcquireSlot();
+			}
+			if (residentSlot < 0) {
+				this.logWorldDataBufferFull(snapshot.chunkPos());
+				return false;
+			}
 		}
 
 		this.worldDataBuffer.uploadChunk(residentSlot, snapshot.blockData());
 		this.worldDataBuffer.bind(WORLD_DATA_BINDING);
 		this.lastUploadedWorldBytes = snapshot.byteSize();
 		chunkData.markResident(residentSlot, this.worldDataBuffer.chunkOffsetBytes(residentSlot), tickIndex);
+		this.worldDataBufferFullFailures = 0;
+		this.worldDataBufferExpansionFailures = 0;
 		return true;
 	}
 
@@ -260,14 +273,94 @@ public final class RenderPipeline implements AutoCloseable {
 		this.memoryManager.reset();
 		this.lastUploadedWorldBytes = 0L;
 		this.lastSyncedChangeCount = 0;
+		this.worldDataBufferFullFailures = 0;
+		this.worldDataBufferExpansionFailures = 0;
 	}
 
 	private static long toBytes(int mebibytes) {
-		return (long) mebibytes * 1024L * 1024L;
+		return (long) mebibytes * MEBIBYTE_BYTES;
 	}
 
 	private int worldDataBudgetMiB() {
 		return Math.max(64, Math.min(this.config.memory.worldDataBufferMiB, this.config.memory.maxResidentWorldMiB));
+	}
+
+	private boolean tryExpandWorldDataBuffer() {
+		int currentBudgetMiB = toMebibytesCeil(this.worldDataBuffer.capacityBytes());
+		int maxBudgetMiB = Math.max(currentBudgetMiB, this.config.memory.maxResidentWorldMiB);
+		if (currentBudgetMiB >= maxBudgetMiB) {
+			return false;
+		}
+
+		int availableVideoMemoryMiB = GLCapabilities.getEstimatedAvailableVideoMemoryMiB();
+		if (availableVideoMemoryMiB < 0) {
+			return false;
+		}
+
+		int usableGrowthMiB = availableVideoMemoryMiB - WORLD_DATA_GROWTH_RESERVE_MIB;
+		if (usableGrowthMiB <= 0) {
+			return false;
+		}
+
+		int requestedBudgetMiB = Math.max(currentBudgetMiB * 2, currentBudgetMiB + WORLD_DATA_GROWTH_MIN_MIB);
+		requestedBudgetMiB = Math.min(requestedBudgetMiB, currentBudgetMiB + usableGrowthMiB);
+		requestedBudgetMiB = Math.min(requestedBudgetMiB, maxBudgetMiB);
+		if (requestedBudgetMiB <= currentBudgetMiB) {
+			return false;
+		}
+
+		try {
+			boolean expanded = this.worldDataBuffer.ensureCapacity(toBytes(requestedBudgetMiB));
+			if (!expanded) {
+				return false;
+			}
+
+			boolean slotBudgetExpanded = this.memoryManager.expandBudget(this.worldDataBuffer.capacityBytes());
+			int newBudgetMiB = toMebibytesCeil(this.worldDataBuffer.capacityBytes());
+			this.worldDataBufferExpansionFailures = 0;
+			PotassiumLogger.logger().info(
+				"Expanded world data buffer from {} MiB to {} MiB after reaching capacity. Estimated available VRAM={} MiB, resident chunk capacity={}, pages={}{}.",
+				currentBudgetMiB,
+				newBudgetMiB,
+				availableVideoMemoryMiB,
+				this.memoryManager.capacityChunks(),
+				this.worldDataBuffer.pageCount(),
+				slotBudgetExpanded ? "" : " (slot budget unchanged)"
+			);
+			return true;
+		} catch (RuntimeException exception) {
+			this.worldDataBufferExpansionFailures++;
+			if (this.worldDataBufferExpansionFailures == 1 || (this.worldDataBufferExpansionFailures % WORLD_DATA_FULL_WARN_INTERVAL) == 0) {
+				PotassiumLogger.logger().warn(
+					"World data buffer expansion from {} MiB to {} MiB failed. Estimated available VRAM={} MiB, failures={}, reason={}",
+					currentBudgetMiB,
+					requestedBudgetMiB,
+					availableVideoMemoryMiB,
+					this.worldDataBufferExpansionFailures,
+					exception.getMessage()
+				);
+			}
+			return false;
+		}
+	}
+
+	private void logWorldDataBufferFull(ChunkPos chunkPos) {
+		this.worldDataBufferFullFailures++;
+		if (this.worldDataBufferFullFailures == 1 || (this.worldDataBufferFullFailures % WORLD_DATA_FULL_WARN_INTERVAL) == 0) {
+			PotassiumLogger.logger().warn(
+				"World data buffer is full; could not resident chunk {}. Resident chunks={}/{}. Failures={} maxResidentWorldMiB={} estimatedAvailableVRAM={} MiB.",
+				chunkPos,
+				this.memoryManager.residentChunks(),
+				this.memoryManager.capacityChunks(),
+				this.worldDataBufferFullFailures,
+				this.config.memory.maxResidentWorldMiB,
+				GLCapabilities.getEstimatedAvailableVideoMemoryMiB()
+			);
+		}
+	}
+
+	private static int toMebibytesCeil(long bytes) {
+		return (int) ((bytes + (MEBIBYTE_BYTES - 1)) / MEBIBYTE_BYTES);
 	}
 
 	private static void closeQuietly(AutoCloseable closeable) {

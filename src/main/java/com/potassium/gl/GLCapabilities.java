@@ -7,6 +7,8 @@ import java.util.regex.Pattern;
 import org.lwjgl.opengl.ATIMeminfo;
 import org.lwjgl.opengl.GL;
 import org.lwjgl.opengl.GL11C;
+import org.lwjgl.opengl.GL32C;
+import org.lwjgl.opengl.GL43C;
 import org.lwjgl.opengl.NVXGPUMemoryInfo;
 import org.lwjgl.system.MemoryUtil;
 
@@ -32,6 +34,8 @@ public final class GLCapabilities {
 	private static int dedicatedVideoMemoryMiB = -1;
 	private static int totalAvailableVideoMemoryMiB = -1;
 	private static int currentAvailableVideoMemoryMiB = -1;
+	private static int maxShaderStorageBufferBindings = -1;
+	private static long maxShaderStorageBlockSizeBytes = -1L;
 
 	private GLCapabilities() {
 	}
@@ -78,6 +82,8 @@ public final class GLCapabilities {
 		hasIndirectCount = caps.GL_ARB_indirect_parameters || isAtLeast(4, 6);
 		hasDsa = caps.GL_ARB_direct_state_access || isAtLeast(4, 5);
 		hasDebugOutput = caps.GL_KHR_debug || caps.GL_ARB_debug_output || isAtLeast(4, 3);
+		maxShaderStorageBufferBindings = GL11C.glGetInteger(GL43C.GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS);
+		maxShaderStorageBlockSizeBytes = GL32C.glGetInteger64(GL43C.GL_MAX_SHADER_STORAGE_BLOCK_SIZE);
 		detectVideoMemory(caps);
 
 		if (!hasSsbo) {
@@ -104,6 +110,11 @@ public final class GLCapabilities {
 			hasIndirectCount,
 			hasDsa,
 			hasDebugOutput
+		);
+		PotassiumLogger.logger().info(
+			"OpenGL storage limits: ssboBindings={}, maxSsboBlockSize={} bytes",
+			maxShaderStorageBufferBindings,
+			maxShaderStorageBlockSizeBytes
 		);
 		PotassiumLogger.logger().info(
 			"GPU memory info ({}): dedicated={} MiB, totalAvailable={} MiB, currentAvailable={} MiB",
@@ -176,6 +187,28 @@ public final class GLCapabilities {
 
 	public static int getCurrentAvailableVideoMemoryMiB() {
 		return currentAvailableVideoMemoryMiB;
+	}
+
+	public static int getEstimatedAvailableVideoMemoryMiB() {
+		if (currentAvailableVideoMemoryMiB >= 0) {
+			return currentAvailableVideoMemoryMiB;
+		}
+		if (totalAvailableVideoMemoryMiB >= 0) {
+			return totalAvailableVideoMemoryMiB;
+		}
+		if (dedicatedVideoMemoryMiB >= 0) {
+			return dedicatedVideoMemoryMiB;
+		}
+
+		return -1;
+	}
+
+	public static int getMaxShaderStorageBufferBindings() {
+		return maxShaderStorageBufferBindings;
+	}
+
+	public static long getMaxShaderStorageBlockSizeBytes() {
+		return maxShaderStorageBlockSizeBytes;
 	}
 
 	private static boolean isAtLeast(int requiredMajor, int requiredMinor) {

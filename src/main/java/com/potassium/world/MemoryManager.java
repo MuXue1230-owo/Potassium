@@ -22,6 +22,28 @@ public final class MemoryManager {
 		}
 	}
 
+	public boolean expandBudget(long newBudgetBytes) {
+		if (this.bytesPerChunk <= 0L || newBudgetBytes <= this.budgetBytes) {
+			return false;
+		}
+
+		int newCapacityChunks = (int) Math.min(Integer.MAX_VALUE, newBudgetBytes / this.bytesPerChunk);
+		if (newCapacityChunks <= this.capacityChunks) {
+			this.budgetBytes = Math.max(this.budgetBytes, newBudgetBytes);
+			return false;
+		}
+
+		for (int slot = this.capacityChunks; slot < newCapacityChunks; slot++) {
+			if (!this.usedSlots.contains(slot)) {
+				this.freeSlots.addLast(slot);
+			}
+		}
+
+		this.budgetBytes = newBudgetBytes;
+		this.capacityChunks = newCapacityChunks;
+		return true;
+	}
+
 	public int tryAcquireSlot() {
 		Integer slot = this.freeSlots.pollFirst();
 		if (slot == null) {

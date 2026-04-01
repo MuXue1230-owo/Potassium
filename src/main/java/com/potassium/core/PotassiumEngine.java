@@ -11,9 +11,11 @@ import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.block.state.BlockState;
+import org.joml.Matrix4fc;
 
 public final class PotassiumEngine implements ClientModInitializer {
 	private static PotassiumEngine instance;
@@ -76,8 +78,9 @@ public final class PotassiumEngine implements ClientModInitializer {
 		}
 	}
 
-	public void onRenderLevelEnd() {
+	public void onRenderLevelEnd(CameraRenderState cameraState, Matrix4fc modelViewMatrix) {
 		if (this.runtimeReady) {
+			this.renderPipeline.renderDebugMeshes(cameraState, modelViewMatrix);
 			this.renderPipeline.endFrame();
 		}
 	}

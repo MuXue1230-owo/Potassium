@@ -4,6 +4,8 @@
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
+const uint POTASSIUM_MESH_VERTICES_PER_CHUNK = 6u;
+
 struct PotassiumMeshGenerationJob {
     uint residentSlot;
     int chunkX;
@@ -18,10 +20,58 @@ layout(std430, binding = 5) readonly buffer PotassiumMeshGenerationJobBuffer {
 
 layout(std430, binding = 6) buffer PotassiumMeshGenerationStatsBuffer {
     uint processedJobs;
-    uint lastResidentSlot;
+    uint generatedVertices;
     uint lastSampledPackedBlock;
     uint reserved0;
 } potassium_mesh_generation_stats;
+
+layout(std430, binding = 7) buffer PotassiumGeneratedMeshMetadataBuffer {
+    uvec4 meshMetadata[];
+} potassium_mesh_metadata;
+
+layout(std430, binding = 8) buffer PotassiumGeneratedMeshVertexBuffer {
+    ivec4 generatedVertices[];
+} potassium_mesh_vertices;
+
+uint potassium_section_block_index_to_x(uint sectionBlockIndex) {
+    return sectionBlockIndex & 15u;
+}
+
+uint potassium_section_block_index_to_z(uint sectionBlockIndex) {
+    return (sectionBlockIndex >> 4u) & 15u;
+}
+
+uint potassium_section_block_index_to_y(uint sectionBlockIndex) {
+    return sectionBlockIndex >> 8u;
+}
+
+void potassium_write_debug_top_face(PotassiumMeshGenerationJob job, uint blockIndex, uint packedBlock) {
+    uint sectionBlockIndex = blockIndex & 4095u;
+    uint sectionIndex = blockIndex >> 12u;
+    uint blockX = potassium_section_block_index_to_x(sectionBlockIndex);
+    uint blockZ = potassium_section_block_index_to_z(sectionBlockIndex);
+    uint blockY = (sectionIndex << 4u) + potassium_section_block_index_to_y(sectionBlockIndex);
+    uint vertexBase = job.residentSlot * POTASSIUM_MESH_VERTICES_PER_CHUNK;
+    uint topY = blockY + 1u;
+    int worldX = (job.chunkX << 4) + int(blockX);
+    int worldZ = (job.chunkZ << 4) + int(blockZ);
+    int worldTopY = int(topY);
+    int packedBlockInt = int(packedBlock);
+
+    potassium_mesh_vertices.generatedVertices[vertexBase + 0u] = ivec4(worldX, worldTopY, worldZ, packedBlockInt);
+    potassium_mesh_vertices.generatedVertices[vertexBase + 1u] = ivec4(worldX + 1, worldTopY, worldZ, packedBlockInt);
+    potassium_mesh_vertices.generatedVertices[vertexBase + 2u] = ivec4(worldX + 1, worldTopY, worldZ + 1, packedBlockInt);
+    potassium_mesh_vertices.generatedVertices[vertexBase + 3u] = ivec4(worldX, worldTopY, worldZ, packedBlockInt);
+    potassium_mesh_vertices.generatedVertices[vertexBase + 4u] = ivec4(worldX + 1, worldTopY, worldZ + 1, packedBlockInt);
+    potassium_mesh_vertices.generatedVertices[vertexBase + 5u] = ivec4(worldX, worldTopY, worldZ + 1, packedBlockInt);
+
+    potassium_mesh_metadata.meshMetadata[job.residentSlot] = uvec4(
+        POTASSIUM_MESH_VERTICES_PER_CHUNK,
+        vertexBase,
+        job.residentSlot,
+        packedBlock
+    );
+}
 
 void main() {
     uint jobIndex = gl_GlobalInvocationID.x;
@@ -30,10 +80,26 @@ void main() {
     }
 
     PotassiumMeshGenerationJob job = potassium_mesh_generation_jobs.jobs[jobIndex];
-    uint firstBlockIndex = potassium_world_chunk_base_block(job.residentSlot);
-    uint sampledPackedBlock = potassium_world_load_packed_block(firstBlockIndex);
+    uint chunkBaseBlock = potassium_world_chunk_base_block(job.residentSlot);
+    uint blockCount = potassium_world_blocks_per_chunk();
+    uint foundPackedBlock = 0u;
+    uint foundBlockIndex = 0u;
+
+    for (int blockIndex = int(blockCount) - 1; blockIndex >= 0; blockIndex--) {
+        uint packedBlock = potassium_world_load_packed_block(chunkBaseBlock + uint(blockIndex));
+        if (packedBlock != 0u) {
+            foundPackedBlock = packedBlock;
+            foundBlockIndex = uint(blockIndex);
+            break;
+        }
+    }
+
+    potassium_mesh_metadata.meshMetadata[job.residentSlot] = uvec4(0u);
+    if (foundPackedBlock != 0u) {
+        potassium_write_debug_top_face(job, foundBlockIndex, foundPackedBlock);
+        atomicAdd(potassium_mesh_generation_stats.generatedVertices, POTASSIUM_MESH_VERTICES_PER_CHUNK);
+    }
 
     atomicAdd(potassium_mesh_generation_stats.processedJobs, 1u);
-    atomicExchange(potassium_mesh_generation_stats.lastResidentSlot, job.residentSlot);
-    atomicExchange(potassium_mesh_generation_stats.lastSampledPackedBlock, sampledPackedBlock);
+    atomicExchange(potassium_mesh_generation_stats.lastSampledPackedBlock, foundPackedBlock);
 }

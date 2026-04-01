@@ -52,6 +52,6 @@ public final class MeshGenerationStatsBuffer implements AutoCloseable {
 		MemoryUtil.memFree(this.readbackBuffer);
 	}
 
-	public record Stats(int processedJobs, int lastResidentSlot, int lastSampledPackedBlock) {
+	public record Stats(int processedJobs, int generatedVertices, int lastSampledPackedBlock) {
 	}
 }

@@ -6,6 +6,8 @@ import com.potassium.gl.GLCapabilities;
 import com.potassium.gl.buffer.IndirectCommandBuffer;
 import com.potassium.gl.buffer.MeshGenerationJobBuffer;
 import com.potassium.gl.buffer.MeshGenerationStatsBuffer;
+import com.potassium.gl.buffer.MeshMetadataBuffer;
+import com.potassium.gl.buffer.MeshVertexBuffer;
 import com.potassium.gl.buffer.VertexBuffer;
 import com.potassium.gl.buffer.WorldDataBuffer;
 import com.potassium.render.culling.FrustumCuller;
@@ -15,26 +17,39 @@ import com.potassium.render.shader.ShaderProgram;
 import com.potassium.world.ChunkManager;
 import com.potassium.world.MemoryManager;
 import com.potassium.world.WorldChangeTracker;
+import java.nio.FloatBuffer;
+import java.nio.IntBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.block.state.BlockState;
 import com.potassium.world.data.ChunkData;
 import com.potassium.world.data.ChunkSnapshot;
+import org.joml.Matrix4f;
+import org.joml.Matrix4fc;
+import org.lwjgl.opengl.GL11C;
+import org.lwjgl.opengl.GL20C;
+import org.lwjgl.opengl.GL30C;
+import org.lwjgl.opengl.GL45C;
 import org.lwjgl.opengl.GL43C;
+import org.lwjgl.system.MemoryStack;
 
 public final class RenderPipeline implements AutoCloseable {
 	private static final long MEBIBYTE_BYTES = 1024L * 1024L;
 	private static final int WORLD_DATA_BINDING = 0;
 	private static final int MESH_JOB_BINDING = WORLD_DATA_BINDING + 1 + WorldDataBuffer.MAX_SHADER_PAGES;
 	private static final int MESH_STATS_BINDING = MESH_JOB_BINDING + 1;
+	private static final int MESH_METADATA_BINDING = MESH_STATS_BINDING + 1;
+	private static final int MESH_VERTEX_BINDING = MESH_METADATA_BINDING + 1;
 	private static final int WORLD_DATA_GROWTH_MIN_MIB = 128;
 	private static final int WORLD_DATA_GROWTH_RESERVE_MIB = 512;
 	private static final int WORLD_DATA_FULL_WARN_INTERVAL = 64;
 	private static final int WORLD_DATA_EVICTION_LOG_INTERVAL = 64;
 	private static final int MESH_GENERATION_JOB_LIMIT_PER_FRAME = 256;
 	private static final int MESH_GENERATION_LOCAL_SIZE_X = 64;
+	private static final int MESH_GENERATION_REQUIRED_SSBO_BINDINGS = MESH_VERTEX_BINDING + 1;
 
 	private final PotassiumConfig config;
 	private final ChunkManager chunkManager;
@@ -47,6 +62,8 @@ public final class RenderPipeline implements AutoCloseable {
 	private IndirectCommandBuffer indirectCommandBuffer;
 	private MeshGenerationJobBuffer meshGenerationJobBuffer;
 	private MeshGenerationStatsBuffer meshGenerationStatsBuffer;
+	private MeshMetadataBuffer meshMetadataBuffer;
+	private MeshVertexBuffer meshVertexBuffer;
 	private VertexBuffer vertexBuffer;
 	private ShaderProgram chunkProgram;
 	private ComputeShader meshGenerationShader;
@@ -59,10 +76,16 @@ public final class RenderPipeline implements AutoCloseable {
 	private int lastMeshGenerationJobs;
 	private int lastMeshGenerationProcessedJobs;
 	private int lastMeshGenerationDirtyCandidates;
+	private int lastMeshGenerationGeneratedVertices;
 	private int lastMeshGenerationSampledPackedBlock;
 	private int worldDataBufferFullFailures;
 	private int worldDataBufferExpansionFailures;
 	private int worldDataEvictions;
+	private int lastRenderedMeshChunks;
+	private int lastRenderedMeshVertices;
+	private int debugMeshVertexArray;
+	private int chunkModelViewUniform;
+	private int chunkProjectionUniform;
 
 	public RenderPipeline(PotassiumConfig config, ChunkManager chunkManager, WorldChangeTracker worldChangeTracker) {
 		this.config = config;
@@ -86,11 +109,24 @@ public final class RenderPipeline implements AutoCloseable {
 			"shaders/render/chunk.vert",
 			"shaders/render/chunk.frag"
 		);
+		this.debugMeshVertexArray = GL45C.glCreateVertexArrays();
+		this.chunkModelViewUniform = GL20C.glGetUniformLocation(this.chunkProgram.handle(), "uModelViewMatrix");
+		this.chunkProjectionUniform = GL20C.glGetUniformLocation(this.chunkProgram.handle(), "uProjectionMatrix");
 
 		if (GLCapabilities.hasComputeShader()) {
-			this.meshGenerationShader = ComputeShader.load("mesh_generation", "shaders/mesh/generation.comp");
-			this.meshGenerationJobBuffer = new MeshGenerationJobBuffer(MESH_GENERATION_JOB_LIMIT_PER_FRAME, usePersistentMapping);
-			this.meshGenerationStatsBuffer = new MeshGenerationStatsBuffer();
+			if (this.hasMeshGenerationBindingBudget()) {
+				this.meshGenerationShader = ComputeShader.load("mesh_generation", "shaders/mesh/generation.comp");
+				this.meshGenerationJobBuffer = new MeshGenerationJobBuffer(MESH_GENERATION_JOB_LIMIT_PER_FRAME, usePersistentMapping);
+				this.meshGenerationStatsBuffer = new MeshGenerationStatsBuffer();
+				this.meshMetadataBuffer = new MeshMetadataBuffer(Math.max(this.config.memory.worldDataBufferMiB, 1));
+				this.meshVertexBuffer = new MeshVertexBuffer(Math.max(this.config.memory.worldDataBufferMiB, 1));
+			} else {
+				PotassiumLogger.logger().warn(
+					"Skipping mesh-generation compute initialization because GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS={} is below the required {}.",
+					GLCapabilities.getMaxShaderStorageBufferBindings(),
+					MESH_GENERATION_REQUIRED_SSBO_BINDINGS
+				);
+			}
 			this.frustumCullingShader = ComputeShader.load("frustum_culling", "shaders/culling/frustum.comp");
 			this.occlusionCullingShader = ComputeShader.load("occlusion_culling", "shaders/culling/occlusion.comp");
 		}
@@ -170,7 +206,7 @@ public final class RenderPipeline implements AutoCloseable {
 
 	public String summaryLine() {
 		return String.format(
-			"chunks=%d resident=%d/%d wdbPages=%d lastUpload=%dB trackedChanges=%d meshJobs=%d/%d meshProcessed=%d sampleBlock=%d frustum=%s occlusion=%s",
+			"chunks=%d resident=%d/%d wdbPages=%d lastUpload=%dB trackedChanges=%d meshJobs=%d/%d meshProcessed=%d meshVertices=%d rendered=%d/%d sampleBlock=%d frustum=%s occlusion=%s",
 			this.chunkManager.size(),
 			this.memoryManager.residentChunks(),
 			this.memoryManager.capacityChunks(),
@@ -180,6 +216,9 @@ public final class RenderPipeline implements AutoCloseable {
 			this.lastMeshGenerationJobs,
 			this.lastMeshGenerationDirtyCandidates,
 			this.lastMeshGenerationProcessedJobs,
+			this.lastMeshGenerationGeneratedVertices,
+			this.lastRenderedMeshChunks,
+			this.lastRenderedMeshVertices,
 			this.lastMeshGenerationSampledPackedBlock,
 			this.frustumCuller.isEnabled(),
 			this.occlusionCuller.isEnabled()
@@ -202,7 +241,10 @@ public final class RenderPipeline implements AutoCloseable {
 		this.lastMeshGenerationJobs = 0;
 		this.lastMeshGenerationProcessedJobs = 0;
 		this.lastMeshGenerationDirtyCandidates = 0;
+		this.lastMeshGenerationGeneratedVertices = 0;
 		this.lastMeshGenerationSampledPackedBlock = 0;
+		this.lastRenderedMeshChunks = 0;
+		this.lastRenderedMeshVertices = 0;
 		this.worldDataBufferFullFailures = 0;
 		this.worldDataBufferExpansionFailures = 0;
 		this.worldDataEvictions = 0;
@@ -215,6 +257,7 @@ public final class RenderPipeline implements AutoCloseable {
 		int sectionsCount = level.getSectionsCount();
 		this.worldDataBuffer.configure(minSectionY, sectionsCount);
 		this.memoryManager.configure(this.worldDataBuffer.capacityBytes(), this.worldDataBuffer.bytesPerChunk());
+		this.ensureMeshOutputCapacity(true);
 
 		PotassiumLogger.logger().info(
 			"Configured world data buffer for level layout: minSectionY={}, sections={}, bytesPerChunk={}, residentChunkCapacity={}, pages={}, targetPageBytes={}",
@@ -262,6 +305,7 @@ public final class RenderPipeline implements AutoCloseable {
 		this.worldDataBuffer.bind(WORLD_DATA_BINDING);
 		this.lastUploadedWorldBytes = snapshot.byteSize();
 		chunkData.markResident(residentSlot, this.worldDataBuffer.chunkOffsetBytes(residentSlot), tickIndex);
+		this.clearMeshSlot(residentSlot);
 		this.worldDataBufferFullFailures = 0;
 		this.worldDataBufferExpansionFailures = 0;
 		return true;
@@ -272,6 +316,7 @@ public final class RenderPipeline implements AutoCloseable {
 			return;
 		}
 
+		this.clearMeshSlot(chunkData.residentSlot());
 		this.memoryManager.releaseSlot(chunkData.residentSlot());
 		chunkData.clearResident();
 	}
@@ -288,6 +333,68 @@ public final class RenderPipeline implements AutoCloseable {
 		return this.memoryManager.usedBytes();
 	}
 
+	public void renderDebugMeshes(CameraRenderState cameraState, Matrix4fc modelViewMatrixState) {
+		if (!this.initialized || this.meshMetadataBuffer == null || this.meshVertexBuffer == null || this.chunkProgram == null) {
+			return;
+		}
+		if (cameraState == null || modelViewMatrixState == null) {
+			return;
+		}
+
+		IntBuffer metadata = this.meshMetadataBuffer.readEntries();
+		if (metadata.remaining() < this.meshMetadataBuffer.capacityEntries() * MeshMetadataBuffer.INTS_PER_ENTRY) {
+			return;
+		}
+
+		this.lastRenderedMeshChunks = 0;
+		this.lastRenderedMeshVertices = 0;
+
+		Matrix4f modelViewMatrix = new Matrix4f(modelViewMatrixState);
+		Matrix4f projectionMatrix = new Matrix4f(cameraState.projectionMatrix);
+
+		GL20C.glUseProgram(this.chunkProgram.handle());
+		try (MemoryStack stack = MemoryStack.stackPush()) {
+			FloatBuffer modelViewBuffer = stack.mallocFloat(16);
+			FloatBuffer projectionBuffer = stack.mallocFloat(16);
+			modelViewMatrix.get(modelViewBuffer);
+			projectionMatrix.get(projectionBuffer);
+			GL20C.glUniformMatrix4fv(this.chunkModelViewUniform, false, modelViewBuffer);
+			GL20C.glUniformMatrix4fv(this.chunkProjectionUniform, false, projectionBuffer);
+		}
+
+		GL30C.glBindVertexArray(this.debugMeshVertexArray);
+		this.meshVertexBuffer.bindArrayBuffer();
+		GL30C.glEnableVertexAttribArray(0);
+		GL30C.glVertexAttribIPointer(0, 4, GL11C.GL_INT, MeshVertexBuffer.BYTES_PER_VERTEX, 0L);
+
+		GL11C.glEnable(GL11C.GL_BLEND);
+		GL11C.glBlendFunc(GL11C.GL_SRC_ALPHA, GL11C.GL_ONE_MINUS_SRC_ALPHA);
+		GL11C.glDisable(GL11C.GL_CULL_FACE);
+
+		for (ChunkData chunkData : this.chunkManager.chunks()) {
+			if (!chunkData.isResident()) {
+				continue;
+			}
+
+			int metadataOffset = chunkData.residentSlot() * MeshMetadataBuffer.INTS_PER_ENTRY;
+			int vertexCount = metadata.get(metadataOffset);
+			int firstVertex = metadata.get(metadataOffset + 1);
+			if (vertexCount <= 0) {
+				continue;
+			}
+
+			GL11C.glDrawArrays(GL11C.GL_TRIANGLES, firstVertex, vertexCount);
+			this.lastRenderedMeshChunks++;
+			this.lastRenderedMeshVertices += vertexCount;
+		}
+
+		GL11C.glEnable(GL11C.GL_CULL_FACE);
+		GL11C.glDisable(GL11C.GL_BLEND);
+		GL30C.glDisableVertexAttribArray(0);
+		GL30C.glBindVertexArray(0);
+		GL20C.glUseProgram(0);
+	}
+
 	@Override
 	public void close() {
 		closeQuietly(this.occlusionCullingShader);
@@ -295,6 +402,8 @@ public final class RenderPipeline implements AutoCloseable {
 		closeQuietly(this.meshGenerationShader);
 		closeQuietly(this.meshGenerationStatsBuffer);
 		closeQuietly(this.meshGenerationJobBuffer);
+		closeQuietly(this.meshVertexBuffer);
+		closeQuietly(this.meshMetadataBuffer);
 		closeQuietly(this.chunkProgram);
 		closeQuietly(this.vertexBuffer);
 		closeQuietly(this.indirectCommandBuffer);
@@ -305,11 +414,17 @@ public final class RenderPipeline implements AutoCloseable {
 		this.meshGenerationShader = null;
 		this.meshGenerationStatsBuffer = null;
 		this.meshGenerationJobBuffer = null;
+		this.meshVertexBuffer = null;
+		this.meshMetadataBuffer = null;
 		this.chunkProgram = null;
 		this.vertexBuffer = null;
 		this.indirectCommandBuffer = null;
 		this.worldDataBuffer = null;
 		this.initialized = false;
+		if (this.debugMeshVertexArray != 0) {
+			GL30C.glDeleteVertexArrays(this.debugMeshVertexArray);
+			this.debugMeshVertexArray = 0;
+		}
 		this.activeLevel = null;
 		this.memoryManager.reset();
 		this.lastUploadedWorldBytes = 0L;
@@ -317,10 +432,15 @@ public final class RenderPipeline implements AutoCloseable {
 		this.lastMeshGenerationJobs = 0;
 		this.lastMeshGenerationProcessedJobs = 0;
 		this.lastMeshGenerationDirtyCandidates = 0;
+		this.lastMeshGenerationGeneratedVertices = 0;
 		this.lastMeshGenerationSampledPackedBlock = 0;
+		this.lastRenderedMeshChunks = 0;
+		this.lastRenderedMeshVertices = 0;
 		this.worldDataBufferFullFailures = 0;
 		this.worldDataBufferExpansionFailures = 0;
 		this.worldDataEvictions = 0;
+		this.chunkModelViewUniform = -1;
+		this.chunkProjectionUniform = -1;
 	}
 
 	private static long toBytes(int mebibytes) {
@@ -362,6 +482,7 @@ public final class RenderPipeline implements AutoCloseable {
 			}
 
 			boolean slotBudgetExpanded = this.memoryManager.expandBudget(this.worldDataBuffer.capacityBytes());
+			this.ensureMeshOutputCapacity(false);
 			int newBudgetMiB = toMebibytesCeil(this.worldDataBuffer.capacityBytes());
 			this.worldDataBufferExpansionFailures = 0;
 			PotassiumLogger.logger().info(
@@ -429,6 +550,7 @@ public final class RenderPipeline implements AutoCloseable {
 		this.lastMeshGenerationJobs = 0;
 		this.lastMeshGenerationProcessedJobs = 0;
 		this.lastMeshGenerationDirtyCandidates = 0;
+		this.lastMeshGenerationGeneratedVertices = 0;
 		this.lastMeshGenerationSampledPackedBlock = 0;
 
 		int shaderVisibleChunkCapacity = this.worldDataBuffer.shaderVisibleChunkCapacity(WORLD_DATA_BINDING);
@@ -459,6 +581,8 @@ public final class RenderPipeline implements AutoCloseable {
 		this.worldDataBuffer.bind(WORLD_DATA_BINDING);
 		this.meshGenerationJobBuffer.bind(MESH_JOB_BINDING);
 		this.meshGenerationStatsBuffer.resetAndBind(MESH_STATS_BINDING);
+		this.meshMetadataBuffer.bind(MESH_METADATA_BINDING);
+		this.meshVertexBuffer.bindStorage(MESH_VERTEX_BINDING);
 		this.meshGenerationShader.use();
 
 		int groupCountX = (scheduledChunks.size() + (MESH_GENERATION_LOCAL_SIZE_X - 1)) / MESH_GENERATION_LOCAL_SIZE_X;
@@ -468,10 +592,37 @@ public final class RenderPipeline implements AutoCloseable {
 		MeshGenerationStatsBuffer.Stats stats = this.meshGenerationStatsBuffer.read();
 		this.lastMeshGenerationJobs = scheduledChunks.size();
 		this.lastMeshGenerationProcessedJobs = stats.processedJobs();
+		this.lastMeshGenerationGeneratedVertices = stats.generatedVertices();
 		this.lastMeshGenerationSampledPackedBlock = stats.lastSampledPackedBlock();
 		for (ChunkData chunkData : scheduledChunks) {
 			chunkData.markMeshClean();
 		}
+	}
+
+	private boolean hasMeshGenerationBindingBudget() {
+		int maxBindings = GLCapabilities.getMaxShaderStorageBufferBindings();
+		return maxBindings <= 0 || maxBindings >= MESH_GENERATION_REQUIRED_SSBO_BINDINGS;
+	}
+
+	private void ensureMeshOutputCapacity(boolean clearMetadata) {
+		if (this.meshMetadataBuffer == null || this.meshVertexBuffer == null) {
+			return;
+		}
+
+		int requiredChunkCapacity = Math.max(this.memoryManager.capacityChunks(), 1);
+		this.meshMetadataBuffer.ensureCapacity(requiredChunkCapacity);
+		this.meshVertexBuffer.ensureChunkCapacity(requiredChunkCapacity);
+		if (clearMetadata) {
+			this.meshMetadataBuffer.clearAll();
+		}
+	}
+
+	private void clearMeshSlot(int residentSlot) {
+		if (this.meshMetadataBuffer == null || residentSlot < 0) {
+			return;
+		}
+
+		this.meshMetadataBuffer.clearSlot(residentSlot);
 	}
 
 	private void logWorldDataBufferFull(ChunkPos chunkPos) {

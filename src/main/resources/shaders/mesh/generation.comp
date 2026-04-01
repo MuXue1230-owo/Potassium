@@ -1,6 +1,39 @@
 #version 450 core
 
-layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+#include "../common/world_data.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct PotassiumMeshGenerationJob {
+    uint residentSlot;
+    int chunkX;
+    int chunkZ;
+    uint version;
+};
+
+layout(std430, binding = 5) readonly buffer PotassiumMeshGenerationJobBuffer {
+    uvec4 header;
+    PotassiumMeshGenerationJob jobs[];
+} potassium_mesh_generation_jobs;
+
+layout(std430, binding = 6) buffer PotassiumMeshGenerationStatsBuffer {
+    uint processedJobs;
+    uint lastResidentSlot;
+    uint lastSampledPackedBlock;
+    uint reserved0;
+} potassium_mesh_generation_stats;
 
 void main() {
+    uint jobIndex = gl_GlobalInvocationID.x;
+    if (jobIndex >= potassium_mesh_generation_jobs.header.x) {
+        return;
+    }
+
+    PotassiumMeshGenerationJob job = potassium_mesh_generation_jobs.jobs[jobIndex];
+    uint firstBlockIndex = potassium_world_chunk_base_block(job.residentSlot);
+    uint sampledPackedBlock = potassium_world_load_packed_block(firstBlockIndex);
+
+    atomicAdd(potassium_mesh_generation_stats.processedJobs, 1u);
+    atomicExchange(potassium_mesh_generation_stats.lastResidentSlot, job.residentSlot);
+    atomicExchange(potassium_mesh_generation_stats.lastSampledPackedBlock, sampledPackedBlock);
 }

@@ -15,9 +15,15 @@ import org.lwjgl.system.MemoryUtil;
 
 public final class WorldDataBuffer implements AutoCloseable {
 	private static final long MAX_JAVA_MAPPED_VIEW_BYTES = Integer.MAX_VALUE;
+	public static final int MAX_SHADER_PAGES = 4;
+	private static final int LAYOUT_HEADER_WORDS = 4;
+	private static final int LAYOUT_PAGE_INFO_WORDS = 4;
+	private static final int LAYOUT_BUFFER_BYTES = Integer.BYTES * (LAYOUT_HEADER_WORDS + (MAX_SHADER_PAGES * LAYOUT_PAGE_INFO_WORDS));
 
 	private final boolean persistentMappingEnabled;
 	private final ArrayList<Page> pages = new ArrayList<>();
+	private final PersistentBuffer layoutBuffer;
+	private final ByteBuffer layoutUploadBuffer;
 	private final ByteBuffer scratchIntBuffer;
 
 	private long requestedCapacityBytes;
@@ -29,20 +35,27 @@ public final class WorldDataBuffer implements AutoCloseable {
 	private int chunksPerPage;
 	private long bytesPerChunk;
 	private boolean warnedAboutBindingLimit;
+	private int lastBoundShaderPageCount = -1;
+	private int lastBoundBaseBinding = -1;
+	private boolean layoutDirty = true;
 
 	public WorldDataBuffer(long initialCapacityBytes, boolean persistentMappingEnabled) {
 		this.persistentMappingEnabled = persistentMappingEnabled;
 		this.requestedCapacityBytes = Math.max(initialCapacityBytes, 1L);
+		this.layoutBuffer = new PersistentBuffer(GL43C.GL_SHADER_STORAGE_BUFFER, LAYOUT_BUFFER_BYTES, persistentMappingEnabled, 1);
+		this.layoutUploadBuffer = MemoryUtil.memCalloc(LAYOUT_BUFFER_BYTES).order(ByteOrder.nativeOrder());
 		this.scratchIntBuffer = MemoryUtil.memAlloc(Integer.BYTES).order(ByteOrder.nativeOrder());
 	}
 
 	public void beginFrame() {
+		this.layoutBuffer.beginFrame();
 		for (Page page : this.pages) {
 			page.storage.beginFrame();
 		}
 	}
 
 	public void endFrame() {
+		this.layoutBuffer.endFrame();
 		for (Page page : this.pages) {
 			page.storage.endFrame();
 		}
@@ -63,22 +76,18 @@ public final class WorldDataBuffer implements AutoCloseable {
 	}
 
 	public void bind(int binding) {
-		if (this.pages.isEmpty()) {
-			return;
-		}
-
-		int maxBindings = GLCapabilities.getMaxShaderStorageBufferBindings();
-		int availableBindings = maxBindings > 0 ? Math.max(0, maxBindings - binding) : Integer.MAX_VALUE;
-		int bindablePages = Math.min(this.pages.size(), availableBindings);
+		int bindablePages = this.resolveShaderVisiblePageCount(binding);
+		this.uploadLayoutIfNeeded(binding, bindablePages);
+		this.layoutBuffer.bindBase(GL43C.GL_SHADER_STORAGE_BUFFER, binding);
 		for (int pageIndex = 0; pageIndex < bindablePages; pageIndex++) {
-			this.pages.get(pageIndex).storage.bindBase(GL43C.GL_SHADER_STORAGE_BUFFER, binding + pageIndex);
+			this.pages.get(pageIndex).storage.bindBase(GL43C.GL_SHADER_STORAGE_BUFFER, binding + 1 + pageIndex);
 		}
 
 		if (bindablePages < this.pages.size() && !this.warnedAboutBindingLimit) {
 			PotassiumLogger.logger().warn(
-				"World data buffer uses {} pages, but only {} SSBO bindings are available from binding {}. Additional pages will stay unbound until the render ABI is paged.",
+				"World data buffer uses {} pages, but only {} pages are shader-visible from binding {}. Additional pages will stay inaccessible until the shader page window is widened.",
 				this.pages.size(),
-				availableBindings,
+				bindablePages,
 				binding
 			);
 			this.warnedAboutBindingLimit = true;
@@ -114,6 +123,24 @@ public final class WorldDataBuffer implements AutoCloseable {
 
 	public int pageCount() {
 		return this.pages.size();
+	}
+
+	public int shaderVisiblePageCount(int binding) {
+		return this.resolveShaderVisiblePageCount(binding);
+	}
+
+	public int shaderVisibleChunkCapacity(int binding) {
+		if (this.bytesPerChunk == 0L) {
+			return 0;
+		}
+
+		int visiblePages = this.resolveShaderVisiblePageCount(binding);
+		long visibleBytes = 0L;
+		for (int pageIndex = 0; pageIndex < visiblePages; pageIndex++) {
+			visibleBytes += this.pages.get(pageIndex).capacityBytes;
+		}
+
+		return (int) Math.min(Integer.MAX_VALUE, visibleBytes / this.bytesPerChunk);
 	}
 
 	public long targetPageCapacityBytes() {
@@ -199,6 +226,8 @@ public final class WorldDataBuffer implements AutoCloseable {
 	@Override
 	public void close() {
 		this.releasePages();
+		this.layoutBuffer.close();
+		MemoryUtil.memFree(this.layoutUploadBuffer);
 		MemoryUtil.memFree(this.scratchIntBuffer);
 		this.requestedCapacityBytes = 0L;
 		this.totalCapacityBytes = 0L;
@@ -209,12 +238,18 @@ public final class WorldDataBuffer implements AutoCloseable {
 		this.chunksPerPage = 0;
 		this.bytesPerChunk = 0L;
 		this.warnedAboutBindingLimit = false;
+		this.lastBoundShaderPageCount = -1;
+		this.lastBoundBaseBinding = -1;
+		this.layoutDirty = true;
 	}
 
 	private void rebuildStorage() {
 		this.releasePages();
 		this.totalCapacityBytes = 0L;
 		this.warnedAboutBindingLimit = false;
+		this.layoutDirty = true;
+		this.lastBoundShaderPageCount = -1;
+		this.lastBoundBaseBinding = -1;
 
 		if (!this.isConfigured()) {
 			return;
@@ -256,6 +291,7 @@ public final class WorldDataBuffer implements AutoCloseable {
 		PersistentBuffer storage = new PersistentBuffer(GL43C.GL_SHADER_STORAGE_BUFFER, pageCapacityBytes, this.persistentMappingEnabled, 1);
 		this.pages.add(new Page(storage, startOffsetBytes, pageCapacityBytes));
 		this.totalCapacityBytes += pageCapacityBytes;
+		this.layoutDirty = true;
 	}
 
 	private void uploadToPages(ByteBuffer source, long logicalOffsetBytes) {
@@ -298,6 +334,45 @@ public final class WorldDataBuffer implements AutoCloseable {
 		}
 
 		return Math.max(maxPageCapacityBytes, this.bytesPerChunk);
+	}
+
+	private int resolveShaderVisiblePageCount(int binding) {
+		int maxBindings = GLCapabilities.getMaxShaderStorageBufferBindings();
+		int availablePageBindings = maxBindings > 0 ? Math.max(0, maxBindings - binding - 1) : Integer.MAX_VALUE;
+		return Math.min(this.pages.size(), Math.min(MAX_SHADER_PAGES, availablePageBindings));
+	}
+
+	private void uploadLayoutIfNeeded(int binding, int shaderVisiblePageCount) {
+		if (!this.layoutDirty && this.lastBoundShaderPageCount == shaderVisiblePageCount && this.lastBoundBaseBinding == binding) {
+			return;
+		}
+
+		this.layoutUploadBuffer.clear();
+		this.layoutUploadBuffer.putInt((int) Math.min(this.bytesPerChunk, Integer.MAX_VALUE));
+		this.layoutUploadBuffer.putInt((int) Math.min(this.bytesPerChunk / BlockData.BYTES, Integer.MAX_VALUE));
+		this.layoutUploadBuffer.putInt(shaderVisiblePageCount);
+		this.layoutUploadBuffer.putInt(this.pages.size());
+
+		for (int pageIndex = 0; pageIndex < MAX_SHADER_PAGES; pageIndex++) {
+			if (pageIndex < shaderVisiblePageCount) {
+				Page page = this.pages.get(pageIndex);
+				this.layoutUploadBuffer.putInt((int) Math.min(page.startOffsetBytes / BlockData.BYTES, Integer.MAX_VALUE));
+				this.layoutUploadBuffer.putInt((int) Math.min(page.capacityBytes / BlockData.BYTES, Integer.MAX_VALUE));
+				this.layoutUploadBuffer.putInt((int) Math.min(page.startOffsetBytes / Math.max(this.bytesPerChunk, 1L), Integer.MAX_VALUE));
+				this.layoutUploadBuffer.putInt((int) Math.min(page.capacityBytes / Math.max(this.bytesPerChunk, 1L), Integer.MAX_VALUE));
+			} else {
+				this.layoutUploadBuffer.putInt(0);
+				this.layoutUploadBuffer.putInt(0);
+				this.layoutUploadBuffer.putInt(0);
+				this.layoutUploadBuffer.putInt(0);
+			}
+		}
+
+		this.layoutUploadBuffer.flip();
+		this.layoutBuffer.upload(this.layoutUploadBuffer, 0L);
+		this.lastBoundShaderPageCount = shaderVisiblePageCount;
+		this.lastBoundBaseBinding = binding;
+		this.layoutDirty = false;
 	}
 
 	private void releasePages() {

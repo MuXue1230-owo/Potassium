@@ -119,15 +119,12 @@ public final class PotassiumEngine implements ClientModInitializer {
 		}
 
 		return String.format(
-			"runtime=ready gl=%s chunks=%d resident=%d/%d queues=%d/%d pendingChanges=%d lastUpload=%dB",
+			"runtime=ready gl=%s queues=%d/%d pendingChanges=%d %s",
 			GLCapabilities.getVersionString(),
-			this.chunkManager.size(),
-			this.renderPipeline.residentChunkCount(),
-			this.renderPipeline.residentChunkCapacity(),
 			this.chunkLoader.loadQueueSize(),
 			this.chunkLoader.unloadQueueSize(),
 			this.worldChangeTracker.pendingChangeCount(),
-			this.renderPipeline.lastUploadedWorldBytes()
+			this.renderPipeline.summaryLine()
 		);
 	}
 

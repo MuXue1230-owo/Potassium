@@ -3,10 +3,16 @@ package com.potassium.render.shader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import org.lwjgl.opengl.GL20C;
 import org.lwjgl.opengl.GL43C;
 
 public final class ShaderProgram implements AutoCloseable {
+	private static final Pattern INCLUDE_PATTERN = Pattern.compile("^\\s*#include\\s+[\"<]([^\">]+)[\">]\\s*$");
+
 	private int handle;
 	private final String label;
 
@@ -95,15 +101,84 @@ public final class ShaderProgram implements AutoCloseable {
 	}
 
 	private static String readResource(String resourcePath) {
-		try (InputStream stream = ShaderProgram.class.getClassLoader().getResourceAsStream(resourcePath)) {
+		return readResource(resourcePath, new HashSet<>());
+	}
+
+	private static String readResource(String resourcePath, Set<String> includeStack) {
+		String normalizedPath = normalizeResourcePath(resourcePath);
+		if (!includeStack.add(normalizedPath)) {
+			throw new IllegalStateException("Shader include cycle detected at: " + normalizedPath);
+		}
+
+		try (InputStream stream = ShaderProgram.class.getClassLoader().getResourceAsStream(normalizedPath)) {
 			if (stream == null) {
 				throw new IllegalStateException("Shader resource not found: " + resourcePath);
 			}
 
-			return new String(stream.readAllBytes(), StandardCharsets.UTF_8);
+			StringBuilder resolvedSource = new StringBuilder();
+			String resourceText = new String(stream.readAllBytes(), StandardCharsets.UTF_8);
+			String baseDirectory = resourceDirectory(normalizedPath);
+			String[] lines = resourceText.split("\\R", -1);
+			for (int lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+				String line = lines[lineIndex];
+				Matcher matcher = INCLUDE_PATTERN.matcher(line);
+				if (matcher.matches()) {
+					String includePath = resolveIncludePath(baseDirectory, matcher.group(1));
+					resolvedSource.append(readResource(includePath, includeStack));
+				} else {
+					resolvedSource.append(line);
+				}
+
+				if (lineIndex < lines.length - 1) {
+					resolvedSource.append('\n');
+				}
+			}
+
+			return resolvedSource.toString();
 		} catch (IOException exception) {
 			throw new IllegalStateException("Failed to read shader resource: " + resourcePath, exception);
+		} finally {
+			includeStack.remove(normalizedPath);
 		}
+	}
+
+	private static String resolveIncludePath(String baseDirectory, String includePath) {
+		if (includePath.startsWith("shaders/")) {
+			return normalizeResourcePath(includePath);
+		}
+
+		return normalizeResourcePath(baseDirectory + includePath);
+	}
+
+	private static String resourceDirectory(String resourcePath) {
+		int lastSeparator = resourcePath.lastIndexOf('/');
+		return lastSeparator >= 0 ? resourcePath.substring(0, lastSeparator + 1) : "";
+	}
+
+	private static String normalizeResourcePath(String resourcePath) {
+		String normalized = resourcePath.replace('\\', '/');
+		if (normalized.startsWith("/")) {
+			normalized = normalized.substring(1);
+		}
+
+		String[] segments = normalized.split("/");
+		String[] normalizedSegments = new String[segments.length];
+		int segmentCount = 0;
+		for (String segment : segments) {
+			if (segment.isEmpty() || ".".equals(segment)) {
+				continue;
+			}
+			if ("..".equals(segment)) {
+				if (segmentCount == 0) {
+					throw new IllegalStateException("Shader include escaped the resource root: " + resourcePath);
+				}
+				segmentCount--;
+				continue;
+			}
+			normalizedSegments[segmentCount++] = segment;
+		}
+
+		return String.join("/", java.util.Arrays.copyOf(normalizedSegments, segmentCount));
 	}
 
 	private record ShaderSource(int shaderType, String resourcePath) {

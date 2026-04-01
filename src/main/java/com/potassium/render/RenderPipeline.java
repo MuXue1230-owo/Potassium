@@ -26,6 +26,7 @@ public final class RenderPipeline implements AutoCloseable {
 	private static final int WORLD_DATA_GROWTH_MIN_MIB = 128;
 	private static final int WORLD_DATA_GROWTH_RESERVE_MIB = 512;
 	private static final int WORLD_DATA_FULL_WARN_INTERVAL = 64;
+	private static final int WORLD_DATA_EVICTION_LOG_INTERVAL = 64;
 
 	private final PotassiumConfig config;
 	private final ChunkManager chunkManager;
@@ -47,6 +48,7 @@ public final class RenderPipeline implements AutoCloseable {
 	private int lastSyncedChangeCount;
 	private int worldDataBufferFullFailures;
 	private int worldDataBufferExpansionFailures;
+	private int worldDataEvictions;
 
 	public RenderPipeline(PotassiumConfig config, ChunkManager chunkManager, WorldChangeTracker worldChangeTracker) {
 		this.config = config;
@@ -172,6 +174,7 @@ public final class RenderPipeline implements AutoCloseable {
 		this.lastSyncedChangeCount = 0;
 		this.worldDataBufferFullFailures = 0;
 		this.worldDataBufferExpansionFailures = 0;
+		this.worldDataEvictions = 0;
 
 		if (level == null) {
 			return;
@@ -214,6 +217,9 @@ public final class RenderPipeline implements AutoCloseable {
 		if (residentSlot < 0) {
 			if (this.tryExpandWorldDataBuffer()) {
 				residentSlot = this.memoryManager.tryAcquireSlot();
+			}
+			if (residentSlot < 0) {
+				residentSlot = this.tryRecycleResidentSlot(snapshot.chunkPos(), tickIndex);
 			}
 			if (residentSlot < 0) {
 				this.logWorldDataBufferFull(snapshot.chunkPos());
@@ -275,6 +281,7 @@ public final class RenderPipeline implements AutoCloseable {
 		this.lastSyncedChangeCount = 0;
 		this.worldDataBufferFullFailures = 0;
 		this.worldDataBufferExpansionFailures = 0;
+		this.worldDataEvictions = 0;
 	}
 
 	private static long toBytes(int mebibytes) {
@@ -342,6 +349,37 @@ public final class RenderPipeline implements AutoCloseable {
 			}
 			return false;
 		}
+	}
+
+	private int tryRecycleResidentSlot(ChunkPos incomingChunkPos, long tickIndex) {
+		ChunkData evictionCandidate = this.chunkManager.findEvictionCandidate();
+		if (evictionCandidate == null) {
+			return -1;
+		}
+
+		ChunkPos evictedChunkPos = evictionCandidate.chunkPos();
+		int previousSlot = evictionCandidate.residentSlot();
+		this.unloadChunk(evictionCandidate);
+		int recycledSlot = this.memoryManager.tryAcquireSlot();
+		if (recycledSlot < 0) {
+			return -1;
+		}
+
+		this.worldDataEvictions++;
+		if (this.worldDataEvictions == 1 || (this.worldDataEvictions % WORLD_DATA_EVICTION_LOG_INTERVAL) == 0) {
+			PotassiumLogger.logger().info(
+				"Evicted resident chunk {} from slot {} to make room for {}. Evictions={}, resident chunks={}/{}.",
+				evictedChunkPos,
+				previousSlot,
+				incomingChunkPos,
+				this.worldDataEvictions,
+				this.memoryManager.residentChunks(),
+				this.memoryManager.capacityChunks()
+			);
+		}
+
+		evictionCandidate.touch(tickIndex);
+		return recycledSlot;
 	}
 
 	private void logWorldDataBufferFull(ChunkPos chunkPos) {

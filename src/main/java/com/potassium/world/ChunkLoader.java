@@ -61,6 +61,11 @@ public final class ChunkLoader {
 				int chunkZ = centerChunk.z() + dz;
 				LevelChunk chunk = level.getChunkSource().getChunk(chunkX, chunkZ, ChunkStatus.FULL, false);
 				if (chunk != null) {
+					var chunkData = this.chunkManager.getChunk(chunk.getPos());
+					if (chunkData != null && chunkData.isResident()) {
+						continue;
+					}
+
 					this.requestLoad(chunk.getPos());
 				}
 			}

@@ -30,6 +30,21 @@ public final class ChunkManager {
 		return this.chunks.remove(chunkPos.pack());
 	}
 
+	public ChunkData findEvictionCandidate() {
+		ChunkData candidate = null;
+		for (ChunkData chunkData : this.chunks.values()) {
+			if (!chunkData.isResident()) {
+				continue;
+			}
+
+			if (candidate == null || chunkData.lastTouchedTick() < candidate.lastTouchedTick()) {
+				candidate = chunkData;
+			}
+		}
+
+		return candidate;
+	}
+
 	public Collection<ChunkData> chunks() {
 		return this.chunks.values();
 	}

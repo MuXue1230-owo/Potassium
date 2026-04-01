@@ -25,6 +25,7 @@ public final class PotassiumEngine implements ClientModInitializer {
 	private RenderPipeline renderPipeline;
 	private DebugOverlay debugOverlay;
 	private ClientLevel activeLevel;
+	private ChunkPos lastBootstrapCenterChunk;
 	private boolean runtimeReady;
 
 	public PotassiumEngine() {
@@ -55,19 +56,15 @@ public final class PotassiumEngine implements ClientModInitializer {
 			this.chunkLoader.clear();
 			this.chunkManager.clear();
 			this.worldChangeTracker.clear();
+			this.lastBootstrapCenterChunk = null;
 			this.renderPipeline.setLevel(this.activeLevel);
 
-			if (this.activeLevel != null && client.player != null) {
-				int bootstrapRadius = Math.min(
-					Math.max(client.options.getEffectiveRenderDistance(), 2),
-					this.config.general.targetRenderDistanceChunks
-				);
-				this.chunkLoader.bootstrapLoadedChunks(this.activeLevel, client.player.blockPosition(), bootstrapRadius);
-			}
+			this.refreshBootstrapWindow(client);
 
 			PotassiumLogger.logger().info("World context changed; cleared resident chunk and change tracking state.");
 		}
 
+		this.refreshBootstrapWindow(client);
 		this.chunkLoader.drainQueues(client.level, this.renderPipeline, this.worldChangeTracker.tickIndex());
 		this.renderPipeline.flushPendingChanges(this.worldChangeTracker.drainChanges());
 		this.worldChangeTracker.advanceTick();
@@ -91,7 +88,11 @@ public final class PotassiumEngine implements ClientModInitializer {
 		}
 
 		this.worldChangeTracker.record(pos, oldState, newState, flags);
-		this.chunkManager.touchChunk(ChunkPos.containing(pos), this.worldChangeTracker.tickIndex());
+		ChunkPos chunkPos = ChunkPos.containing(pos);
+		var chunkData = this.chunkManager.touchChunk(chunkPos, this.worldChangeTracker.tickIndex());
+		if (!chunkData.isResident()) {
+			this.chunkLoader.requestRefresh(chunkPos);
+		}
 
 		if (this.config.debug.verboseWorldChangeLogging) {
 			PotassiumLogger.logger().debug(
@@ -168,14 +169,8 @@ public final class PotassiumEngine implements ClientModInitializer {
 
 		this.renderPipeline.initialize();
 		this.renderPipeline.setLevel(this.activeLevel);
-
-		if (this.activeLevel != null && client.player != null) {
-			int bootstrapRadius = Math.min(
-				Math.max(client.options.getEffectiveRenderDistance(), 2),
-				this.config.general.targetRenderDistanceChunks
-			);
-			this.chunkLoader.bootstrapLoadedChunks(this.activeLevel, client.player.blockPosition(), bootstrapRadius);
-		}
+		this.lastBootstrapCenterChunk = null;
+		this.refreshBootstrapWindow(client);
 
 		this.runtimeReady = true;
 
@@ -214,8 +209,28 @@ public final class PotassiumEngine implements ClientModInitializer {
 
 		this.debugOverlay = null;
 		this.activeLevel = null;
+		this.lastBootstrapCenterChunk = null;
 		this.runtimeReady = false;
 
 		PotassiumLogger.logger().info("Potassium runtime stopped.");
+	}
+
+	private void refreshBootstrapWindow(Minecraft client) {
+		if (this.activeLevel == null || client.player == null) {
+			this.lastBootstrapCenterChunk = null;
+			return;
+		}
+
+		ChunkPos centerChunk = ChunkPos.containing(client.player.blockPosition());
+		if (centerChunk.equals(this.lastBootstrapCenterChunk)) {
+			return;
+		}
+
+		int bootstrapRadius = Math.min(
+			Math.max(client.options.getEffectiveRenderDistance(), 2),
+			this.config.general.targetRenderDistanceChunks
+		);
+		this.chunkLoader.bootstrapLoadedChunks(this.activeLevel, client.player.blockPosition(), bootstrapRadius);
+		this.lastBootstrapCenterChunk = centerChunk;
 	}
 }

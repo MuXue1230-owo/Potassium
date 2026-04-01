@@ -1,5 +1,11 @@
 const int POTASSIUM_WORLD_DATA_MAX_SHADER_PAGES = 4;
 const uint POTASSIUM_WORLD_DATA_MAX_SHADER_PAGES_U = 4u;
+const uint POTASSIUM_BLOCK_STATE_ID_MASK = (1u << 20u) - 1u;
+const uint POTASSIUM_BLOCK_FLAGS_MASK = (1u << 4u) - 1u;
+const uint POTASSIUM_BLOCK_FLAGS_SHIFT = 28u;
+const uint POTASSIUM_BLOCK_FLAG_OCCLUDES = 1u << 0u;
+const uint POTASSIUM_BLOCK_FLAG_FLUID = 1u << 1u;
+const uint POTASSIUM_BLOCK_FLAG_TRANSLUCENT = 1u << 2u;
 
 layout(std430, binding = 0) readonly buffer PotassiumWorldDataLayoutBuffer {
     uvec4 header;
@@ -75,4 +81,28 @@ uint potassium_world_load_packed_block(uint logicalBlockIndex) {
 
 uint potassium_world_chunk_base_block(uint residentSlot) {
     return residentSlot * potassium_world_blocks_per_chunk();
+}
+
+uint potassium_block_state_id(uint packedBlock) {
+    return packedBlock & POTASSIUM_BLOCK_STATE_ID_MASK;
+}
+
+uint potassium_block_flags(uint packedBlock) {
+    return (packedBlock >> POTASSIUM_BLOCK_FLAGS_SHIFT) & POTASSIUM_BLOCK_FLAGS_MASK;
+}
+
+bool potassium_block_is_air(uint packedBlock) {
+    return potassium_block_state_id(packedBlock) == 0u;
+}
+
+bool potassium_block_occludes(uint packedBlock) {
+    return (potassium_block_flags(packedBlock) & POTASSIUM_BLOCK_FLAG_OCCLUDES) != 0u;
+}
+
+bool potassium_block_is_fluid(uint packedBlock) {
+    return (potassium_block_flags(packedBlock) & POTASSIUM_BLOCK_FLAG_FLUID) != 0u;
+}
+
+bool potassium_block_is_translucent(uint packedBlock) {
+    return (potassium_block_flags(packedBlock) & POTASSIUM_BLOCK_FLAG_TRANSLUCENT) != 0u;
 }

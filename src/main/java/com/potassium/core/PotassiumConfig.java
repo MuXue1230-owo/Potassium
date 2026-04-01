@@ -81,6 +81,7 @@ public final class PotassiumConfig {
 		this.memory.vertexUploadBufferMiB = Math.max(this.memory.vertexUploadBufferMiB, 16);
 		this.memory.maxResidentWorldMiB = Math.max(this.memory.maxResidentWorldMiB, this.memory.worldDataBufferMiB);
 		this.memory.indirectCommandCapacity = Math.max(this.memory.indirectCommandCapacity, 1024);
+		this.memory.meshFacesPerChunk = Math.max(this.memory.meshFacesPerChunk, 32);
 	}
 
 	public static final class General {
@@ -102,5 +103,6 @@ public final class PotassiumConfig {
 		public int vertexUploadBufferMiB = 64;
 		public int maxResidentWorldMiB = 3072;
 		public int indirectCommandCapacity = 32768;
+		public int meshFacesPerChunk = 256;
 	}
 }

@@ -38,6 +38,11 @@ import org.lwjgl.system.MemoryStack;
 
 public final class RenderPipeline implements AutoCloseable {
 	private static final long MEBIBYTE_BYTES = 1024L * 1024L;
+	private static final int INVALID_RESIDENT_SLOT = -1;
+	private static final int MESH_METADATA_OPAQUE_VERTEX_COUNT_OFFSET = 0;
+	private static final int MESH_METADATA_OPAQUE_FIRST_VERTEX_OFFSET = 1;
+	private static final int MESH_METADATA_TRANSLUCENT_VERTEX_COUNT_OFFSET = 2;
+	private static final int MESH_METADATA_TRANSLUCENT_FIRST_VERTEX_OFFSET = 3;
 	private static final int WORLD_DATA_BINDING = 0;
 	private static final int MESH_JOB_BINDING = WORLD_DATA_BINDING + 1 + WorldDataBuffer.MAX_SHADER_PAGES;
 	private static final int MESH_STATS_BINDING = MESH_JOB_BINDING + 1;
@@ -77,6 +82,7 @@ public final class RenderPipeline implements AutoCloseable {
 	private int lastMeshGenerationProcessedJobs;
 	private int lastMeshGenerationDirtyCandidates;
 	private int lastMeshGenerationGeneratedVertices;
+	private int lastMeshGenerationClippedJobs;
 	private int lastMeshGenerationSampledPackedBlock;
 	private int worldDataBufferFullFailures;
 	private int worldDataBufferExpansionFailures;
@@ -86,6 +92,7 @@ public final class RenderPipeline implements AutoCloseable {
 	private int debugMeshVertexArray;
 	private int chunkModelViewUniform;
 	private int chunkProjectionUniform;
+	private int meshFacesPerChunkUniform;
 
 	public RenderPipeline(PotassiumConfig config, ChunkManager chunkManager, WorldChangeTracker worldChangeTracker) {
 		this.config = config;
@@ -118,8 +125,9 @@ public final class RenderPipeline implements AutoCloseable {
 				this.meshGenerationShader = ComputeShader.load("mesh_generation", "shaders/mesh/generation.comp");
 				this.meshGenerationJobBuffer = new MeshGenerationJobBuffer(MESH_GENERATION_JOB_LIMIT_PER_FRAME, usePersistentMapping);
 				this.meshGenerationStatsBuffer = new MeshGenerationStatsBuffer();
-				this.meshMetadataBuffer = new MeshMetadataBuffer(Math.max(this.config.memory.worldDataBufferMiB, 1));
-				this.meshVertexBuffer = new MeshVertexBuffer(Math.max(this.config.memory.worldDataBufferMiB, 1));
+				this.meshMetadataBuffer = new MeshMetadataBuffer(1);
+				this.meshVertexBuffer = new MeshVertexBuffer(1, this.config.memory.meshFacesPerChunk);
+				this.meshFacesPerChunkUniform = GL20C.glGetUniformLocation(this.meshGenerationShader.handle(), "uMeshFacesPerChunk");
 			} else {
 				PotassiumLogger.logger().warn(
 					"Skipping mesh-generation compute initialization because GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS={} is below the required {}.",
@@ -134,9 +142,10 @@ public final class RenderPipeline implements AutoCloseable {
 		this.initialized = true;
 
 		PotassiumLogger.logger().info(
-			"Render pipeline initialized. worldData={} MiB, indirectCommands={}, persistentMapping={}, computeShaders={}",
+			"Render pipeline initialized. worldData={} MiB, indirectCommands={}, meshFacesPerChunk={}, persistentMapping={}, computeShaders={}",
 			this.config.memory.worldDataBufferMiB,
 			this.config.memory.indirectCommandCapacity,
+			this.config.memory.meshFacesPerChunk,
 			usePersistentMapping,
 			GLCapabilities.hasComputeShader()
 		);
@@ -206,7 +215,7 @@ public final class RenderPipeline implements AutoCloseable {
 
 	public String summaryLine() {
 		return String.format(
-			"chunks=%d resident=%d/%d wdbPages=%d lastUpload=%dB trackedChanges=%d meshJobs=%d/%d meshProcessed=%d meshVertices=%d rendered=%d/%d sampleBlock=%d frustum=%s occlusion=%s",
+			"chunks=%d resident=%d/%d wdbPages=%d lastUpload=%dB trackedChanges=%d meshJobs=%d/%d meshProcessed=%d meshVertices=%d meshClipped=%d rendered=%d/%d sampleBlock=%d frustum=%s occlusion=%s",
 			this.chunkManager.size(),
 			this.memoryManager.residentChunks(),
 			this.memoryManager.capacityChunks(),
@@ -217,6 +226,7 @@ public final class RenderPipeline implements AutoCloseable {
 			this.lastMeshGenerationDirtyCandidates,
 			this.lastMeshGenerationProcessedJobs,
 			this.lastMeshGenerationGeneratedVertices,
+			this.lastMeshGenerationClippedJobs,
 			this.lastRenderedMeshChunks,
 			this.lastRenderedMeshVertices,
 			this.lastMeshGenerationSampledPackedBlock,
@@ -242,6 +252,7 @@ public final class RenderPipeline implements AutoCloseable {
 		this.lastMeshGenerationProcessedJobs = 0;
 		this.lastMeshGenerationDirtyCandidates = 0;
 		this.lastMeshGenerationGeneratedVertices = 0;
+		this.lastMeshGenerationClippedJobs = 0;
 		this.lastMeshGenerationSampledPackedBlock = 0;
 		this.lastRenderedMeshChunks = 0;
 		this.lastRenderedMeshVertices = 0;
@@ -306,6 +317,7 @@ public final class RenderPipeline implements AutoCloseable {
 		this.lastUploadedWorldBytes = snapshot.byteSize();
 		chunkData.markResident(residentSlot, this.worldDataBuffer.chunkOffsetBytes(residentSlot), tickIndex);
 		this.clearMeshSlot(residentSlot);
+		this.markAdjacentResidentChunksMeshDirty(snapshot.chunkPos(), tickIndex);
 		this.worldDataBufferFullFailures = 0;
 		this.worldDataBufferExpansionFailures = 0;
 		return true;
@@ -316,9 +328,12 @@ public final class RenderPipeline implements AutoCloseable {
 			return;
 		}
 
-		this.clearMeshSlot(chunkData.residentSlot());
-		this.memoryManager.releaseSlot(chunkData.residentSlot());
+		ChunkPos chunkPos = chunkData.chunkPos();
+		int residentSlot = chunkData.residentSlot();
+		this.clearMeshSlot(residentSlot);
+		this.memoryManager.releaseSlot(residentSlot);
 		chunkData.clearResident();
+		this.markAdjacentResidentChunksMeshDirty(chunkPos, this.worldChangeTracker.tickIndex());
 	}
 
 	public int residentChunkCount() {
@@ -331,6 +346,24 @@ public final class RenderPipeline implements AutoCloseable {
 
 	public long residentWorldBytes() {
 		return this.memoryManager.usedBytes();
+	}
+
+	public void markBoundaryNeighborsDirty(net.minecraft.core.BlockPos position, long tickIndex) {
+		ChunkPos chunkPos = ChunkPos.containing(position);
+		int localX = position.getX() & 15;
+		int localZ = position.getZ() & 15;
+		if (localX == 0) {
+			this.markResidentChunkMeshDirty(chunkPos.x() - 1, chunkPos.z(), tickIndex);
+		}
+		if (localX == 15) {
+			this.markResidentChunkMeshDirty(chunkPos.x() + 1, chunkPos.z(), tickIndex);
+		}
+		if (localZ == 0) {
+			this.markResidentChunkMeshDirty(chunkPos.x(), chunkPos.z() - 1, tickIndex);
+		}
+		if (localZ == 15) {
+			this.markResidentChunkMeshDirty(chunkPos.x(), chunkPos.z() + 1, tickIndex);
+		}
 	}
 
 	public void renderDebugMeshes(CameraRenderState cameraState, Matrix4fc modelViewMatrixState) {
@@ -346,7 +379,7 @@ public final class RenderPipeline implements AutoCloseable {
 			return;
 		}
 
-		this.lastRenderedMeshChunks = 0;
+		this.lastRenderedMeshChunks = this.countRenderedDebugMeshChunks(metadata);
 		this.lastRenderedMeshVertices = 0;
 
 		Matrix4f modelViewMatrix = new Matrix4f(modelViewMatrixState);
@@ -367,27 +400,25 @@ public final class RenderPipeline implements AutoCloseable {
 		GL30C.glEnableVertexAttribArray(0);
 		GL30C.glVertexAttribIPointer(0, 4, GL11C.GL_INT, MeshVertexBuffer.BYTES_PER_VERTEX, 0L);
 
+		GL11C.glDisable(GL11C.GL_BLEND);
+		GL11C.glEnable(GL11C.GL_CULL_FACE);
+		this.drawDebugMeshPass(
+			metadata,
+			MESH_METADATA_OPAQUE_VERTEX_COUNT_OFFSET,
+			MESH_METADATA_OPAQUE_FIRST_VERTEX_OFFSET
+		);
+
 		GL11C.glEnable(GL11C.GL_BLEND);
 		GL11C.glBlendFunc(GL11C.GL_SRC_ALPHA, GL11C.GL_ONE_MINUS_SRC_ALPHA);
+		GL11C.glDepthMask(false);
 		GL11C.glDisable(GL11C.GL_CULL_FACE);
+		this.drawDebugMeshPass(
+			metadata,
+			MESH_METADATA_TRANSLUCENT_VERTEX_COUNT_OFFSET,
+			MESH_METADATA_TRANSLUCENT_FIRST_VERTEX_OFFSET
+		);
 
-		for (ChunkData chunkData : this.chunkManager.chunks()) {
-			if (!chunkData.isResident()) {
-				continue;
-			}
-
-			int metadataOffset = chunkData.residentSlot() * MeshMetadataBuffer.INTS_PER_ENTRY;
-			int vertexCount = metadata.get(metadataOffset);
-			int firstVertex = metadata.get(metadataOffset + 1);
-			if (vertexCount <= 0) {
-				continue;
-			}
-
-			GL11C.glDrawArrays(GL11C.GL_TRIANGLES, firstVertex, vertexCount);
-			this.lastRenderedMeshChunks++;
-			this.lastRenderedMeshVertices += vertexCount;
-		}
-
+		GL11C.glDepthMask(true);
 		GL11C.glEnable(GL11C.GL_CULL_FACE);
 		GL11C.glDisable(GL11C.GL_BLEND);
 		GL30C.glDisableVertexAttribArray(0);
@@ -433,6 +464,7 @@ public final class RenderPipeline implements AutoCloseable {
 		this.lastMeshGenerationProcessedJobs = 0;
 		this.lastMeshGenerationDirtyCandidates = 0;
 		this.lastMeshGenerationGeneratedVertices = 0;
+		this.lastMeshGenerationClippedJobs = 0;
 		this.lastMeshGenerationSampledPackedBlock = 0;
 		this.lastRenderedMeshChunks = 0;
 		this.lastRenderedMeshVertices = 0;
@@ -441,6 +473,7 @@ public final class RenderPipeline implements AutoCloseable {
 		this.worldDataEvictions = 0;
 		this.chunkModelViewUniform = -1;
 		this.chunkProjectionUniform = -1;
+		this.meshFacesPerChunkUniform = -1;
 	}
 
 	private static long toBytes(int mebibytes) {
@@ -551,6 +584,7 @@ public final class RenderPipeline implements AutoCloseable {
 		this.lastMeshGenerationProcessedJobs = 0;
 		this.lastMeshGenerationDirtyCandidates = 0;
 		this.lastMeshGenerationGeneratedVertices = 0;
+		this.lastMeshGenerationClippedJobs = 0;
 		this.lastMeshGenerationSampledPackedBlock = 0;
 
 		int shaderVisibleChunkCapacity = this.worldDataBuffer.shaderVisibleChunkCapacity(WORLD_DATA_BINDING);
@@ -570,7 +604,15 @@ public final class RenderPipeline implements AutoCloseable {
 			}
 
 			scheduledChunks.add(chunkData);
-			this.meshGenerationJobBuffer.addJob(chunkData.residentSlot(), chunkData.chunkPos(), chunkData.version());
+			this.meshGenerationJobBuffer.addJob(
+				chunkData.residentSlot(),
+				chunkData.chunkPos(),
+				chunkData.version(),
+				this.resolveNeighborResidentSlot(chunkData.chunkPos().x() - 1, chunkData.chunkPos().z(), shaderVisibleChunkCapacity),
+				this.resolveNeighborResidentSlot(chunkData.chunkPos().x() + 1, chunkData.chunkPos().z(), shaderVisibleChunkCapacity),
+				this.resolveNeighborResidentSlot(chunkData.chunkPos().x(), chunkData.chunkPos().z() - 1, shaderVisibleChunkCapacity),
+				this.resolveNeighborResidentSlot(chunkData.chunkPos().x(), chunkData.chunkPos().z() + 1, shaderVisibleChunkCapacity)
+			);
 		}
 
 		if (scheduledChunks.isEmpty()) {
@@ -584,6 +626,9 @@ public final class RenderPipeline implements AutoCloseable {
 		this.meshMetadataBuffer.bind(MESH_METADATA_BINDING);
 		this.meshVertexBuffer.bindStorage(MESH_VERTEX_BINDING);
 		this.meshGenerationShader.use();
+		if (this.meshFacesPerChunkUniform >= 0) {
+			GL30C.glUniform1ui(this.meshFacesPerChunkUniform, this.meshVertexBuffer.facesPerChunk());
+		}
 
 		int groupCountX = (scheduledChunks.size() + (MESH_GENERATION_LOCAL_SIZE_X - 1)) / MESH_GENERATION_LOCAL_SIZE_X;
 		GL43C.glDispatchCompute(groupCountX, 1, 1);
@@ -593,6 +638,7 @@ public final class RenderPipeline implements AutoCloseable {
 		this.lastMeshGenerationJobs = scheduledChunks.size();
 		this.lastMeshGenerationProcessedJobs = stats.processedJobs();
 		this.lastMeshGenerationGeneratedVertices = stats.generatedVertices();
+		this.lastMeshGenerationClippedJobs = stats.clippedJobs();
 		this.lastMeshGenerationSampledPackedBlock = stats.lastSampledPackedBlock();
 		for (ChunkData chunkData : scheduledChunks) {
 			chunkData.markMeshClean();
@@ -602,6 +648,16 @@ public final class RenderPipeline implements AutoCloseable {
 	private boolean hasMeshGenerationBindingBudget() {
 		int maxBindings = GLCapabilities.getMaxShaderStorageBufferBindings();
 		return maxBindings <= 0 || maxBindings >= MESH_GENERATION_REQUIRED_SSBO_BINDINGS;
+	}
+
+	private int resolveNeighborResidentSlot(int chunkX, int chunkZ, int shaderVisibleChunkCapacity) {
+		ChunkData neighborChunk = this.chunkManager.getChunk(new ChunkPos(chunkX, chunkZ));
+		if (neighborChunk == null || !neighborChunk.isResident()) {
+			return INVALID_RESIDENT_SLOT;
+		}
+
+		int residentSlot = neighborChunk.residentSlot();
+		return residentSlot < shaderVisibleChunkCapacity ? residentSlot : INVALID_RESIDENT_SLOT;
 	}
 
 	private void ensureMeshOutputCapacity(boolean clearMetadata) {
@@ -623,6 +679,59 @@ public final class RenderPipeline implements AutoCloseable {
 		}
 
 		this.meshMetadataBuffer.clearSlot(residentSlot);
+	}
+
+	private void markAdjacentResidentChunksMeshDirty(ChunkPos centerChunkPos, long tickIndex) {
+		this.markResidentChunkMeshDirty(centerChunkPos.x() - 1, centerChunkPos.z(), tickIndex);
+		this.markResidentChunkMeshDirty(centerChunkPos.x() + 1, centerChunkPos.z(), tickIndex);
+		this.markResidentChunkMeshDirty(centerChunkPos.x(), centerChunkPos.z() - 1, tickIndex);
+		this.markResidentChunkMeshDirty(centerChunkPos.x(), centerChunkPos.z() + 1, tickIndex);
+	}
+
+	private void markResidentChunkMeshDirty(int chunkX, int chunkZ, long tickIndex) {
+		ChunkData chunkData = this.chunkManager.getChunk(new ChunkPos(chunkX, chunkZ));
+		if (chunkData == null || !chunkData.isResident()) {
+			return;
+		}
+
+		chunkData.touch(tickIndex);
+		chunkData.markMeshDirty();
+	}
+
+	private void drawDebugMeshPass(IntBuffer metadata, int vertexCountOffset, int firstVertexOffset) {
+		for (ChunkData chunkData : this.chunkManager.chunks()) {
+			if (!chunkData.isResident()) {
+				continue;
+			}
+
+			int metadataOffset = chunkData.residentSlot() * MeshMetadataBuffer.INTS_PER_ENTRY;
+			int vertexCount = metadata.get(metadataOffset + vertexCountOffset);
+			if (vertexCount <= 0) {
+				continue;
+			}
+
+			int firstVertex = metadata.get(metadataOffset + firstVertexOffset);
+			GL11C.glDrawArrays(GL11C.GL_TRIANGLES, firstVertex, vertexCount);
+			this.lastRenderedMeshVertices += vertexCount;
+		}
+	}
+
+	private int countRenderedDebugMeshChunks(IntBuffer metadata) {
+		int renderedChunks = 0;
+		for (ChunkData chunkData : this.chunkManager.chunks()) {
+			if (!chunkData.isResident()) {
+				continue;
+			}
+
+			int metadataOffset = chunkData.residentSlot() * MeshMetadataBuffer.INTS_PER_ENTRY;
+			int opaqueVertexCount = metadata.get(metadataOffset + MESH_METADATA_OPAQUE_VERTEX_COUNT_OFFSET);
+			int translucentVertexCount = metadata.get(metadataOffset + MESH_METADATA_TRANSLUCENT_VERTEX_COUNT_OFFSET);
+			if (opaqueVertexCount > 0 || translucentVertexCount > 0) {
+				renderedChunks++;
+			}
+		}
+
+		return renderedChunks;
 	}
 
 	private void logWorldDataBufferFull(ChunkPos chunkPos) {

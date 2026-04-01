@@ -208,7 +208,7 @@ public final class WorldDataBuffer implements AutoCloseable {
 		long byteOffset = this.chunkOffsetBytes(residentSlot) + ((long) blockIndex * BlockData.BYTES);
 
 		this.scratchIntBuffer.clear();
-		this.scratchIntBuffer.putInt(BlockData.fromState(newState, flags).packed());
+		this.scratchIntBuffer.putInt(BlockData.fromState(newState).packed());
 		this.scratchIntBuffer.flip();
 		this.lastUploadBytes = BlockData.BYTES;
 		this.uploadToPages(this.scratchIntBuffer, byteOffset);

@@ -37,7 +37,8 @@ public final class MeshGenerationStatsBuffer implements AutoCloseable {
 		return new Stats(
 			this.readbackBuffer.getInt(0),
 			this.readbackBuffer.getInt(Integer.BYTES),
-			this.readbackBuffer.getInt(Integer.BYTES * 2)
+			this.readbackBuffer.getInt(Integer.BYTES * 2),
+			this.readbackBuffer.getInt(Integer.BYTES * 3)
 		);
 	}
 
@@ -52,6 +53,6 @@ public final class MeshGenerationStatsBuffer implements AutoCloseable {
 		MemoryUtil.memFree(this.readbackBuffer);
 	}
 
-	public record Stats(int processedJobs, int generatedVertices, int lastSampledPackedBlock) {
+	public record Stats(int processedJobs, int generatedVertices, int clippedJobs, int lastSampledPackedBlock) {
 	}
 }

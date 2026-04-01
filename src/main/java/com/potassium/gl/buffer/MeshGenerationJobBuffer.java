@@ -9,13 +9,17 @@ import org.lwjgl.system.MemoryUtil;
 
 public final class MeshGenerationJobBuffer implements AutoCloseable {
 	public static final int HEADER_BYTES = Integer.BYTES * 4;
-	public static final int JOB_STRIDE_BYTES = Integer.BYTES * 4;
+	public static final int JOB_STRIDE_BYTES = Integer.BYTES * 8;
 
 	private static final int HEADER_JOB_COUNT_OFFSET = 0;
 	private static final int JOB_RESIDENT_SLOT_OFFSET = 0;
 	private static final int JOB_CHUNK_X_OFFSET = Integer.BYTES;
 	private static final int JOB_CHUNK_Z_OFFSET = Integer.BYTES * 2;
 	private static final int JOB_VERSION_OFFSET = Integer.BYTES * 3;
+	private static final int JOB_NEIGHBOR_NEG_X_SLOT_OFFSET = Integer.BYTES * 4;
+	private static final int JOB_NEIGHBOR_POS_X_SLOT_OFFSET = Integer.BYTES * 5;
+	private static final int JOB_NEIGHBOR_NEG_Z_SLOT_OFFSET = Integer.BYTES * 6;
+	private static final int JOB_NEIGHBOR_POS_Z_SLOT_OFFSET = Integer.BYTES * 7;
 
 	private final PersistentBuffer gpuBuffer;
 	private ByteBuffer jobStream;
@@ -45,7 +49,15 @@ public final class MeshGenerationJobBuffer implements AutoCloseable {
 		this.gpuBuffer.endFrame();
 	}
 
-	public int addJob(int residentSlot, ChunkPos chunkPos, long version) {
+	public int addJob(
+		int residentSlot,
+		ChunkPos chunkPos,
+		long version,
+		int neighborNegXResidentSlot,
+		int neighborPosXResidentSlot,
+		int neighborNegZResidentSlot,
+		int neighborPosZResidentSlot
+	) {
 		if (residentSlot < 0) {
 			throw new IllegalArgumentException("residentSlot must be non-negative.");
 		}
@@ -57,6 +69,10 @@ public final class MeshGenerationJobBuffer implements AutoCloseable {
 		this.jobStream.putInt(jobOffset + JOB_CHUNK_X_OFFSET, chunkPos.x());
 		this.jobStream.putInt(jobOffset + JOB_CHUNK_Z_OFFSET, chunkPos.z());
 		this.jobStream.putInt(jobOffset + JOB_VERSION_OFFSET, (int) Math.min(version, Integer.MAX_VALUE));
+		this.jobStream.putInt(jobOffset + JOB_NEIGHBOR_NEG_X_SLOT_OFFSET, neighborNegXResidentSlot);
+		this.jobStream.putInt(jobOffset + JOB_NEIGHBOR_POS_X_SLOT_OFFSET, neighborPosXResidentSlot);
+		this.jobStream.putInt(jobOffset + JOB_NEIGHBOR_NEG_Z_SLOT_OFFSET, neighborNegZResidentSlot);
+		this.jobStream.putInt(jobOffset + JOB_NEIGHBOR_POS_Z_SLOT_OFFSET, neighborPosZResidentSlot);
 		this.dirty = true;
 		return jobIndex;
 	}

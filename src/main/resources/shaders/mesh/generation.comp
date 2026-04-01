@@ -4,13 +4,25 @@
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-const uint POTASSIUM_MESH_VERTICES_PER_CHUNK = 6u;
+layout(location = 0) uniform uint uMeshFacesPerChunk;
+
+const uint POTASSIUM_MESH_VERTICES_PER_FACE = 6u;
+const uint POTASSIUM_FACE_POS_Y = 0u;
+const uint POTASSIUM_FACE_NEG_Y = 1u;
+const uint POTASSIUM_FACE_POS_X = 2u;
+const uint POTASSIUM_FACE_NEG_X = 3u;
+const uint POTASSIUM_FACE_POS_Z = 4u;
+const uint POTASSIUM_FACE_NEG_Z = 5u;
 
 struct PotassiumMeshGenerationJob {
     uint residentSlot;
     int chunkX;
     int chunkZ;
     uint version;
+    int neighborNegXResidentSlot;
+    int neighborPosXResidentSlot;
+    int neighborNegZResidentSlot;
+    int neighborPosZResidentSlot;
 };
 
 layout(std430, binding = 5) readonly buffer PotassiumMeshGenerationJobBuffer {
@@ -21,8 +33,8 @@ layout(std430, binding = 5) readonly buffer PotassiumMeshGenerationJobBuffer {
 layout(std430, binding = 6) buffer PotassiumMeshGenerationStatsBuffer {
     uint processedJobs;
     uint generatedVertices;
+    uint clippedJobs;
     uint lastSampledPackedBlock;
-    uint reserved0;
 } potassium_mesh_generation_stats;
 
 layout(std430, binding = 7) buffer PotassiumGeneratedMeshMetadataBuffer {
@@ -45,32 +57,155 @@ uint potassium_section_block_index_to_y(uint sectionBlockIndex) {
     return sectionBlockIndex >> 8u;
 }
 
-void potassium_write_debug_top_face(PotassiumMeshGenerationJob job, uint blockIndex, uint packedBlock) {
-    uint sectionBlockIndex = blockIndex & 4095u;
-    uint sectionIndex = blockIndex >> 12u;
-    uint blockX = potassium_section_block_index_to_x(sectionBlockIndex);
-    uint blockZ = potassium_section_block_index_to_z(sectionBlockIndex);
-    uint blockY = (sectionIndex << 4u) + potassium_section_block_index_to_y(sectionBlockIndex);
-    uint vertexBase = job.residentSlot * POTASSIUM_MESH_VERTICES_PER_CHUNK;
-    uint topY = blockY + 1u;
+uint potassium_chunk_height_blocks() {
+    return potassium_world_blocks_per_chunk() >> 8u;
+}
+
+uint potassium_chunk_local_block_index(uint blockX, uint blockY, uint blockZ) {
+    uint sectionIndex = blockY >> 4u;
+    uint sectionLocalY = blockY & 15u;
+    return (sectionIndex << 12u) | (sectionLocalY << 8u) | (blockZ << 4u) | blockX;
+}
+
+uint potassium_chunk_load_local_packed_block(uint residentSlot, uint blockX, uint blockY, uint blockZ) {
+    uint logicalBlockIndex = potassium_world_chunk_base_block(residentSlot) + potassium_chunk_local_block_index(blockX, blockY, blockZ);
+    return potassium_world_load_packed_block(logicalBlockIndex);
+}
+
+uint potassium_chunk_load_neighbor_packed_block(PotassiumMeshGenerationJob job, int blockX, int blockY, int blockZ) {
+    if (blockY < 0 || uint(blockY) >= potassium_chunk_height_blocks()) {
+        return 0u;
+    }
+
+    if (blockX >= 0 && blockX < 16 && blockZ >= 0 && blockZ < 16) {
+        return potassium_chunk_load_local_packed_block(job.residentSlot, uint(blockX), uint(blockY), uint(blockZ));
+    }
+
+    if (blockZ >= 0 && blockZ < 16) {
+        if (blockX < 0) {
+            return job.neighborNegXResidentSlot < 0
+                ? 0u
+                : potassium_chunk_load_local_packed_block(uint(job.neighborNegXResidentSlot), 15u, uint(blockY), uint(blockZ));
+        }
+        if (blockX >= 16) {
+            return job.neighborPosXResidentSlot < 0
+                ? 0u
+                : potassium_chunk_load_local_packed_block(uint(job.neighborPosXResidentSlot), 0u, uint(blockY), uint(blockZ));
+        }
+    }
+
+    if (blockX >= 0 && blockX < 16) {
+        if (blockZ < 0) {
+            return job.neighborNegZResidentSlot < 0
+                ? 0u
+                : potassium_chunk_load_local_packed_block(uint(job.neighborNegZResidentSlot), uint(blockX), uint(blockY), 15u);
+        }
+        if (blockZ >= 16) {
+            return job.neighborPosZResidentSlot < 0
+                ? 0u
+                : potassium_chunk_load_local_packed_block(uint(job.neighborPosZResidentSlot), uint(blockX), uint(blockY), 0u);
+        }
+    }
+
+    return 0u;
+}
+
+bool potassium_should_emit_face(uint packedBlock, uint neighborPackedBlock) {
+    if (potassium_block_is_air(neighborPackedBlock)) {
+        return true;
+    }
+
+    if (potassium_block_state_id(neighborPackedBlock) == potassium_block_state_id(packedBlock)) {
+        return false;
+    }
+
+    return !potassium_block_occludes(neighborPackedBlock);
+}
+
+void potassium_write_face_vertex(uint vertexIndex, int worldX, int worldY, int worldZ, uint packedBlock) {
+    potassium_mesh_vertices.generatedVertices[vertexIndex] = ivec4(worldX, worldY, worldZ, int(packedBlock));
+}
+
+void potassium_emit_face(PotassiumMeshGenerationJob job, uint faceDirection, uint blockX, uint blockY, uint blockZ, uint packedBlock, uint faceIndex) {
+    uint firstVertex = ((job.residentSlot * uMeshFacesPerChunk) + faceIndex) * POTASSIUM_MESH_VERTICES_PER_FACE;
     int worldX = (job.chunkX << 4) + int(blockX);
+    int worldY = int(blockY);
     int worldZ = (job.chunkZ << 4) + int(blockZ);
-    int worldTopY = int(topY);
-    int packedBlockInt = int(packedBlock);
 
-    potassium_mesh_vertices.generatedVertices[vertexBase + 0u] = ivec4(worldX, worldTopY, worldZ, packedBlockInt);
-    potassium_mesh_vertices.generatedVertices[vertexBase + 1u] = ivec4(worldX + 1, worldTopY, worldZ, packedBlockInt);
-    potassium_mesh_vertices.generatedVertices[vertexBase + 2u] = ivec4(worldX + 1, worldTopY, worldZ + 1, packedBlockInt);
-    potassium_mesh_vertices.generatedVertices[vertexBase + 3u] = ivec4(worldX, worldTopY, worldZ, packedBlockInt);
-    potassium_mesh_vertices.generatedVertices[vertexBase + 4u] = ivec4(worldX + 1, worldTopY, worldZ + 1, packedBlockInt);
-    potassium_mesh_vertices.generatedVertices[vertexBase + 5u] = ivec4(worldX, worldTopY, worldZ + 1, packedBlockInt);
+    switch (faceDirection) {
+        case POTASSIUM_FACE_POS_Y:
+            potassium_write_face_vertex(firstVertex + 0u, worldX, worldY + 1, worldZ, packedBlock);
+            potassium_write_face_vertex(firstVertex + 1u, worldX + 1, worldY + 1, worldZ, packedBlock);
+            potassium_write_face_vertex(firstVertex + 2u, worldX + 1, worldY + 1, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 3u, worldX, worldY + 1, worldZ, packedBlock);
+            potassium_write_face_vertex(firstVertex + 4u, worldX + 1, worldY + 1, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 5u, worldX, worldY + 1, worldZ + 1, packedBlock);
+            break;
+        case POTASSIUM_FACE_NEG_Y:
+            potassium_write_face_vertex(firstVertex + 0u, worldX, worldY, worldZ, packedBlock);
+            potassium_write_face_vertex(firstVertex + 1u, worldX + 1, worldY, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 2u, worldX + 1, worldY, worldZ, packedBlock);
+            potassium_write_face_vertex(firstVertex + 3u, worldX, worldY, worldZ, packedBlock);
+            potassium_write_face_vertex(firstVertex + 4u, worldX, worldY, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 5u, worldX + 1, worldY, worldZ + 1, packedBlock);
+            break;
+        case POTASSIUM_FACE_POS_X:
+            potassium_write_face_vertex(firstVertex + 0u, worldX + 1, worldY, worldZ, packedBlock);
+            potassium_write_face_vertex(firstVertex + 1u, worldX + 1, worldY, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 2u, worldX + 1, worldY + 1, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 3u, worldX + 1, worldY, worldZ, packedBlock);
+            potassium_write_face_vertex(firstVertex + 4u, worldX + 1, worldY + 1, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 5u, worldX + 1, worldY + 1, worldZ, packedBlock);
+            break;
+        case POTASSIUM_FACE_NEG_X:
+            potassium_write_face_vertex(firstVertex + 0u, worldX, worldY, worldZ, packedBlock);
+            potassium_write_face_vertex(firstVertex + 1u, worldX, worldY + 1, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 2u, worldX, worldY, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 3u, worldX, worldY, worldZ, packedBlock);
+            potassium_write_face_vertex(firstVertex + 4u, worldX, worldY + 1, worldZ, packedBlock);
+            potassium_write_face_vertex(firstVertex + 5u, worldX, worldY + 1, worldZ + 1, packedBlock);
+            break;
+        case POTASSIUM_FACE_POS_Z:
+            potassium_write_face_vertex(firstVertex + 0u, worldX, worldY, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 1u, worldX + 1, worldY + 1, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 2u, worldX + 1, worldY, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 3u, worldX, worldY, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 4u, worldX, worldY + 1, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 5u, worldX + 1, worldY + 1, worldZ + 1, packedBlock);
+            break;
+        default:
+            potassium_write_face_vertex(firstVertex + 0u, worldX, worldY, worldZ, packedBlock);
+            potassium_write_face_vertex(firstVertex + 1u, worldX + 1, worldY, worldZ, packedBlock);
+            potassium_write_face_vertex(firstVertex + 2u, worldX + 1, worldY + 1, worldZ, packedBlock);
+            potassium_write_face_vertex(firstVertex + 3u, worldX, worldY, worldZ, packedBlock);
+            potassium_write_face_vertex(firstVertex + 4u, worldX + 1, worldY + 1, worldZ, packedBlock);
+            potassium_write_face_vertex(firstVertex + 5u, worldX, worldY + 1, worldZ, packedBlock);
+            break;
+    }
+}
 
-    potassium_mesh_metadata.meshMetadata[job.residentSlot] = uvec4(
-        POTASSIUM_MESH_VERTICES_PER_CHUNK,
-        vertexBase,
-        job.residentSlot,
-        packedBlock
-    );
+bool potassium_try_emit_face(PotassiumMeshGenerationJob job, uint faceDirection, uint blockX, uint blockY, uint blockZ, uint packedBlock, inout uint faceCount) {
+    bool translucentFace = potassium_block_is_translucent(packedBlock) || potassium_block_is_fluid(packedBlock);
+    uint opaqueFaceCount = potassium_mesh_metadata.meshMetadata[job.residentSlot].x;
+    uint translucentFaceCount = potassium_mesh_metadata.meshMetadata[job.residentSlot].z;
+    if ((opaqueFaceCount + translucentFaceCount) >= uMeshFacesPerChunk) {
+        return false;
+    }
+
+    uint faceIndex;
+    if (translucentFace) {
+        translucentFaceCount++;
+        faceIndex = uMeshFacesPerChunk - translucentFaceCount;
+        potassium_mesh_metadata.meshMetadata[job.residentSlot].z = translucentFaceCount;
+    } else {
+        faceIndex = opaqueFaceCount;
+        opaqueFaceCount++;
+        potassium_mesh_metadata.meshMetadata[job.residentSlot].x = opaqueFaceCount;
+    }
+
+    potassium_emit_face(job, faceDirection, blockX, blockY, blockZ, packedBlock, faceIndex);
+    faceCount = opaqueFaceCount + translucentFaceCount;
+    return true;
 }
 
 void main() {
@@ -80,26 +215,77 @@ void main() {
     }
 
     PotassiumMeshGenerationJob job = potassium_mesh_generation_jobs.jobs[jobIndex];
-    uint chunkBaseBlock = potassium_world_chunk_base_block(job.residentSlot);
-    uint blockCount = potassium_world_blocks_per_chunk();
-    uint foundPackedBlock = 0u;
-    uint foundBlockIndex = 0u;
+    potassium_mesh_metadata.meshMetadata[job.residentSlot] = uvec4(0u);
+    uint chunkHeight = potassium_chunk_height_blocks();
+    uint faceCount = 0u;
+    uint opaqueFaceCount = 0u;
+    uint translucentFaceCount = 0u;
+    uint lastPackedBlock = 0u;
+    bool clipped = false;
 
-    for (int blockIndex = int(blockCount) - 1; blockIndex >= 0; blockIndex--) {
-        uint packedBlock = potassium_world_load_packed_block(chunkBaseBlock + uint(blockIndex));
-        if (packedBlock != 0u) {
-            foundPackedBlock = packedBlock;
-            foundBlockIndex = uint(blockIndex);
-            break;
+    for (uint blockY = 0u; blockY < chunkHeight && !clipped; blockY++) {
+        for (uint blockZ = 0u; blockZ < 16u && !clipped; blockZ++) {
+            for (uint blockX = 0u; blockX < 16u; blockX++) {
+                uint packedBlock = potassium_chunk_load_local_packed_block(job.residentSlot, blockX, blockY, blockZ);
+                if (potassium_block_is_air(packedBlock)) {
+                    continue;
+                }
+
+                lastPackedBlock = packedBlock;
+
+                if (potassium_should_emit_face(packedBlock, potassium_chunk_load_neighbor_packed_block(job, int(blockX), int(blockY) + 1, int(blockZ)))
+                    && !potassium_try_emit_face(job, POTASSIUM_FACE_POS_Y, blockX, blockY, blockZ, packedBlock, faceCount)) {
+                    clipped = true;
+                    break;
+                }
+                if (potassium_should_emit_face(packedBlock, potassium_chunk_load_neighbor_packed_block(job, int(blockX), int(blockY) - 1, int(blockZ)))
+                    && !potassium_try_emit_face(job, POTASSIUM_FACE_NEG_Y, blockX, blockY, blockZ, packedBlock, faceCount)) {
+                    clipped = true;
+                    break;
+                }
+                if (potassium_should_emit_face(packedBlock, potassium_chunk_load_neighbor_packed_block(job, int(blockX) + 1, int(blockY), int(blockZ)))
+                    && !potassium_try_emit_face(job, POTASSIUM_FACE_POS_X, blockX, blockY, blockZ, packedBlock, faceCount)) {
+                    clipped = true;
+                    break;
+                }
+                if (potassium_should_emit_face(packedBlock, potassium_chunk_load_neighbor_packed_block(job, int(blockX) - 1, int(blockY), int(blockZ)))
+                    && !potassium_try_emit_face(job, POTASSIUM_FACE_NEG_X, blockX, blockY, blockZ, packedBlock, faceCount)) {
+                    clipped = true;
+                    break;
+                }
+                if (potassium_should_emit_face(packedBlock, potassium_chunk_load_neighbor_packed_block(job, int(blockX), int(blockY), int(blockZ) + 1))
+                    && !potassium_try_emit_face(job, POTASSIUM_FACE_POS_Z, blockX, blockY, blockZ, packedBlock, faceCount)) {
+                    clipped = true;
+                    break;
+                }
+                if (potassium_should_emit_face(packedBlock, potassium_chunk_load_neighbor_packed_block(job, int(blockX), int(blockY), int(blockZ) - 1))
+                    && !potassium_try_emit_face(job, POTASSIUM_FACE_NEG_Z, blockX, blockY, blockZ, packedBlock, faceCount)) {
+                    clipped = true;
+                    break;
+                }
+            }
         }
     }
 
-    potassium_mesh_metadata.meshMetadata[job.residentSlot] = uvec4(0u);
-    if (foundPackedBlock != 0u) {
-        potassium_write_debug_top_face(job, foundBlockIndex, foundPackedBlock);
-        atomicAdd(potassium_mesh_generation_stats.generatedVertices, POTASSIUM_MESH_VERTICES_PER_CHUNK);
+    uint firstVertex = (job.residentSlot * uMeshFacesPerChunk) * POTASSIUM_MESH_VERTICES_PER_FACE;
+    opaqueFaceCount = potassium_mesh_metadata.meshMetadata[job.residentSlot].x;
+    translucentFaceCount = potassium_mesh_metadata.meshMetadata[job.residentSlot].z;
+    potassium_mesh_metadata.meshMetadata[job.residentSlot] = uvec4(
+        opaqueFaceCount * POTASSIUM_MESH_VERTICES_PER_FACE,
+        firstVertex,
+        translucentFaceCount * POTASSIUM_MESH_VERTICES_PER_FACE,
+        firstVertex + ((uMeshFacesPerChunk - translucentFaceCount) * POTASSIUM_MESH_VERTICES_PER_FACE)
+    );
+    if ((opaqueFaceCount + translucentFaceCount) > 0u) {
+        atomicAdd(
+            potassium_mesh_generation_stats.generatedVertices,
+            (opaqueFaceCount + translucentFaceCount) * POTASSIUM_MESH_VERTICES_PER_FACE
+        );
+    }
+    if (clipped) {
+        atomicAdd(potassium_mesh_generation_stats.clippedJobs, 1u);
     }
 
     atomicAdd(potassium_mesh_generation_stats.processedJobs, 1u);
-    atomicExchange(potassium_mesh_generation_stats.lastSampledPackedBlock, foundPackedBlock);
+    atomicExchange(potassium_mesh_generation_stats.lastSampledPackedBlock, lastPackedBlock);
 }

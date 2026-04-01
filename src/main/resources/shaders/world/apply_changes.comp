@@ -1,0 +1,107 @@
+#version 450 core
+
+#include "../common/world_data_rw.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+const int POTASSIUM_RESIDENT_CHUNK_STATE_INTS_PER_ENTRY = 8;
+const int POTASSIUM_RESIDENT_CHUNK_ACTIVE_OFFSET = 0;
+const int POTASSIUM_RESIDENT_CHUNK_DIRTY_OFFSET = 1;
+const int POTASSIUM_RESIDENT_CHUNK_NEG_X_SLOT_OFFSET = 4;
+const int POTASSIUM_RESIDENT_CHUNK_POS_X_SLOT_OFFSET = 5;
+const int POTASSIUM_RESIDENT_CHUNK_NEG_Z_SLOT_OFFSET = 6;
+const int POTASSIUM_RESIDENT_CHUNK_POS_Z_SLOT_OFFSET = 7;
+
+const int POTASSIUM_CHANGE_QUEUE_HEADER_INTS = 1;
+const int POTASSIUM_CHANGE_QUEUE_INTS_PER_ENTRY = 4;
+const int POTASSIUM_CHANGE_QUEUE_RESIDENT_SLOT_OFFSET = 0;
+const int POTASSIUM_CHANGE_QUEUE_LOCAL_BLOCK_INDEX_OFFSET = 1;
+const int POTASSIUM_CHANGE_QUEUE_PACKED_BLOCK_OFFSET = 2;
+const int POTASSIUM_CHANGE_QUEUE_BOUNDARY_MASK_OFFSET = 3;
+
+const uint POTASSIUM_BOUNDARY_NEG_X = 1u << 0u;
+const uint POTASSIUM_BOUNDARY_POS_X = 1u << 1u;
+const uint POTASSIUM_BOUNDARY_NEG_Z = 1u << 2u;
+const uint POTASSIUM_BOUNDARY_POS_Z = 1u << 3u;
+
+layout(std430, binding = 5) buffer PotassiumResidentChunkStateBuffer {
+    int residentChunkState[];
+} potassium_resident_chunk_state;
+
+layout(std430, binding = 12) readonly buffer PotassiumChangeQueueBuffer {
+    int queueWords[];
+} potassium_change_queue;
+
+int potassium_resident_chunk_state_base(int residentSlot) {
+    return residentSlot * POTASSIUM_RESIDENT_CHUNK_STATE_INTS_PER_ENTRY;
+}
+
+int potassium_change_queue_entry_base(uint entryIndex) {
+    return POTASSIUM_CHANGE_QUEUE_HEADER_INTS + (int(entryIndex) * POTASSIUM_CHANGE_QUEUE_INTS_PER_ENTRY);
+}
+
+void potassium_mark_resident_slot_dirty(int residentSlot) {
+    if (residentSlot < 0 || uint(residentSlot) >= potassium_world_shader_visible_chunk_capacity()) {
+        return;
+    }
+
+    int residentStateBase = potassium_resident_chunk_state_base(residentSlot);
+    if (potassium_resident_chunk_state.residentChunkState[residentStateBase + POTASSIUM_RESIDENT_CHUNK_ACTIVE_OFFSET] == 0) {
+        return;
+    }
+
+    potassium_resident_chunk_state.residentChunkState[residentStateBase + POTASSIUM_RESIDENT_CHUNK_DIRTY_OFFSET] = 1;
+}
+
+void main() {
+    uint entryIndex = gl_GlobalInvocationID.x;
+    uint changeCount = uint(max(potassium_change_queue.queueWords[0], 0));
+    if (entryIndex >= changeCount) {
+        return;
+    }
+
+    int entryBase = potassium_change_queue_entry_base(entryIndex);
+    int residentSlot = potassium_change_queue.queueWords[entryBase + POTASSIUM_CHANGE_QUEUE_RESIDENT_SLOT_OFFSET];
+    int localBlockIndex = potassium_change_queue.queueWords[entryBase + POTASSIUM_CHANGE_QUEUE_LOCAL_BLOCK_INDEX_OFFSET];
+    uint packedBlock = uint(potassium_change_queue.queueWords[entryBase + POTASSIUM_CHANGE_QUEUE_PACKED_BLOCK_OFFSET]);
+    uint boundaryMask = uint(potassium_change_queue.queueWords[entryBase + POTASSIUM_CHANGE_QUEUE_BOUNDARY_MASK_OFFSET]);
+
+    if (residentSlot < 0 || localBlockIndex < 0) {
+        return;
+    }
+    if (uint(residentSlot) >= potassium_world_shader_visible_chunk_capacity()) {
+        return;
+    }
+    if (uint(localBlockIndex) >= potassium_world_blocks_per_chunk()) {
+        return;
+    }
+
+    uint logicalBlockIndex = potassium_world_chunk_base_block(uint(residentSlot)) + uint(localBlockIndex);
+    if (!potassium_world_store_packed_block(logicalBlockIndex, packedBlock)) {
+        return;
+    }
+
+    int residentStateBase = potassium_resident_chunk_state_base(residentSlot);
+    potassium_resident_chunk_state.residentChunkState[residentStateBase + POTASSIUM_RESIDENT_CHUNK_DIRTY_OFFSET] = 1;
+
+    if ((boundaryMask & POTASSIUM_BOUNDARY_NEG_X) != 0u) {
+        potassium_mark_resident_slot_dirty(
+            potassium_resident_chunk_state.residentChunkState[residentStateBase + POTASSIUM_RESIDENT_CHUNK_NEG_X_SLOT_OFFSET]
+        );
+    }
+    if ((boundaryMask & POTASSIUM_BOUNDARY_POS_X) != 0u) {
+        potassium_mark_resident_slot_dirty(
+            potassium_resident_chunk_state.residentChunkState[residentStateBase + POTASSIUM_RESIDENT_CHUNK_POS_X_SLOT_OFFSET]
+        );
+    }
+    if ((boundaryMask & POTASSIUM_BOUNDARY_NEG_Z) != 0u) {
+        potassium_mark_resident_slot_dirty(
+            potassium_resident_chunk_state.residentChunkState[residentStateBase + POTASSIUM_RESIDENT_CHUNK_NEG_Z_SLOT_OFFSET]
+        );
+    }
+    if ((boundaryMask & POTASSIUM_BOUNDARY_POS_Z) != 0u) {
+        potassium_mark_resident_slot_dirty(
+            potassium_resident_chunk_state.residentChunkState[residentStateBase + POTASSIUM_RESIDENT_CHUNK_POS_Z_SLOT_OFFSET]
+        );
+    }
+}

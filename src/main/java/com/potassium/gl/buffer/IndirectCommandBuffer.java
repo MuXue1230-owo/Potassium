@@ -3,6 +3,7 @@ package com.potassium.gl.buffer;
 import com.potassium.core.PotassiumLogger;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import org.lwjgl.opengl.GL43C;
 import org.lwjgl.opengl.GL40C;
 import org.lwjgl.system.MemoryUtil;
 
@@ -83,6 +84,10 @@ public final class IndirectCommandBuffer implements AutoCloseable {
 		this.gpuBuffer.bind();
 	}
 
+	public void bindForStorage(int binding) {
+		this.gpuBuffer.bindBase(GL43C.GL_SHADER_STORAGE_BUFFER, binding);
+	}
+
 	public long drawOffsetBytes(int firstCommandIndex) {
 		if (firstCommandIndex < 0 || firstCommandIndex > this.commandCount) {
 			throw new IllegalArgumentException("firstCommandIndex is out of range.");
@@ -97,6 +102,10 @@ public final class IndirectCommandBuffer implements AutoCloseable {
 
 	public int capacityCommands() {
 		return this.capacityCommands;
+	}
+
+	public void ensureCapacity(int requiredCommands) {
+		this.ensureCommandCapacity(requiredCommands);
 	}
 
 	public boolean usesPersistentMapping() {

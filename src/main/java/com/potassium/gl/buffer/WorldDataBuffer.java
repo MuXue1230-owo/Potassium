@@ -17,8 +17,9 @@ public final class WorldDataBuffer implements AutoCloseable {
 	private static final long MAX_JAVA_MAPPED_VIEW_BYTES = Integer.MAX_VALUE;
 	public static final int MAX_SHADER_PAGES = 4;
 	private static final int LAYOUT_HEADER_WORDS = 4;
+	private static final int LAYOUT_WORLD_INFO_WORDS = 4;
 	private static final int LAYOUT_PAGE_INFO_WORDS = 4;
-	private static final int LAYOUT_BUFFER_BYTES = Integer.BYTES * (LAYOUT_HEADER_WORDS + (MAX_SHADER_PAGES * LAYOUT_PAGE_INFO_WORDS));
+	private static final int LAYOUT_BUFFER_BYTES = Integer.BYTES * (LAYOUT_HEADER_WORDS + LAYOUT_WORLD_INFO_WORDS + (MAX_SHADER_PAGES * LAYOUT_PAGE_INFO_WORDS));
 
 	private final boolean persistentMappingEnabled;
 	private final ArrayList<Page> pages = new ArrayList<>();
@@ -192,27 +193,54 @@ public final class WorldDataBuffer implements AutoCloseable {
 	}
 
 	public boolean applyBlockChange(int residentSlot, BlockPos position, BlockState newState, int flags) {
+		int localBlockIndex = this.localBlockIndex(position);
+		if (localBlockIndex < 0) {
+			return false;
+		}
+
+		return this.applyPackedBlockChange(residentSlot, localBlockIndex, BlockData.fromState(newState).packed());
+	}
+
+	public boolean applyPackedBlockChange(int residentSlot, int localBlockIndex, int packedBlock) {
 		if (!this.isConfigured()) {
 			return false;
+		}
+		if (localBlockIndex < 0 || localBlockIndex >= this.blocksPerChunk()) {
+			return false;
+		}
+
+		long byteOffset = this.chunkOffsetBytes(residentSlot) + ((long) localBlockIndex * BlockData.BYTES);
+
+		this.scratchIntBuffer.clear();
+		this.scratchIntBuffer.putInt(packedBlock);
+		this.scratchIntBuffer.flip();
+		this.lastUploadBytes = BlockData.BYTES;
+		this.uploadToPages(this.scratchIntBuffer, byteOffset);
+		return true;
+	}
+
+	public int localBlockIndex(BlockPos position) {
+		if (!this.isConfigured()) {
+			return -1;
 		}
 
 		int sectionIndex = SectionPos.blockToSectionCoord(position.getY()) - this.minSectionY;
 		if (sectionIndex < 0 || sectionIndex >= this.sectionsCount) {
-			return false;
+			return -1;
 		}
 
 		int localX = SectionPos.sectionRelative(position.getX());
 		int localY = SectionPos.sectionRelative(position.getY());
 		int localZ = SectionPos.sectionRelative(position.getZ());
-		int blockIndex = (sectionIndex * LevelChunkSection.SECTION_SIZE) + (localY * 256) + (localZ * 16) + localX;
-		long byteOffset = this.chunkOffsetBytes(residentSlot) + ((long) blockIndex * BlockData.BYTES);
+		return (sectionIndex * LevelChunkSection.SECTION_SIZE) + (localY * 256) + (localZ * 16) + localX;
+	}
 
-		this.scratchIntBuffer.clear();
-		this.scratchIntBuffer.putInt(BlockData.fromState(newState).packed());
-		this.scratchIntBuffer.flip();
-		this.lastUploadBytes = BlockData.BYTES;
-		this.uploadToPages(this.scratchIntBuffer, byteOffset);
-		return true;
+	public int blocksPerChunk() {
+		if (!this.isConfigured()) {
+			return 0;
+		}
+
+		return Math.toIntExact(this.bytesPerChunk / BlockData.BYTES);
 	}
 
 	public long capacityBytes() {
@@ -352,6 +380,10 @@ public final class WorldDataBuffer implements AutoCloseable {
 		this.layoutUploadBuffer.putInt((int) Math.min(this.bytesPerChunk / BlockData.BYTES, Integer.MAX_VALUE));
 		this.layoutUploadBuffer.putInt(shaderVisiblePageCount);
 		this.layoutUploadBuffer.putInt(this.pages.size());
+		this.layoutUploadBuffer.putInt(this.minSectionY);
+		this.layoutUploadBuffer.putInt(this.sectionsCount);
+		this.layoutUploadBuffer.putInt(0);
+		this.layoutUploadBuffer.putInt(0);
 
 		for (int pageIndex = 0; pageIndex < MAX_SHADER_PAGES; pageIndex++) {
 			if (pageIndex < shaderVisiblePageCount) {

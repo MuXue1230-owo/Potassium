@@ -1,0 +1,29 @@
+#version 450 core
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler2D uSourceDepthLevel;
+layout(location = 0) uniform int uSourceMipLevel;
+layout(r32f, binding = 0) uniform writeonly image2D uTargetDepthLevel;
+
+void main() {
+    ivec2 targetCoord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 targetSize = imageSize(uTargetDepthLevel);
+    if (targetCoord.x >= targetSize.x || targetCoord.y >= targetSize.y) {
+        return;
+    }
+
+    ivec2 sourceBase = targetCoord * 2;
+    ivec2 sourceSize = textureSize(uSourceDepthLevel, uSourceMipLevel);
+    ivec2 sampleCoord0 = clamp(sourceBase, ivec2(0), sourceSize - ivec2(1));
+    ivec2 sampleCoord1 = clamp(sourceBase + ivec2(1, 0), ivec2(0), sourceSize - ivec2(1));
+    ivec2 sampleCoord2 = clamp(sourceBase + ivec2(0, 1), ivec2(0), sourceSize - ivec2(1));
+    ivec2 sampleCoord3 = clamp(sourceBase + ivec2(1, 1), ivec2(0), sourceSize - ivec2(1));
+
+    float depth0 = texelFetch(uSourceDepthLevel, sampleCoord0, uSourceMipLevel).r;
+    float depth1 = texelFetch(uSourceDepthLevel, sampleCoord1, uSourceMipLevel).r;
+    float depth2 = texelFetch(uSourceDepthLevel, sampleCoord2, uSourceMipLevel).r;
+    float depth3 = texelFetch(uSourceDepthLevel, sampleCoord3, uSourceMipLevel).r;
+    float maxDepth = max(max(depth0, depth1), max(depth2, depth3));
+    imageStore(uTargetDepthLevel, targetCoord, vec4(maxDepth, 0.0, 0.0, 1.0));
+}

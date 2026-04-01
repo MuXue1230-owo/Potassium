@@ -5,6 +5,7 @@
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(location = 0) uniform uint uMeshFacesPerChunk;
+layout(location = 1) uniform uint uResidentSlotCapacity;
 
 const uint POTASSIUM_MESH_VERTICES_PER_FACE = 6u;
 const uint POTASSIUM_FACE_POS_Y = 0u;
@@ -14,21 +15,29 @@ const uint POTASSIUM_FACE_NEG_X = 3u;
 const uint POTASSIUM_FACE_POS_Z = 4u;
 const uint POTASSIUM_FACE_NEG_Z = 5u;
 
+const int POTASSIUM_RESIDENT_CHUNK_STATE_INTS_PER_ENTRY = 8;
+const int POTASSIUM_RESIDENT_CHUNK_ACTIVE_OFFSET = 0;
+const int POTASSIUM_RESIDENT_CHUNK_DIRTY_OFFSET = 1;
+const int POTASSIUM_RESIDENT_CHUNK_CHUNK_X_OFFSET = 2;
+const int POTASSIUM_RESIDENT_CHUNK_CHUNK_Z_OFFSET = 3;
+const int POTASSIUM_RESIDENT_CHUNK_NEG_X_SLOT_OFFSET = 4;
+const int POTASSIUM_RESIDENT_CHUNK_POS_X_SLOT_OFFSET = 5;
+const int POTASSIUM_RESIDENT_CHUNK_NEG_Z_SLOT_OFFSET = 6;
+const int POTASSIUM_RESIDENT_CHUNK_POS_Z_SLOT_OFFSET = 7;
+
 struct PotassiumMeshGenerationJob {
     uint residentSlot;
     int chunkX;
     int chunkZ;
-    uint version;
     int neighborNegXResidentSlot;
     int neighborPosXResidentSlot;
     int neighborNegZResidentSlot;
     int neighborPosZResidentSlot;
 };
 
-layout(std430, binding = 5) readonly buffer PotassiumMeshGenerationJobBuffer {
-    uvec4 header;
-    PotassiumMeshGenerationJob jobs[];
-} potassium_mesh_generation_jobs;
+layout(std430, binding = 5) buffer PotassiumResidentChunkStateBuffer {
+    int residentChunkState[];
+} potassium_resident_chunk_state;
 
 layout(std430, binding = 6) buffer PotassiumMeshGenerationStatsBuffer {
     uint processedJobs;
@@ -38,12 +47,20 @@ layout(std430, binding = 6) buffer PotassiumMeshGenerationStatsBuffer {
 } potassium_mesh_generation_stats;
 
 layout(std430, binding = 7) buffer PotassiumGeneratedMeshMetadataBuffer {
-    uvec4 meshMetadata[];
+    int meshMetadata[];
 } potassium_mesh_metadata;
 
 layout(std430, binding = 8) buffer PotassiumGeneratedMeshVertexBuffer {
     ivec4 generatedVertices[];
 } potassium_mesh_vertices;
+
+const int POTASSIUM_MESH_METADATA_INTS_PER_ENTRY = 8;
+const int POTASSIUM_MESH_METADATA_OPAQUE_VERTEX_COUNT_OFFSET = 0;
+const int POTASSIUM_MESH_METADATA_OPAQUE_FIRST_VERTEX_OFFSET = 1;
+const int POTASSIUM_MESH_METADATA_TRANSLUCENT_VERTEX_COUNT_OFFSET = 2;
+const int POTASSIUM_MESH_METADATA_TRANSLUCENT_FIRST_VERTEX_OFFSET = 3;
+const int POTASSIUM_MESH_METADATA_CHUNK_X_OFFSET = 4;
+const int POTASSIUM_MESH_METADATA_CHUNK_Z_OFFSET = 5;
 
 uint potassium_section_block_index_to_x(uint sectionBlockIndex) {
     return sectionBlockIndex & 15u;
@@ -122,6 +139,21 @@ bool potassium_should_emit_face(uint packedBlock, uint neighborPackedBlock) {
     return !potassium_block_occludes(neighborPackedBlock);
 }
 
+int potassium_mesh_metadata_base(int residentSlot) {
+    return residentSlot * POTASSIUM_MESH_METADATA_INTS_PER_ENTRY;
+}
+
+int potassium_resident_chunk_state_base(uint residentSlot) {
+    return int(residentSlot) * POTASSIUM_RESIDENT_CHUNK_STATE_INTS_PER_ENTRY;
+}
+
+void potassium_clear_mesh_metadata(uint residentSlot) {
+    int metadataBase = potassium_mesh_metadata_base(int(residentSlot));
+    for (int index = 0; index < POTASSIUM_MESH_METADATA_INTS_PER_ENTRY; index++) {
+        potassium_mesh_metadata.meshMetadata[metadataBase + index] = 0;
+    }
+}
+
 void potassium_write_face_vertex(uint vertexIndex, int worldX, int worldY, int worldZ, uint packedBlock) {
     potassium_mesh_vertices.generatedVertices[vertexIndex] = ivec4(worldX, worldY, worldZ, int(packedBlock));
 }
@@ -186,8 +218,9 @@ void potassium_emit_face(PotassiumMeshGenerationJob job, uint faceDirection, uin
 
 bool potassium_try_emit_face(PotassiumMeshGenerationJob job, uint faceDirection, uint blockX, uint blockY, uint blockZ, uint packedBlock, inout uint faceCount) {
     bool translucentFace = potassium_block_is_translucent(packedBlock) || potassium_block_is_fluid(packedBlock);
-    uint opaqueFaceCount = potassium_mesh_metadata.meshMetadata[job.residentSlot].x;
-    uint translucentFaceCount = potassium_mesh_metadata.meshMetadata[job.residentSlot].z;
+    int metadataBase = potassium_mesh_metadata_base(int(job.residentSlot));
+    uint opaqueFaceCount = uint(max(potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_OPAQUE_VERTEX_COUNT_OFFSET], 0));
+    uint translucentFaceCount = uint(max(potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_TRANSLUCENT_VERTEX_COUNT_OFFSET], 0));
     if ((opaqueFaceCount + translucentFaceCount) >= uMeshFacesPerChunk) {
         return false;
     }
@@ -196,11 +229,11 @@ bool potassium_try_emit_face(PotassiumMeshGenerationJob job, uint faceDirection,
     if (translucentFace) {
         translucentFaceCount++;
         faceIndex = uMeshFacesPerChunk - translucentFaceCount;
-        potassium_mesh_metadata.meshMetadata[job.residentSlot].z = translucentFaceCount;
+        potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_TRANSLUCENT_VERTEX_COUNT_OFFSET] = int(translucentFaceCount);
     } else {
         faceIndex = opaqueFaceCount;
         opaqueFaceCount++;
-        potassium_mesh_metadata.meshMetadata[job.residentSlot].x = opaqueFaceCount;
+        potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_OPAQUE_VERTEX_COUNT_OFFSET] = int(opaqueFaceCount);
     }
 
     potassium_emit_face(job, faceDirection, blockX, blockY, blockZ, packedBlock, faceIndex);
@@ -209,13 +242,32 @@ bool potassium_try_emit_face(PotassiumMeshGenerationJob job, uint faceDirection,
 }
 
 void main() {
-    uint jobIndex = gl_GlobalInvocationID.x;
-    if (jobIndex >= potassium_mesh_generation_jobs.header.x) {
+    uint residentSlot = gl_GlobalInvocationID.x;
+    if (residentSlot >= uResidentSlotCapacity) {
         return;
     }
 
-    PotassiumMeshGenerationJob job = potassium_mesh_generation_jobs.jobs[jobIndex];
-    potassium_mesh_metadata.meshMetadata[job.residentSlot] = uvec4(0u);
+    if (residentSlot >= potassium_world_shader_visible_chunk_capacity()) {
+        return;
+    }
+
+    int residentStateBase = potassium_resident_chunk_state_base(residentSlot);
+    if (potassium_resident_chunk_state.residentChunkState[residentStateBase + POTASSIUM_RESIDENT_CHUNK_ACTIVE_OFFSET] == 0) {
+        return;
+    }
+    if (potassium_resident_chunk_state.residentChunkState[residentStateBase + POTASSIUM_RESIDENT_CHUNK_DIRTY_OFFSET] == 0) {
+        return;
+    }
+
+    PotassiumMeshGenerationJob job;
+    job.residentSlot = residentSlot;
+    job.chunkX = potassium_resident_chunk_state.residentChunkState[residentStateBase + POTASSIUM_RESIDENT_CHUNK_CHUNK_X_OFFSET];
+    job.chunkZ = potassium_resident_chunk_state.residentChunkState[residentStateBase + POTASSIUM_RESIDENT_CHUNK_CHUNK_Z_OFFSET];
+    job.neighborNegXResidentSlot = potassium_resident_chunk_state.residentChunkState[residentStateBase + POTASSIUM_RESIDENT_CHUNK_NEG_X_SLOT_OFFSET];
+    job.neighborPosXResidentSlot = potassium_resident_chunk_state.residentChunkState[residentStateBase + POTASSIUM_RESIDENT_CHUNK_POS_X_SLOT_OFFSET];
+    job.neighborNegZResidentSlot = potassium_resident_chunk_state.residentChunkState[residentStateBase + POTASSIUM_RESIDENT_CHUNK_NEG_Z_SLOT_OFFSET];
+    job.neighborPosZResidentSlot = potassium_resident_chunk_state.residentChunkState[residentStateBase + POTASSIUM_RESIDENT_CHUNK_POS_Z_SLOT_OFFSET];
+    potassium_clear_mesh_metadata(job.residentSlot);
     uint chunkHeight = potassium_chunk_height_blocks();
     uint faceCount = 0u;
     uint opaqueFaceCount = 0u;
@@ -268,14 +320,17 @@ void main() {
     }
 
     uint firstVertex = (job.residentSlot * uMeshFacesPerChunk) * POTASSIUM_MESH_VERTICES_PER_FACE;
-    opaqueFaceCount = potassium_mesh_metadata.meshMetadata[job.residentSlot].x;
-    translucentFaceCount = potassium_mesh_metadata.meshMetadata[job.residentSlot].z;
-    potassium_mesh_metadata.meshMetadata[job.residentSlot] = uvec4(
-        opaqueFaceCount * POTASSIUM_MESH_VERTICES_PER_FACE,
-        firstVertex,
-        translucentFaceCount * POTASSIUM_MESH_VERTICES_PER_FACE,
+    int metadataBase = potassium_mesh_metadata_base(int(job.residentSlot));
+    opaqueFaceCount = uint(max(potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_OPAQUE_VERTEX_COUNT_OFFSET], 0));
+    translucentFaceCount = uint(max(potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_TRANSLUCENT_VERTEX_COUNT_OFFSET], 0));
+    potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_OPAQUE_VERTEX_COUNT_OFFSET] = int(opaqueFaceCount * POTASSIUM_MESH_VERTICES_PER_FACE);
+    potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_OPAQUE_FIRST_VERTEX_OFFSET] = int(firstVertex);
+    potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_TRANSLUCENT_VERTEX_COUNT_OFFSET] = int(translucentFaceCount * POTASSIUM_MESH_VERTICES_PER_FACE);
+    potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_TRANSLUCENT_FIRST_VERTEX_OFFSET] = int(
         firstVertex + ((uMeshFacesPerChunk - translucentFaceCount) * POTASSIUM_MESH_VERTICES_PER_FACE)
     );
+    potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_CHUNK_X_OFFSET] = job.chunkX;
+    potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_CHUNK_Z_OFFSET] = job.chunkZ;
     if ((opaqueFaceCount + translucentFaceCount) > 0u) {
         atomicAdd(
             potassium_mesh_generation_stats.generatedVertices,
@@ -288,4 +343,5 @@ void main() {
 
     atomicAdd(potassium_mesh_generation_stats.processedJobs, 1u);
     atomicExchange(potassium_mesh_generation_stats.lastSampledPackedBlock, lastPackedBlock);
+    potassium_resident_chunk_state.residentChunkState[residentStateBase + POTASSIUM_RESIDENT_CHUNK_DIRTY_OFFSET] = 0;
 }

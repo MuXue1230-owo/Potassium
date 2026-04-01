@@ -94,7 +94,9 @@ public final class PotassiumEngine implements ClientModInitializer {
 		ChunkPos chunkPos = ChunkPos.containing(pos);
 		long tickIndex = this.worldChangeTracker.tickIndex();
 		var chunkData = this.chunkManager.touchChunk(chunkPos, tickIndex);
-		this.renderPipeline.markBoundaryNeighborsDirty(pos, tickIndex);
+		if (!this.renderPipeline.handlesWorldChangesOnGpu()) {
+			this.renderPipeline.markBoundaryNeighborsDirty(pos, tickIndex);
+		}
 		if (!chunkData.isResident()) {
 			this.chunkLoader.requestRefresh(chunkPos);
 		}

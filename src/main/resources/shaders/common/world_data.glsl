@@ -9,6 +9,7 @@ const uint POTASSIUM_BLOCK_FLAG_TRANSLUCENT = 1u << 2u;
 
 layout(std430, binding = 0) readonly buffer PotassiumWorldDataLayoutBuffer {
     uvec4 header;
+    ivec4 worldInfo;
     uvec4 pageInfo[POTASSIUM_WORLD_DATA_MAX_SHADER_PAGES];
 } potassium_world_data_layout;
 
@@ -38,6 +39,24 @@ uint potassium_world_blocks_per_chunk() {
 
 uint potassium_world_shader_visible_page_count() {
     return min(potassium_world_data_layout.header.z, POTASSIUM_WORLD_DATA_MAX_SHADER_PAGES_U);
+}
+
+int potassium_world_min_section_y() {
+    return potassium_world_data_layout.worldInfo.x;
+}
+
+int potassium_world_sections_count() {
+    return potassium_world_data_layout.worldInfo.y;
+}
+
+uint potassium_world_shader_visible_chunk_capacity() {
+    uint pageCount = potassium_world_shader_visible_page_count();
+    uint chunkCapacity = 0u;
+    for (uint index = 0u; index < pageCount; index++) {
+        chunkCapacity += potassium_world_data_layout.pageInfo[index].w;
+    }
+
+    return chunkCapacity;
 }
 
 bool potassium_world_resolve_block(uint logicalBlockIndex, out uint pageIndex, out uint localBlockIndex) {

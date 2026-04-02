@@ -11,7 +11,6 @@ import org.lwjgl.system.MemoryUtil;
 public final class MeshGenerationStatsBuffer implements AutoCloseable {
 	private static final int BUFFER_BYTES = Integer.BYTES * 4;
 
-	private final ByteBuffer zeroBuffer;
 	private final ByteBuffer readbackBuffer;
 
 	private int handle;
@@ -19,14 +18,10 @@ public final class MeshGenerationStatsBuffer implements AutoCloseable {
 	public MeshGenerationStatsBuffer() {
 		this.handle = GL45C.glCreateBuffers();
 		GL45C.glNamedBufferStorage(this.handle, BUFFER_BYTES, GL45C.GL_DYNAMIC_STORAGE_BIT);
-		this.zeroBuffer = MemoryUtil.memCalloc(BUFFER_BYTES).order(ByteOrder.nativeOrder());
 		this.readbackBuffer = MemoryUtil.memAlloc(BUFFER_BYTES).order(ByteOrder.nativeOrder());
 	}
 
-	public void resetAndBind(int binding) {
-		ByteBuffer zeros = this.zeroBuffer.duplicate().order(ByteOrder.nativeOrder());
-		zeros.clear();
-		GL45C.glNamedBufferSubData(this.handle, 0L, zeros);
+	public void bind(int binding) {
 		GL30C.glBindBufferBase(GL43C.GL_SHADER_STORAGE_BUFFER, binding, this.handle);
 	}
 
@@ -49,7 +44,6 @@ public final class MeshGenerationStatsBuffer implements AutoCloseable {
 			this.handle = 0;
 		}
 
-		MemoryUtil.memFree(this.zeroBuffer);
 		MemoryUtil.memFree(this.readbackBuffer);
 	}
 

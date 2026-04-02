@@ -15,17 +15,27 @@ public final class OitFramebuffer implements AutoCloseable {
 	private int depthRenderbuffer;
 	private int width;
 	private int height;
+	private int depthInternalFormat;
 
-	public void ensureSize(int width, int height) {
+	public boolean ensureSizeFromSource(int sourceFramebuffer, int width, int height) {
+		FramebufferDepthFormat sourceDepthFormat = FramebufferDepthFormat.resolve(sourceFramebuffer);
+		if (!sourceDepthFormat.isDefined()) {
+			return false;
+		}
+
 		int targetWidth = Math.max(width, 1);
 		int targetHeight = Math.max(height, 1);
-		if (this.framebuffer != 0 && this.width == targetWidth && this.height == targetHeight) {
-			return;
+		if (this.framebuffer != 0
+			&& this.width == targetWidth
+			&& this.height == targetHeight
+			&& this.depthInternalFormat == sourceDepthFormat.internalFormat()) {
+			return true;
 		}
 
 		this.close();
 		this.width = targetWidth;
 		this.height = targetHeight;
+		this.depthInternalFormat = sourceDepthFormat.internalFormat();
 
 		this.framebuffer = GL45C.glCreateFramebuffers();
 		this.accumulationTexture = GL45C.glCreateTextures(GL11C.GL_TEXTURE_2D);
@@ -41,10 +51,10 @@ public final class OitFramebuffer implements AutoCloseable {
 		GL45C.glNamedFramebufferTexture(this.framebuffer, GL30C.GL_COLOR_ATTACHMENT1, this.revealageTexture, 0);
 
 		this.depthRenderbuffer = GL45C.glCreateRenderbuffers();
-		GL45C.glNamedRenderbufferStorage(this.depthRenderbuffer, GL30C.GL_DEPTH_COMPONENT24, this.width, this.height);
+		GL45C.glNamedRenderbufferStorage(this.depthRenderbuffer, this.depthInternalFormat, this.width, this.height);
 		GL45C.glNamedFramebufferRenderbuffer(
 			this.framebuffer,
-			GL30C.GL_DEPTH_ATTACHMENT,
+			sourceDepthFormat.attachmentPoint(),
 			GL30C.GL_RENDERBUFFER,
 			this.depthRenderbuffer
 		);
@@ -53,6 +63,7 @@ public final class OitFramebuffer implements AutoCloseable {
 		if (status != GL30C.GL_FRAMEBUFFER_COMPLETE) {
 			throw new IllegalStateException("Failed to create translucent OIT framebuffer. status=0x" + Integer.toHexString(status));
 		}
+		return true;
 	}
 
 	public void clear() {
@@ -141,5 +152,6 @@ public final class OitFramebuffer implements AutoCloseable {
 
 		this.width = 0;
 		this.height = 0;
+		this.depthInternalFormat = 0;
 	}
 }

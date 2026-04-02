@@ -1,0 +1,24 @@
+#version 450 core
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 6) buffer PotassiumMeshGenerationStatsBuffer {
+    uint processedJobs;
+    uint generatedVertices;
+    uint clippedJobs;
+    uint lastSampledPackedBlock;
+} potassium_mesh_generation_stats;
+
+layout(std430, binding = 11) buffer PotassiumDrawCommandCountBuffer {
+    uint opaqueCommandCount;
+    uint translucentCommandCount;
+} potassium_draw_command_counts;
+
+void main() {
+    potassium_mesh_generation_stats.processedJobs = 0u;
+    potassium_mesh_generation_stats.generatedVertices = 0u;
+    potassium_mesh_generation_stats.clippedJobs = 0u;
+    potassium_mesh_generation_stats.lastSampledPackedBlock = 0u;
+    potassium_draw_command_counts.opaqueCommandCount = 0u;
+    potassium_draw_command_counts.translucentCommandCount = 0u;
+}

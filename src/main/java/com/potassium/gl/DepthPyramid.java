@@ -4,6 +4,7 @@ import org.lwjgl.opengl.GL11C;
 import org.lwjgl.opengl.GL15C;
 import org.lwjgl.opengl.GL12C;
 import org.lwjgl.opengl.GL30C;
+import org.lwjgl.opengl.GL43C;
 import org.lwjgl.opengl.GL42C;
 import org.lwjgl.opengl.GL45C;
 
@@ -14,29 +15,40 @@ public final class DepthPyramid implements AutoCloseable {
 	private int width;
 	private int height;
 	private int levels;
+	private int depthCopyInternalFormat;
 
-	public void ensureSize(int width, int height) {
+	public boolean ensureSizeFromSource(int sourceFramebuffer, int width, int height) {
+		FramebufferDepthFormat sourceDepthFormat = FramebufferDepthFormat.resolve(sourceFramebuffer);
+		if (!sourceDepthFormat.isDefined()) {
+			return false;
+		}
+
 		int targetWidth = Math.max(width, 1);
 		int targetHeight = Math.max(height, 1);
 		int targetLevels = mipLevels(targetWidth, targetHeight);
 		if (this.copyFramebuffer != 0
 			&& this.width == targetWidth
 			&& this.height == targetHeight
-			&& this.levels == targetLevels) {
-			return;
+			&& this.levels == targetLevels
+			&& this.depthCopyInternalFormat == sourceDepthFormat.internalFormat()) {
+			return true;
 		}
 
 		this.close();
 		this.width = targetWidth;
 		this.height = targetHeight;
 		this.levels = targetLevels;
+		this.depthCopyInternalFormat = sourceDepthFormat.internalFormat();
 
 		this.copyFramebuffer = GL45C.glCreateFramebuffers();
 		this.depthCopyTexture = GL45C.glCreateTextures(GL11C.GL_TEXTURE_2D);
-		GL45C.glTextureStorage2D(this.depthCopyTexture, 1, GL30C.GL_DEPTH_COMPONENT32F, this.width, this.height);
+		GL45C.glTextureStorage2D(this.depthCopyTexture, 1, this.depthCopyInternalFormat, this.width, this.height);
 		GL45C.glTextureParameteri(this.depthCopyTexture, GL11C.GL_TEXTURE_MIN_FILTER, GL11C.GL_NEAREST);
 		GL45C.glTextureParameteri(this.depthCopyTexture, GL11C.GL_TEXTURE_MAG_FILTER, GL11C.GL_NEAREST);
-		GL45C.glNamedFramebufferTexture(this.copyFramebuffer, GL30C.GL_DEPTH_ATTACHMENT, this.depthCopyTexture, 0);
+		if (sourceDepthFormat.hasStencil()) {
+			GL45C.glTextureParameteri(this.depthCopyTexture, GL43C.GL_DEPTH_STENCIL_TEXTURE_MODE, GL11C.GL_DEPTH_COMPONENT);
+		}
+		GL45C.glNamedFramebufferTexture(this.copyFramebuffer, sourceDepthFormat.attachmentPoint(), this.depthCopyTexture, 0);
 		GL45C.glNamedFramebufferDrawBuffer(this.copyFramebuffer, GL11C.GL_NONE);
 		GL45C.glNamedFramebufferReadBuffer(this.copyFramebuffer, GL11C.GL_NONE);
 
@@ -50,6 +62,7 @@ public final class DepthPyramid implements AutoCloseable {
 		GL45C.glTextureParameteri(this.pyramidTexture, GL11C.GL_TEXTURE_MIN_FILTER, GL11C.GL_NEAREST_MIPMAP_NEAREST);
 		GL45C.glTextureParameteri(this.pyramidTexture, GL11C.GL_TEXTURE_MAG_FILTER, GL11C.GL_NEAREST);
 		GL45C.glTextureParameteri(this.pyramidTexture, GL12C.GL_TEXTURE_MAX_LEVEL, this.levels - 1);
+		return true;
 	}
 
 	public void copyDepthFrom(int sourceFramebuffer, int sourceViewportX, int sourceViewportY, int sourceViewportWidth, int sourceViewportHeight) {
@@ -130,6 +143,7 @@ public final class DepthPyramid implements AutoCloseable {
 		this.width = 0;
 		this.height = 0;
 		this.levels = 0;
+		this.depthCopyInternalFormat = 0;
 	}
 
 	private static int mipLevels(int width, int height) {

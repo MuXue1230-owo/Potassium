@@ -78,9 +78,26 @@ public final class PotassiumEngine implements ClientModInitializer {
 		}
 	}
 
-	public void onRenderLevelEnd(CameraRenderState cameraState, Matrix4fc modelViewMatrix) {
+	public boolean onRenderOpaqueTerrain(CameraRenderState cameraState, Matrix4fc modelViewMatrix) {
 		if (this.runtimeReady) {
-			this.renderPipeline.renderDebugMeshes(cameraState, modelViewMatrix);
+			this.renderPipeline.renderOpaqueTerrain(cameraState, modelViewMatrix);
+			return true;
+		}
+
+		return false;
+	}
+
+	public boolean onRenderTranslucentTerrain(CameraRenderState cameraState, Matrix4fc modelViewMatrix) {
+		if (this.runtimeReady) {
+			this.renderPipeline.renderTranslucentTerrain(cameraState, modelViewMatrix);
+			return true;
+		}
+
+		return false;
+	}
+
+	public void onRenderLevelEnd() {
+		if (this.runtimeReady) {
 			this.renderPipeline.endFrame();
 		}
 	}

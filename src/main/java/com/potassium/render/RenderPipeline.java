@@ -96,6 +96,7 @@ public final class RenderPipeline implements AutoCloseable {
 	private ShaderProgram chunkTranslucentProgram;
 	private ShaderProgram oitCompositeProgram;
 	private ComputeShader applyChangesShader;
+	private ComputeShader resetFrameStateShader;
 	private ComputeShader depthCopyShader;
 	private ComputeShader depthDownsampleShader;
 	private ComputeShader meshGenerationShader;
@@ -179,6 +180,9 @@ public final class RenderPipeline implements AutoCloseable {
 		this.chunkTranslucentProjectionUniform = GL20C.glGetUniformLocation(this.chunkTranslucentProgram.handle(), "uProjectionMatrix");
 
 		if (GLCapabilities.hasComputeShader()) {
+			if (this.hasGpuFrameStateResetBindingBudget()) {
+				this.resetFrameStateShader = ComputeShader.load("reset_frame_state", "shaders/common/reset_frame_state.comp");
+			}
 			if (this.hasGpuChangeApplyBindingBudget()) {
 				this.applyChangesShader = ComputeShader.load("apply_world_changes", "shaders/world/apply_changes.comp");
 				this.changeQueueBuffer = new ChangeQueueBuffer(this.config.memory.changeQueueCapacity, usePersistentMapping);
@@ -251,6 +255,7 @@ public final class RenderPipeline implements AutoCloseable {
 		}
 		if (this.residentChunkStateBuffer != null) {
 			this.residentChunkStateBuffer.beginFrame();
+			this.resetGpuFrameStateBuffers();
 			this.dispatchPendingGpuWorldChanges();
 			this.dispatchDirtyMeshGeneration();
 		}
@@ -368,7 +373,7 @@ public final class RenderPipeline implements AutoCloseable {
 
 	public String summaryLine() {
 		return String.format(
-			"chunks=%d resident=%d/%d wdbPages=%d lastUpload=%dB trackedChanges=%d meshJobs=%d/%d meshProcessed=%d meshVertices=%d meshClipped=%d rendered=%d/%d opaqueVisible=%d translucentVisible=%d sampleBlock=%d frustum=%s occlusion=%s",
+			"chunks=%d resident=%d/%d wdbPages=%d lastUpload=%dB trackedChanges=%d meshJobs=%d/%d meshProcessed=%s meshVertices=%s meshClipped=%s rendered=%s/%s opaqueVisible=%s translucentVisible=%s sampleBlock=%s frustum=%s occlusion=%s",
 			this.chunkManager.size(),
 			this.memoryManager.residentChunks(),
 			this.memoryManager.capacityChunks(),
@@ -377,14 +382,14 @@ public final class RenderPipeline implements AutoCloseable {
 			this.worldChangeTracker.pendingChangeCount(),
 			this.lastMeshGenerationJobs,
 			this.lastMeshGenerationDirtyCandidates,
-			this.lastMeshGenerationProcessedJobs,
-			this.lastMeshGenerationGeneratedVertices,
-			this.lastMeshGenerationClippedJobs,
-			this.lastRenderedMeshChunks,
-			this.lastRenderedMeshVertices,
-			this.lastVisibleOpaqueMeshChunks,
-			this.lastVisibleTranslucentMeshChunks,
-			this.lastMeshGenerationSampledPackedBlock,
+			describeStat(this.lastMeshGenerationProcessedJobs),
+			describeStat(this.lastMeshGenerationGeneratedVertices),
+			describeStat(this.lastMeshGenerationClippedJobs),
+			describeStat(this.lastRenderedMeshChunks),
+			describeStat(this.lastRenderedMeshVertices),
+			describeStat(this.lastVisibleOpaqueMeshChunks),
+			describeStat(this.lastVisibleTranslucentMeshChunks),
+			describeStat(this.lastMeshGenerationSampledPackedBlock),
 			this.frustumCuller.isEnabled(),
 			this.occlusionCuller.isEnabled()
 		);
@@ -531,6 +536,11 @@ public final class RenderPipeline implements AutoCloseable {
 	}
 
 	public void renderDebugMeshes(CameraRenderState cameraState, Matrix4fc modelViewMatrixState) {
+		this.renderOpaqueTerrain(cameraState, modelViewMatrixState);
+		this.renderTranslucentTerrain(cameraState, modelViewMatrixState);
+	}
+
+	public void renderOpaqueTerrain(CameraRenderState cameraState, Matrix4fc modelViewMatrixState) {
 		if (!this.initialized || this.meshMetadataBuffer == null || this.meshVertexBuffer == null || this.chunkProgram == null) {
 			return;
 		}
@@ -545,93 +555,127 @@ public final class RenderPipeline implements AutoCloseable {
 
 		Matrix4f modelViewMatrix = new Matrix4f(modelViewMatrixState);
 		Matrix4f projectionMatrix = new Matrix4f(cameraState.projectionMatrix);
+		this.bindMeshDrawState();
 		this.useChunkProgram(this.chunkProgram, this.chunkModelViewUniform, this.chunkProjectionUniform, modelViewMatrix, projectionMatrix);
 
-		GL30C.glBindVertexArray(this.debugMeshVertexArray);
-		this.meshVertexBuffer.bindArrayBuffer();
-		GL30C.glEnableVertexAttribArray(0);
-		GL30C.glVertexAttribIPointer(0, 4, GL11C.GL_INT, MeshVertexBuffer.BYTES_PER_VERTEX, 0L);
-
 		if (this.hasGpuDrivenDrawPath()) {
-			int sceneDrawFramebuffer;
-			int viewportX;
-			int viewportY;
-			int viewportWidth;
-			int viewportHeight;
-			try (MemoryStack stack = MemoryStack.stackPush()) {
-				IntBuffer viewport = stack.mallocInt(4);
-				GL11C.glGetIntegerv(GL11C.GL_VIEWPORT, viewport);
-				sceneDrawFramebuffer = GL11C.glGetInteger(GL30C.GL_DRAW_FRAMEBUFFER_BINDING);
-				viewportX = viewport.get(0);
-				viewportY = viewport.get(1);
-				viewportWidth = viewport.get(2);
-				viewportHeight = viewport.get(3);
-			}
-
+			SceneFramebufferState sceneFramebufferState = this.captureSceneFramebufferState();
+			this.resetGpuFrameStateBuffers();
 			int commandCount = this.dispatchGpuDrivenVisibilityCulling(
-				sceneDrawFramebuffer,
-				viewportX,
-				viewportY,
-				viewportWidth,
-				viewportHeight,
+				sceneFramebufferState.drawFramebuffer(),
+				sceneFramebufferState.viewportX(),
+				sceneFramebufferState.viewportY(),
+				sceneFramebufferState.viewportWidth(),
+				sceneFramebufferState.viewportHeight(),
 				projectionMatrix,
 				modelViewMatrix
 			);
 			GL11C.glDisable(GL11C.GL_BLEND);
+			GL11C.glEnable(GL11C.GL_DEPTH_TEST);
 			GL11C.glDepthMask(true);
 			GL11C.glEnable(GL11C.GL_CULL_FACE);
 			this.drawGpuDrivenOpaqueMeshes(commandCount);
+			this.lastVisibleOpaqueMeshChunks = -1;
+			this.lastVisibleTranslucentMeshChunks = -1;
+			this.lastRenderedMeshChunks = -1;
+			this.lastRenderedMeshVertices = -1;
+		} else {
+			IntBuffer metadata = this.meshMetadataBuffer.readEntries();
+			if (metadata.remaining() < this.meshMetadataBuffer.capacityEntries() * MeshMetadataBuffer.INTS_PER_ENTRY) {
+				this.finishMeshDrawState();
+				return;
+			}
 
-			if (this.hasGpuDrivenTranslucentOitPath()) {
-				this.renderGpuDrivenTranslucentOit(
+			this.frustumCuller.update(projectionMatrix, modelViewMatrix);
+			this.populateVisibleOpaqueDraws(metadata);
+
+			GL11C.glDisable(GL11C.GL_BLEND);
+			GL11C.glEnable(GL11C.GL_DEPTH_TEST);
+			GL11C.glDepthMask(true);
+			GL11C.glEnable(GL11C.GL_CULL_FACE);
+			this.drawOpaqueDebugMeshes();
+		}
+
+		this.finishMeshDrawState();
+	}
+
+	public void renderTranslucentTerrain(CameraRenderState cameraState, Matrix4fc modelViewMatrixState) {
+		if (!this.initialized || this.meshMetadataBuffer == null || this.meshVertexBuffer == null || this.chunkProgram == null) {
+			return;
+		}
+		if (cameraState == null || modelViewMatrixState == null) {
+			return;
+		}
+
+		Matrix4f modelViewMatrix = new Matrix4f(modelViewMatrixState);
+		Matrix4f projectionMatrix = new Matrix4f(cameraState.projectionMatrix);
+		this.bindMeshDrawState();
+
+		if (this.hasGpuDrivenDrawPath()) {
+			SceneFramebufferState sceneFramebufferState = this.captureSceneFramebufferState();
+			this.resetGpuFrameStateBuffers();
+			int commandCount = this.dispatchGpuDrivenVisibilityCulling(
+				sceneFramebufferState.drawFramebuffer(),
+				sceneFramebufferState.viewportX(),
+				sceneFramebufferState.viewportY(),
+				sceneFramebufferState.viewportWidth(),
+				sceneFramebufferState.viewportHeight(),
+				projectionMatrix,
+				modelViewMatrix
+			);
+			if (this.hasGpuDrivenTranslucentOitPath() && this.renderGpuDrivenTranslucentOit(
 					commandCount,
-					sceneDrawFramebuffer,
-					viewportX,
-					viewportY,
-					viewportWidth,
-					viewportHeight,
+					sceneFramebufferState.drawFramebuffer(),
+					sceneFramebufferState.viewportX(),
+					sceneFramebufferState.viewportY(),
+					sceneFramebufferState.viewportWidth(),
+					sceneFramebufferState.viewportHeight(),
 					modelViewMatrix,
 					projectionMatrix
-				);
+				)) {
+				// Translucent meshes were rendered through the OIT path.
 			} else {
+				this.useChunkProgram(this.chunkProgram, this.chunkModelViewUniform, this.chunkProjectionUniform, modelViewMatrix, projectionMatrix);
 				GL11C.glEnable(GL11C.GL_BLEND);
+				GL11C.glEnable(GL11C.GL_DEPTH_TEST);
 				GL11C.glBlendFunc(GL11C.GL_SRC_ALPHA, GL11C.GL_ONE_MINUS_SRC_ALPHA);
 				GL11C.glDepthMask(false);
 				GL11C.glDisable(GL11C.GL_CULL_FACE);
 				this.drawGpuDrivenTranslucentMeshes(commandCount);
 			}
-
-			if (this.drawCommandCountBuffer != null) {
-				DrawCommandCountBuffer.Counts commandCounts = this.drawCommandCountBuffer.read();
-				this.lastVisibleOpaqueMeshChunks = commandCounts.opaqueCount();
-				this.lastVisibleTranslucentMeshChunks = commandCounts.translucentCount();
-				this.lastRenderedMeshChunks = commandCounts.opaqueCount() + commandCounts.translucentCount();
-			}
+			this.lastVisibleOpaqueMeshChunks = -1;
+			this.lastVisibleTranslucentMeshChunks = -1;
+			this.lastRenderedMeshChunks = -1;
+			this.lastRenderedMeshVertices = -1;
 		} else {
+			this.useChunkProgram(this.chunkProgram, this.chunkModelViewUniform, this.chunkProjectionUniform, modelViewMatrix, projectionMatrix);
 			IntBuffer metadata = this.meshMetadataBuffer.readEntries();
 			if (metadata.remaining() < this.meshMetadataBuffer.capacityEntries() * MeshMetadataBuffer.INTS_PER_ENTRY) {
-				GL30C.glDisableVertexAttribArray(0);
-				GL30C.glBindVertexArray(0);
-				GL20C.glUseProgram(0);
+				this.finishMeshDrawState();
 				return;
 			}
 
 			this.frustumCuller.update(projectionMatrix, modelViewMatrix);
-			ArrayList<TranslucentDraw> translucentDraws = new ArrayList<>();
-			this.populateVisibleDraws(metadata, translucentDraws, cameraState);
-
-			GL11C.glDisable(GL11C.GL_BLEND);
-			GL11C.glDepthMask(true);
-			GL11C.glEnable(GL11C.GL_CULL_FACE);
-			this.drawOpaqueDebugMeshes();
-
+			ArrayList<TranslucentDraw> translucentDraws = this.collectVisibleTranslucentDraws(metadata, cameraState);
 			GL11C.glEnable(GL11C.GL_BLEND);
+			GL11C.glEnable(GL11C.GL_DEPTH_TEST);
 			GL11C.glBlendFunc(GL11C.GL_SRC_ALPHA, GL11C.GL_ONE_MINUS_SRC_ALPHA);
 			GL11C.glDepthMask(false);
 			GL11C.glDisable(GL11C.GL_CULL_FACE);
 			this.drawTranslucentDebugMeshes(translucentDraws);
 		}
 
+		this.finishMeshDrawState();
+	}
+
+	private void bindMeshDrawState() {
+		GL30C.glBindVertexArray(this.debugMeshVertexArray);
+		this.meshVertexBuffer.bindArrayBuffer();
+		GL30C.glEnableVertexAttribArray(0);
+		GL30C.glVertexAttribIPointer(0, 4, GL11C.GL_INT, MeshVertexBuffer.BYTES_PER_VERTEX, 0L);
+	}
+
+	private void finishMeshDrawState() {
 		GL11C.glDepthMask(true);
 		GL11C.glEnable(GL11C.GL_DEPTH_TEST);
 		GL11C.glEnable(GL11C.GL_CULL_FACE);
@@ -647,6 +691,7 @@ public final class RenderPipeline implements AutoCloseable {
 		closeQuietly(this.depthPyramid);
 		closeQuietly(this.depthDownsampleShader);
 		closeQuietly(this.depthCopyShader);
+		closeQuietly(this.resetFrameStateShader);
 		closeQuietly(this.occlusionCullingShader);
 		closeQuietly(this.frustumCullingShader);
 		closeQuietly(this.meshGenerationShader);
@@ -669,6 +714,7 @@ public final class RenderPipeline implements AutoCloseable {
 		this.depthPyramid = null;
 		this.depthDownsampleShader = null;
 		this.depthCopyShader = null;
+		this.resetFrameStateShader = null;
 		this.occlusionCullingShader = null;
 		this.frustumCullingShader = null;
 		this.meshGenerationShader = null;
@@ -849,7 +895,7 @@ public final class RenderPipeline implements AutoCloseable {
 		this.lastMeshGenerationDirtyCandidates = this.memoryManager.residentChunks();
 		this.worldDataBuffer.bind(WORLD_DATA_BINDING);
 		this.residentChunkStateBuffer.bind(RESIDENT_CHUNK_STATE_BINDING);
-		this.meshGenerationStatsBuffer.resetAndBind(MESH_STATS_BINDING);
+		this.meshGenerationStatsBuffer.bind(MESH_STATS_BINDING);
 		this.meshMetadataBuffer.bind(MESH_METADATA_BINDING);
 		this.meshVertexBuffer.bindStorage(MESH_VERTEX_BINDING);
 		this.meshGenerationShader.use();
@@ -863,12 +909,10 @@ public final class RenderPipeline implements AutoCloseable {
 		int groupCountX = (residentSlotCapacity + (MESH_GENERATION_LOCAL_SIZE_X - 1)) / MESH_GENERATION_LOCAL_SIZE_X;
 		GL43C.glDispatchCompute(groupCountX, 1, 1);
 		GL43C.glMemoryBarrier(GL43C.GL_SHADER_STORAGE_BARRIER_BIT | GL43C.GL_BUFFER_UPDATE_BARRIER_BIT);
-
-		MeshGenerationStatsBuffer.Stats stats = this.meshGenerationStatsBuffer.read();
-		this.lastMeshGenerationProcessedJobs = stats.processedJobs();
-		this.lastMeshGenerationGeneratedVertices = stats.generatedVertices();
-		this.lastMeshGenerationClippedJobs = stats.clippedJobs();
-		this.lastMeshGenerationSampledPackedBlock = stats.lastSampledPackedBlock();
+		this.lastMeshGenerationProcessedJobs = -1;
+		this.lastMeshGenerationGeneratedVertices = -1;
+		this.lastMeshGenerationClippedJobs = -1;
+		this.lastMeshGenerationSampledPackedBlock = -1;
 	}
 
 	private boolean hasMeshGenerationBindingBudget() {
@@ -881,11 +925,22 @@ public final class RenderPipeline implements AutoCloseable {
 		return maxBindings <= 0 || maxBindings >= APPLY_CHANGES_REQUIRED_SSBO_BINDINGS;
 	}
 
+	private boolean hasGpuFrameStateResetBindingBudget() {
+		int maxBindings = GLCapabilities.getMaxShaderStorageBufferBindings();
+		return maxBindings <= 0 || maxBindings >= DRAW_COMMAND_COUNT_BINDING + 1;
+	}
+
 	private boolean hasGpuChangeApplyPath() {
 		return this.applyChangesShader != null
 			&& this.changeQueueBuffer != null
 			&& this.residentChunkStateBuffer != null
 			&& this.worldDataBuffer != null;
+	}
+
+	private boolean hasGpuFrameStateResetPath() {
+		return this.resetFrameStateShader != null
+			&& this.meshGenerationStatsBuffer != null
+			&& this.drawCommandCountBuffer != null;
 	}
 
 	private boolean hasGpuDrivenDrawBindingBudget() {
@@ -944,7 +999,7 @@ public final class RenderPipeline implements AutoCloseable {
 		this.meshMetadataBuffer.bind(MESH_METADATA_BINDING);
 		this.indirectCommandBuffer.bindForStorage(OPAQUE_COMMAND_BINDING);
 		this.translucentIndirectCommandBuffer.bindForStorage(TRANSLUCENT_COMMAND_BINDING);
-		this.drawCommandCountBuffer.resetAndBind(DRAW_COMMAND_COUNT_BINDING);
+		this.drawCommandCountBuffer.bind(DRAW_COMMAND_COUNT_BINDING);
 		this.frustumCullingShader.use();
 		if (this.frustumViewProjectionUniform >= 0) {
 			try (MemoryStack stack = MemoryStack.stackPush()) {
@@ -973,11 +1028,13 @@ public final class RenderPipeline implements AutoCloseable {
 			return this.dispatchGpuDrivenFrustumCulling(projectionMatrix, modelViewMatrix);
 		}
 
-		this.buildDepthPyramid(sceneDrawFramebuffer, sceneViewportX, sceneViewportY, sceneViewportWidth, sceneViewportHeight);
+		if (!this.buildDepthPyramid(sceneDrawFramebuffer, sceneViewportX, sceneViewportY, sceneViewportWidth, sceneViewportHeight)) {
+			return this.dispatchGpuDrivenFrustumCulling(projectionMatrix, modelViewMatrix);
+		}
 		return this.dispatchGpuDrivenOcclusionCulling(sceneViewportWidth, sceneViewportHeight, projectionMatrix, modelViewMatrix);
 	}
 
-	private void buildDepthPyramid(
+	private boolean buildDepthPyramid(
 		int sceneDrawFramebuffer,
 		int sceneViewportX,
 		int sceneViewportY,
@@ -985,10 +1042,12 @@ public final class RenderPipeline implements AutoCloseable {
 		int sceneViewportHeight
 	) {
 		if (this.depthPyramid == null || this.depthCopyShader == null || this.depthDownsampleShader == null) {
-			return;
+			return false;
 		}
 
-		this.depthPyramid.ensureSize(sceneViewportWidth, sceneViewportHeight);
+		if (!this.depthPyramid.ensureSizeFromSource(sceneDrawFramebuffer, sceneViewportWidth, sceneViewportHeight)) {
+			return false;
+		}
 		this.depthPyramid.copyDepthFrom(sceneDrawFramebuffer, sceneViewportX, sceneViewportY, sceneViewportWidth, sceneViewportHeight);
 		this.depthPyramid.bindDepthCopyTexture(0);
 		this.depthPyramid.bindPyramidLevelForWrite(0, 0);
@@ -1014,6 +1073,7 @@ public final class RenderPipeline implements AutoCloseable {
 			);
 			GL43C.glMemoryBarrier(GL43C.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL43C.GL_TEXTURE_FETCH_BARRIER_BIT);
 		}
+		return true;
 	}
 
 	private int dispatchGpuDrivenOcclusionCulling(
@@ -1030,7 +1090,7 @@ public final class RenderPipeline implements AutoCloseable {
 		this.meshMetadataBuffer.bind(MESH_METADATA_BINDING);
 		this.indirectCommandBuffer.bindForStorage(OPAQUE_COMMAND_BINDING);
 		this.translucentIndirectCommandBuffer.bindForStorage(TRANSLUCENT_COMMAND_BINDING);
-		this.drawCommandCountBuffer.resetAndBind(DRAW_COMMAND_COUNT_BINDING);
+		this.drawCommandCountBuffer.bind(DRAW_COMMAND_COUNT_BINDING);
 		this.depthPyramid.bindPyramidTexture(0);
 		this.occlusionCullingShader.use();
 		if (this.occlusionViewProjectionUniform >= 0) {
@@ -1070,7 +1130,19 @@ public final class RenderPipeline implements AutoCloseable {
 		this.pendingGpuChangeCount = 0;
 	}
 
-	private void renderGpuDrivenTranslucentOit(
+	private void resetGpuFrameStateBuffers() {
+		if (!this.hasGpuFrameStateResetPath()) {
+			return;
+		}
+
+		this.meshGenerationStatsBuffer.bind(MESH_STATS_BINDING);
+		this.drawCommandCountBuffer.bind(DRAW_COMMAND_COUNT_BINDING);
+		this.resetFrameStateShader.use();
+		GL43C.glDispatchCompute(1, 1, 1);
+		GL43C.glMemoryBarrier(GL43C.GL_SHADER_STORAGE_BARRIER_BIT | GL43C.GL_BUFFER_UPDATE_BARRIER_BIT);
+	}
+
+	private boolean renderGpuDrivenTranslucentOit(
 		int commandCount,
 		int sceneDrawFramebuffer,
 		int sceneViewportX,
@@ -1081,10 +1153,12 @@ public final class RenderPipeline implements AutoCloseable {
 		Matrix4fc projectionMatrix
 	) {
 		if (commandCount <= 0 || sceneViewportWidth <= 0 || sceneViewportHeight <= 0 || this.translucentOitFramebuffer == null) {
-			return;
+			return false;
 		}
 
-		this.translucentOitFramebuffer.ensureSize(sceneViewportWidth, sceneViewportHeight);
+		if (!this.translucentOitFramebuffer.ensureSizeFromSource(sceneDrawFramebuffer, sceneViewportWidth, sceneViewportHeight)) {
+			return false;
+		}
 		this.translucentOitFramebuffer.clear();
 		this.translucentOitFramebuffer.copyDepthFrom(
 			sceneDrawFramebuffer,
@@ -1126,6 +1200,7 @@ public final class RenderPipeline implements AutoCloseable {
 		GL11C.glDrawArrays(GL11C.GL_TRIANGLES, 0, 3);
 		GL30C.glBindVertexArray(this.debugMeshVertexArray);
 		GL11C.glEnable(GL11C.GL_DEPTH_TEST);
+		return true;
 	}
 
 	private int resolveResidentSlot(int chunkX, int chunkZ) {
@@ -1232,6 +1307,89 @@ public final class RenderPipeline implements AutoCloseable {
 			this.resolveResidentSlot(chunkPos.x(), chunkPos.z() + 1),
 			dirty
 		);
+	}
+
+	private SceneFramebufferState captureSceneFramebufferState() {
+		try (MemoryStack stack = MemoryStack.stackPush()) {
+			IntBuffer viewport = stack.mallocInt(4);
+			GL11C.glGetIntegerv(GL11C.GL_VIEWPORT, viewport);
+			int sceneDrawFramebuffer = GL11C.glGetInteger(GL30C.GL_DRAW_FRAMEBUFFER_BINDING);
+			return new SceneFramebufferState(
+				sceneDrawFramebuffer,
+				viewport.get(0),
+				viewport.get(1),
+				viewport.get(2),
+				viewport.get(3)
+			);
+		}
+	}
+
+	private void populateVisibleOpaqueDraws(IntBuffer metadata) {
+		int visibleMinSectionY = this.worldDataBuffer.minSectionY();
+		int visibleSectionsCount = this.worldDataBuffer.sectionsCount();
+
+		for (ChunkData chunkData : this.chunkManager.chunks()) {
+			if (!chunkData.isResident()) {
+				continue;
+			}
+			if (!this.frustumCuller.isChunkVisible(chunkData.chunkPos(), visibleMinSectionY, visibleSectionsCount)) {
+				continue;
+			}
+
+			int metadataOffset = chunkData.residentSlot() * MeshMetadataBuffer.INTS_PER_ENTRY;
+			int opaqueVertexCount = metadata.get(metadataOffset + MESH_METADATA_OPAQUE_VERTEX_COUNT_OFFSET);
+			if (opaqueVertexCount <= 0) {
+				continue;
+			}
+
+			int firstVertex = metadata.get(metadataOffset + MESH_METADATA_OPAQUE_FIRST_VERTEX_OFFSET);
+			this.indirectCommandBuffer.addDrawArraysCommand(opaqueVertexCount, 1, firstVertex, 0);
+			this.lastRenderedMeshVertices += opaqueVertexCount;
+			this.lastVisibleOpaqueMeshChunks++;
+			this.lastRenderedMeshChunks++;
+		}
+	}
+
+	private ArrayList<TranslucentDraw> collectVisibleTranslucentDraws(IntBuffer metadata, CameraRenderState cameraState) {
+		ArrayList<TranslucentDraw> translucentDraws = new ArrayList<>();
+		double cameraX = cameraState.pos.x;
+		double cameraY = cameraState.pos.y;
+		double cameraZ = cameraState.pos.z;
+		int visibleMinSectionY = this.worldDataBuffer.minSectionY();
+		int visibleSectionsCount = this.worldDataBuffer.sectionsCount();
+
+		for (ChunkData chunkData : this.chunkManager.chunks()) {
+			if (!chunkData.isResident()) {
+				continue;
+			}
+			if (!this.frustumCuller.isChunkVisible(chunkData.chunkPos(), visibleMinSectionY, visibleSectionsCount)) {
+				continue;
+			}
+
+			int metadataOffset = chunkData.residentSlot() * MeshMetadataBuffer.INTS_PER_ENTRY;
+			int translucentVertexCount = metadata.get(metadataOffset + MESH_METADATA_TRANSLUCENT_VERTEX_COUNT_OFFSET);
+			if (translucentVertexCount <= 0) {
+				continue;
+			}
+
+			int translucentFirstVertex = metadata.get(metadataOffset + MESH_METADATA_TRANSLUCENT_FIRST_VERTEX_OFFSET);
+			double distanceSquared = squaredDistanceToChunkCenter(
+				chunkData.chunkPos(),
+				visibleMinSectionY,
+				visibleSectionsCount,
+				cameraX,
+				cameraY,
+				cameraZ
+			);
+			translucentDraws.add(new TranslucentDraw(translucentFirstVertex, translucentVertexCount, distanceSquared));
+			this.lastRenderedMeshVertices += translucentVertexCount;
+			this.lastVisibleTranslucentMeshChunks++;
+			if (metadata.get(metadataOffset + MESH_METADATA_OPAQUE_VERTEX_COUNT_OFFSET) <= 0) {
+				this.lastRenderedMeshChunks++;
+			}
+		}
+
+		return translucentDraws;
 	}
 
 	private void populateVisibleDraws(IntBuffer metadata, List<TranslucentDraw> translucentDraws, CameraRenderState cameraState) {
@@ -1379,6 +1537,10 @@ public final class RenderPipeline implements AutoCloseable {
 		return (deltaX * deltaX) + (deltaY * deltaY) + (deltaZ * deltaZ);
 	}
 
+	private static String describeStat(int value) {
+		return value >= 0 ? Integer.toString(value) : "gpu";
+	}
+
 	private static int boundaryMask(net.minecraft.core.BlockPos position) {
 		int mask = 0;
 		int localX = position.getX() & 15;
@@ -1427,6 +1589,9 @@ public final class RenderPipeline implements AutoCloseable {
 		} catch (Exception exception) {
 			PotassiumLogger.logger().warn("Failed to close render resource cleanly.", exception);
 		}
+	}
+
+	private record SceneFramebufferState(int drawFramebuffer, int viewportX, int viewportY, int viewportWidth, int viewportHeight) {
 	}
 
 	private record TranslucentDraw(int firstVertex, int vertexCount, double distanceSquared) {

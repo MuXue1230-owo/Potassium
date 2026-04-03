@@ -7,6 +7,7 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 layout(location = 0) uniform mat4 uViewProjectionMatrix;
 layout(location = 1) uniform vec2 uViewportSize;
 layout(location = 2) uniform int uDepthPyramidLevels;
+layout(location = 4) uniform uint uResidentSlotCapacity;
 
 layout(binding = 0) uniform sampler2D uDepthPyramid;
 
@@ -142,6 +143,10 @@ bool potassium_chunk_occluded(int chunkX, int chunkZ) {
 
 void main() {
     uint residentSlot = gl_GlobalInvocationID.x;
+    if (residentSlot >= uResidentSlotCapacity) {
+        return;
+    }
+
     int metadataBase = potassium_mesh_metadata_base(residentSlot);
     int opaqueVertexCount = potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_OPAQUE_VERTEX_COUNT_OFFSET];
     int translucentVertexCount = potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_TRANSLUCENT_VERTEX_COUNT_OFFSET];

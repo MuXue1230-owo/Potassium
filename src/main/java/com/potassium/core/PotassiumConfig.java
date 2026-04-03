@@ -82,7 +82,7 @@ public final class PotassiumConfig {
 		this.memory.maxResidentWorldMiB = Math.max(this.memory.maxResidentWorldMiB, this.memory.worldDataBufferMiB);
 		this.memory.indirectCommandCapacity = Math.max(this.memory.indirectCommandCapacity, 1024);
 		this.memory.changeQueueCapacity = Math.max(this.memory.changeQueueCapacity, 1024);
-		this.memory.meshFacesPerChunk = Math.max(this.memory.meshFacesPerChunk, 32);
+		this.memory.meshFacesPerChunk = Math.max(this.memory.meshFacesPerChunk, 4096);
 	}
 
 	public static final class General {
@@ -105,6 +105,6 @@ public final class PotassiumConfig {
 		public int maxResidentWorldMiB = 3072;
 		public int indirectCommandCapacity = 32768;
 		public int changeQueueCapacity = 16384;
-		public int meshFacesPerChunk = 256;
+		public int meshFacesPerChunk = 4096;
 	}
 }

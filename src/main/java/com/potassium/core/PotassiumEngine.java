@@ -11,6 +11,7 @@ import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.renderer.SubmitNodeStorage;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.ChunkPos;
@@ -78,19 +79,17 @@ public final class PotassiumEngine implements ClientModInitializer {
 		}
 	}
 
-	public boolean onRenderOpaqueTerrain(CameraRenderState cameraState, Matrix4fc modelViewMatrix) {
-		if (this.runtimeReady) {
-			this.renderPipeline.renderOpaqueTerrain(cameraState, modelViewMatrix);
-			return true;
+	public boolean onRenderOpaqueTerrain(CameraRenderState cameraState, Matrix4fc modelViewMatrix, SubmitNodeStorage submitNodeStorage) {
+		if (this.runtimeReady && this.renderPipeline != null) {
+			return this.renderPipeline.submitOpaqueTerrain(cameraState, submitNodeStorage);
 		}
 
 		return false;
 	}
 
-	public boolean onRenderTranslucentTerrain(CameraRenderState cameraState, Matrix4fc modelViewMatrix) {
-		if (this.runtimeReady) {
-			this.renderPipeline.renderTranslucentTerrain(cameraState, modelViewMatrix);
-			return true;
+	public boolean onRenderTranslucentTerrain(CameraRenderState cameraState, Matrix4fc modelViewMatrix, SubmitNodeStorage submitNodeStorage) {
+		if (this.runtimeReady && this.renderPipeline != null) {
+			return this.renderPipeline.submitTranslucentTerrain(cameraState, submitNodeStorage);
 		}
 
 		return false;

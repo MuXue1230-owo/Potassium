@@ -1,7 +1,10 @@
 package com.potassium.gl.buffer;
 
+import java.nio.IntBuffer;
 import org.lwjgl.opengl.GL15C;
 import org.lwjgl.opengl.GL43C;
+import org.lwjgl.opengl.GL45C;
+import org.lwjgl.system.MemoryUtil;
 
 public final class MeshVertexBuffer implements AutoCloseable {
 	public static final int UINTS_PER_VERTEX = 4;
@@ -51,6 +54,19 @@ public final class MeshVertexBuffer implements AutoCloseable {
 
 	public int verticesPerChunk() {
 		return this.facesPerChunk * VERTICES_PER_FACE;
+	}
+
+	public IntBuffer readVertices(int firstVertex, int vertexCount) {
+		int clampedFirstVertex = Math.max(firstVertex, 0);
+		int clampedVertexCount = Math.max(vertexCount, 0);
+		IntBuffer readback = MemoryUtil.memAllocInt(clampedVertexCount * UINTS_PER_VERTEX);
+		GL45C.glGetNamedBufferSubData(
+			this.storage.handle(),
+			(long) clampedFirstVertex * BYTES_PER_VERTEX,
+			readback
+		);
+		readback.clear();
+		return readback;
 	}
 
 	@Override

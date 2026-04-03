@@ -15,7 +15,7 @@ const uint POTASSIUM_FACE_NEG_X = 3u;
 const uint POTASSIUM_FACE_POS_Z = 4u;
 const uint POTASSIUM_FACE_NEG_Z = 5u;
 
-const int POTASSIUM_RESIDENT_CHUNK_STATE_INTS_PER_ENTRY = 8;
+const int POTASSIUM_RESIDENT_CHUNK_STATE_INTS_PER_ENTRY = 9;
 const int POTASSIUM_RESIDENT_CHUNK_ACTIVE_OFFSET = 0;
 const int POTASSIUM_RESIDENT_CHUNK_DIRTY_OFFSET = 1;
 const int POTASSIUM_RESIDENT_CHUNK_CHUNK_X_OFFSET = 2;
@@ -24,6 +24,7 @@ const int POTASSIUM_RESIDENT_CHUNK_NEG_X_SLOT_OFFSET = 4;
 const int POTASSIUM_RESIDENT_CHUNK_POS_X_SLOT_OFFSET = 5;
 const int POTASSIUM_RESIDENT_CHUNK_NEG_Z_SLOT_OFFSET = 6;
 const int POTASSIUM_RESIDENT_CHUNK_POS_Z_SLOT_OFFSET = 7;
+const int POTASSIUM_RESIDENT_CHUNK_MESH_REVISION_OFFSET = 8;
 
 struct PotassiumMeshGenerationJob {
     uint residentSlot;
@@ -61,6 +62,7 @@ const int POTASSIUM_MESH_METADATA_TRANSLUCENT_VERTEX_COUNT_OFFSET = 2;
 const int POTASSIUM_MESH_METADATA_TRANSLUCENT_FIRST_VERTEX_OFFSET = 3;
 const int POTASSIUM_MESH_METADATA_CHUNK_X_OFFSET = 4;
 const int POTASSIUM_MESH_METADATA_CHUNK_Z_OFFSET = 5;
+const int POTASSIUM_MESH_METADATA_MESH_REVISION_OFFSET = 6;
 
 uint potassium_section_block_index_to_x(uint sectionBlockIndex) {
     return sectionBlockIndex & 15u;
@@ -161,57 +163,57 @@ void potassium_write_face_vertex(uint vertexIndex, int worldX, int worldY, int w
 void potassium_emit_face(PotassiumMeshGenerationJob job, uint faceDirection, uint blockX, uint blockY, uint blockZ, uint packedBlock, uint faceIndex) {
     uint firstVertex = ((job.residentSlot * uMeshFacesPerChunk) + faceIndex) * POTASSIUM_MESH_VERTICES_PER_FACE;
     int worldX = (job.chunkX << 4) + int(blockX);
-    int worldY = int(blockY);
+    int worldY = (potassium_world_min_section_y() << 4) + int(blockY);
     int worldZ = (job.chunkZ << 4) + int(blockZ);
 
     switch (faceDirection) {
         case POTASSIUM_FACE_POS_Y:
             potassium_write_face_vertex(firstVertex + 0u, worldX, worldY + 1, worldZ, packedBlock);
-            potassium_write_face_vertex(firstVertex + 1u, worldX + 1, worldY + 1, worldZ, packedBlock);
+            potassium_write_face_vertex(firstVertex + 1u, worldX, worldY + 1, worldZ + 1, packedBlock);
             potassium_write_face_vertex(firstVertex + 2u, worldX + 1, worldY + 1, worldZ + 1, packedBlock);
             potassium_write_face_vertex(firstVertex + 3u, worldX, worldY + 1, worldZ, packedBlock);
             potassium_write_face_vertex(firstVertex + 4u, worldX + 1, worldY + 1, worldZ + 1, packedBlock);
-            potassium_write_face_vertex(firstVertex + 5u, worldX, worldY + 1, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 5u, worldX + 1, worldY + 1, worldZ, packedBlock);
             break;
         case POTASSIUM_FACE_NEG_Y:
             potassium_write_face_vertex(firstVertex + 0u, worldX, worldY, worldZ, packedBlock);
-            potassium_write_face_vertex(firstVertex + 1u, worldX + 1, worldY, worldZ + 1, packedBlock);
-            potassium_write_face_vertex(firstVertex + 2u, worldX + 1, worldY, worldZ, packedBlock);
+            potassium_write_face_vertex(firstVertex + 1u, worldX + 1, worldY, worldZ, packedBlock);
+            potassium_write_face_vertex(firstVertex + 2u, worldX + 1, worldY, worldZ + 1, packedBlock);
             potassium_write_face_vertex(firstVertex + 3u, worldX, worldY, worldZ, packedBlock);
-            potassium_write_face_vertex(firstVertex + 4u, worldX, worldY, worldZ + 1, packedBlock);
-            potassium_write_face_vertex(firstVertex + 5u, worldX + 1, worldY, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 4u, worldX + 1, worldY, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 5u, worldX, worldY, worldZ + 1, packedBlock);
             break;
         case POTASSIUM_FACE_POS_X:
             potassium_write_face_vertex(firstVertex + 0u, worldX + 1, worldY, worldZ, packedBlock);
-            potassium_write_face_vertex(firstVertex + 1u, worldX + 1, worldY, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 1u, worldX + 1, worldY + 1, worldZ, packedBlock);
             potassium_write_face_vertex(firstVertex + 2u, worldX + 1, worldY + 1, worldZ + 1, packedBlock);
             potassium_write_face_vertex(firstVertex + 3u, worldX + 1, worldY, worldZ, packedBlock);
             potassium_write_face_vertex(firstVertex + 4u, worldX + 1, worldY + 1, worldZ + 1, packedBlock);
-            potassium_write_face_vertex(firstVertex + 5u, worldX + 1, worldY + 1, worldZ, packedBlock);
+            potassium_write_face_vertex(firstVertex + 5u, worldX + 1, worldY, worldZ + 1, packedBlock);
             break;
         case POTASSIUM_FACE_NEG_X:
             potassium_write_face_vertex(firstVertex + 0u, worldX, worldY, worldZ, packedBlock);
-            potassium_write_face_vertex(firstVertex + 1u, worldX, worldY + 1, worldZ + 1, packedBlock);
-            potassium_write_face_vertex(firstVertex + 2u, worldX, worldY, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 1u, worldX, worldY, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 2u, worldX, worldY + 1, worldZ + 1, packedBlock);
             potassium_write_face_vertex(firstVertex + 3u, worldX, worldY, worldZ, packedBlock);
-            potassium_write_face_vertex(firstVertex + 4u, worldX, worldY + 1, worldZ, packedBlock);
-            potassium_write_face_vertex(firstVertex + 5u, worldX, worldY + 1, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 4u, worldX, worldY + 1, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 5u, worldX, worldY + 1, worldZ, packedBlock);
             break;
         case POTASSIUM_FACE_POS_Z:
             potassium_write_face_vertex(firstVertex + 0u, worldX, worldY, worldZ + 1, packedBlock);
-            potassium_write_face_vertex(firstVertex + 1u, worldX + 1, worldY + 1, worldZ + 1, packedBlock);
-            potassium_write_face_vertex(firstVertex + 2u, worldX + 1, worldY, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 1u, worldX + 1, worldY, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 2u, worldX + 1, worldY + 1, worldZ + 1, packedBlock);
             potassium_write_face_vertex(firstVertex + 3u, worldX, worldY, worldZ + 1, packedBlock);
-            potassium_write_face_vertex(firstVertex + 4u, worldX, worldY + 1, worldZ + 1, packedBlock);
-            potassium_write_face_vertex(firstVertex + 5u, worldX + 1, worldY + 1, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 4u, worldX + 1, worldY + 1, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 5u, worldX, worldY + 1, worldZ + 1, packedBlock);
             break;
         default:
             potassium_write_face_vertex(firstVertex + 0u, worldX, worldY, worldZ, packedBlock);
-            potassium_write_face_vertex(firstVertex + 1u, worldX + 1, worldY, worldZ, packedBlock);
+            potassium_write_face_vertex(firstVertex + 1u, worldX, worldY + 1, worldZ, packedBlock);
             potassium_write_face_vertex(firstVertex + 2u, worldX + 1, worldY + 1, worldZ, packedBlock);
             potassium_write_face_vertex(firstVertex + 3u, worldX, worldY, worldZ, packedBlock);
             potassium_write_face_vertex(firstVertex + 4u, worldX + 1, worldY + 1, worldZ, packedBlock);
-            potassium_write_face_vertex(firstVertex + 5u, worldX, worldY + 1, worldZ, packedBlock);
+            potassium_write_face_vertex(firstVertex + 5u, worldX + 1, worldY, worldZ, packedBlock);
             break;
     }
 }
@@ -275,43 +277,43 @@ void main() {
     uint lastPackedBlock = 0u;
     bool clipped = false;
 
-    for (uint blockY = 0u; blockY < chunkHeight && !clipped; blockY++) {
+    for (int blockY = int(chunkHeight) - 1; blockY >= 0 && !clipped; blockY--) {
         for (uint blockZ = 0u; blockZ < 16u && !clipped; blockZ++) {
             for (uint blockX = 0u; blockX < 16u; blockX++) {
-                uint packedBlock = potassium_chunk_load_local_packed_block(job.residentSlot, blockX, blockY, blockZ);
+                uint packedBlock = potassium_chunk_load_local_packed_block(job.residentSlot, blockX, uint(blockY), blockZ);
                 if (potassium_block_is_air(packedBlock)) {
                     continue;
                 }
 
                 lastPackedBlock = packedBlock;
 
-                if (potassium_should_emit_face(packedBlock, potassium_chunk_load_neighbor_packed_block(job, int(blockX), int(blockY) + 1, int(blockZ)))
-                    && !potassium_try_emit_face(job, POTASSIUM_FACE_POS_Y, blockX, blockY, blockZ, packedBlock, faceCount)) {
+                if (potassium_should_emit_face(packedBlock, potassium_chunk_load_neighbor_packed_block(job, int(blockX), blockY + 1, int(blockZ)))
+                    && !potassium_try_emit_face(job, POTASSIUM_FACE_POS_Y, blockX, uint(blockY), blockZ, packedBlock, faceCount)) {
                     clipped = true;
                     break;
                 }
-                if (potassium_should_emit_face(packedBlock, potassium_chunk_load_neighbor_packed_block(job, int(blockX), int(blockY) - 1, int(blockZ)))
-                    && !potassium_try_emit_face(job, POTASSIUM_FACE_NEG_Y, blockX, blockY, blockZ, packedBlock, faceCount)) {
+                if (potassium_should_emit_face(packedBlock, potassium_chunk_load_neighbor_packed_block(job, int(blockX), blockY - 1, int(blockZ)))
+                    && !potassium_try_emit_face(job, POTASSIUM_FACE_NEG_Y, blockX, uint(blockY), blockZ, packedBlock, faceCount)) {
                     clipped = true;
                     break;
                 }
-                if (potassium_should_emit_face(packedBlock, potassium_chunk_load_neighbor_packed_block(job, int(blockX) + 1, int(blockY), int(blockZ)))
-                    && !potassium_try_emit_face(job, POTASSIUM_FACE_POS_X, blockX, blockY, blockZ, packedBlock, faceCount)) {
+                if (potassium_should_emit_face(packedBlock, potassium_chunk_load_neighbor_packed_block(job, int(blockX) + 1, blockY, int(blockZ)))
+                    && !potassium_try_emit_face(job, POTASSIUM_FACE_POS_X, blockX, uint(blockY), blockZ, packedBlock, faceCount)) {
                     clipped = true;
                     break;
                 }
-                if (potassium_should_emit_face(packedBlock, potassium_chunk_load_neighbor_packed_block(job, int(blockX) - 1, int(blockY), int(blockZ)))
-                    && !potassium_try_emit_face(job, POTASSIUM_FACE_NEG_X, blockX, blockY, blockZ, packedBlock, faceCount)) {
+                if (potassium_should_emit_face(packedBlock, potassium_chunk_load_neighbor_packed_block(job, int(blockX) - 1, blockY, int(blockZ)))
+                    && !potassium_try_emit_face(job, POTASSIUM_FACE_NEG_X, blockX, uint(blockY), blockZ, packedBlock, faceCount)) {
                     clipped = true;
                     break;
                 }
-                if (potassium_should_emit_face(packedBlock, potassium_chunk_load_neighbor_packed_block(job, int(blockX), int(blockY), int(blockZ) + 1))
-                    && !potassium_try_emit_face(job, POTASSIUM_FACE_POS_Z, blockX, blockY, blockZ, packedBlock, faceCount)) {
+                if (potassium_should_emit_face(packedBlock, potassium_chunk_load_neighbor_packed_block(job, int(blockX), blockY, int(blockZ) + 1))
+                    && !potassium_try_emit_face(job, POTASSIUM_FACE_POS_Z, blockX, uint(blockY), blockZ, packedBlock, faceCount)) {
                     clipped = true;
                     break;
                 }
-                if (potassium_should_emit_face(packedBlock, potassium_chunk_load_neighbor_packed_block(job, int(blockX), int(blockY), int(blockZ) - 1))
-                    && !potassium_try_emit_face(job, POTASSIUM_FACE_NEG_Z, blockX, blockY, blockZ, packedBlock, faceCount)) {
+                if (potassium_should_emit_face(packedBlock, potassium_chunk_load_neighbor_packed_block(job, int(blockX), blockY, int(blockZ) - 1))
+                    && !potassium_try_emit_face(job, POTASSIUM_FACE_NEG_Z, blockX, uint(blockY), blockZ, packedBlock, faceCount)) {
                     clipped = true;
                     break;
                 }
@@ -331,6 +333,8 @@ void main() {
     );
     potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_CHUNK_X_OFFSET] = job.chunkX;
     potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_CHUNK_Z_OFFSET] = job.chunkZ;
+    potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_MESH_REVISION_OFFSET] =
+        potassium_resident_chunk_state.residentChunkState[residentStateBase + POTASSIUM_RESIDENT_CHUNK_MESH_REVISION_OFFSET];
     if ((opaqueFaceCount + translucentFaceCount) > 0u) {
         atomicAdd(
             potassium_mesh_generation_stats.generatedVertices,

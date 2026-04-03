@@ -79,6 +79,27 @@ public final class MeshMetadataBuffer implements AutoCloseable {
 		return ints;
 	}
 
+	public int[] readEntry(int entryIndex) {
+		if (entryIndex < 0 || entryIndex >= this.capacityEntries) {
+			return new int[INTS_PER_ENTRY];
+		}
+
+		ByteBuffer readback = MemoryUtil.memAlloc(BYTES_PER_ENTRY).order(ByteOrder.nativeOrder());
+		try {
+			GL45C.glGetNamedBufferSubData(
+				this.storage.handle(),
+				(long) entryIndex * BYTES_PER_ENTRY,
+				readback
+			);
+			IntBuffer ints = readback.asIntBuffer();
+			int[] entry = new int[INTS_PER_ENTRY];
+			ints.get(entry);
+			return entry;
+		} finally {
+			MemoryUtil.memFree(readback);
+		}
+	}
+
 	public int capacityEntries() {
 		return this.capacityEntries;
 	}

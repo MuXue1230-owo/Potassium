@@ -7,6 +7,7 @@ import com.mojang.blaze3d.resource.ResourceHandle;
 import com.mojang.blaze3d.textures.GpuSampler;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.renderer.LevelRenderer;
+import net.minecraft.client.renderer.SubmitNodeStorage;
 import net.minecraft.client.renderer.chunk.ChunkSectionLayerGroup;
 import net.minecraft.client.renderer.chunk.ChunkSectionsToRender;
 import net.minecraft.client.renderer.state.level.LevelRenderState;
@@ -15,6 +16,7 @@ import net.minecraft.util.profiling.ProfilerFiller;
 import org.joml.Matrix4fc;
 import org.joml.Vector4f;
 import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.Redirect;
@@ -22,6 +24,9 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(LevelRenderer.class)
 public abstract class WorldRenderMixin {
+	@Shadow
+	private SubmitNodeStorage submitNodeStorage;
+
 	@Inject(
 		method = "renderLevel(Lcom/mojang/blaze3d/resource/GraphicsResourceAllocator;Lnet/minecraft/client/DeltaTracker;ZLnet/minecraft/client/renderer/state/level/CameraRenderState;Lorg/joml/Matrix4fc;Lcom/mojang/blaze3d/buffers/GpuBufferSlice;Lorg/joml/Vector4f;ZLnet/minecraft/client/renderer/chunk/ChunkSectionsToRender;)V",
 		at = @At("HEAD")
@@ -91,7 +96,7 @@ public abstract class WorldRenderMixin {
 		Matrix4fc modelViewMatrix
 	) {
 		PotassiumEngine engine = PotassiumEngine.getNullable();
-		if (engine != null && engine.onRenderOpaqueTerrain(levelRenderState.cameraRenderState, modelViewMatrix)) {
+		if (engine != null && engine.onRenderOpaqueTerrain(levelRenderState.cameraRenderState, modelViewMatrix, this.submitNodeStorage)) {
 			return;
 		}
 
@@ -123,7 +128,7 @@ public abstract class WorldRenderMixin {
 		Matrix4fc modelViewMatrix
 	) {
 		PotassiumEngine engine = PotassiumEngine.getNullable();
-		if (engine != null && engine.onRenderTranslucentTerrain(levelRenderState.cameraRenderState, modelViewMatrix)) {
+		if (engine != null && engine.onRenderTranslucentTerrain(levelRenderState.cameraRenderState, modelViewMatrix, this.submitNodeStorage)) {
 			return;
 		}
 

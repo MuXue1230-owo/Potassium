@@ -101,6 +101,10 @@ public final class MemoryManager {
 		return this.usedSlots.size();
 	}
 
+	public int freeSlotsCount() {
+		return this.freeSlots.size();
+	}
+
 	public long usedBytes() {
 		return this.bytesPerChunk * this.usedSlots.size();
 	}

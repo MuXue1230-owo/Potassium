@@ -378,7 +378,10 @@ public final class WorldDataBuffer implements AutoCloseable {
 		}
 
 		try {
-			return new PersistentBuffer(GL43C.GL_SHADER_STORAGE_BUFFER, pageCapacityBytes, true, 1);
+			// 世界数据页面使用 2 段（而非默认 3 段）：
+			// 上传发生在 beginFrame() 期间，GPU 在 endFrame() 后才读取，
+			// 2 段足够避免 CPU-GPU 竞争，同时减少 33% 的 GPU 内存占用
+			return new PersistentBuffer(GL43C.GL_SHADER_STORAGE_BUFFER, pageCapacityBytes, true, 2);
 		} catch (RuntimeException persistentFailure) {
 			if (!this.warnedAboutPersistentPageFallback) {
 				PotassiumLogger.logger().warn(

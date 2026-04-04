@@ -36,6 +36,7 @@ public final class PotassiumEngine implements ClientModInitializer {
 	private ChunkPos lastBootstrapCenterChunk;
 	private boolean pendingBlockMaterialUpload;
 	private boolean runtimeReady;
+	private boolean initialChunksDrained;
 
 	public PotassiumEngine() {
 		instance = this;
@@ -67,11 +68,25 @@ public final class PotassiumEngine implements ClientModInitializer {
 			this.chunkManager.clear();
 			this.worldChangeTracker.clear();
 			this.lastBootstrapCenterChunk = null;
+			this.initialChunksDrained = false;
 			this.renderPipeline.setLevel(this.activeLevel);
 
 			this.refreshBootstrapWindow(client);
 
 			PotassiumLogger.logger().info("World context changed; cleared resident chunk and change tracking state.");
+		}
+
+		// During initial GPU mesh generation, do NOT drain more chunk loads.
+		// The loading screen will block until GPU work is done, and we don't
+		// want VRAM to explode from the load queue filling up during that time.
+		if (this.renderPipeline.isInitialMeshGenerationPending()) {
+			// Still refresh bootstrap and flush materials/changes, but skip chunk loading
+			this.refreshBootstrapWindow(client);
+			if (this.pendingBlockMaterialUpload) {
+				this.renderPipeline.updateBlockMaterialTable(this.blockMaterialTable);
+				this.pendingBlockMaterialUpload = false;
+			}
+			return;
 		}
 
 		this.refreshBootstrapWindow(client);
@@ -82,6 +97,62 @@ public final class PotassiumEngine implements ClientModInitializer {
 		}
 		this.renderPipeline.flushPendingChanges(this.worldChangeTracker.drainChanges());
 		this.worldChangeTracker.advanceTick();
+	}
+
+	/**
+	 * Called by LevelLoadTrackerMixin during the loading screen.
+	 * Drains all pending chunk loads (bypassing per-tick limit) once,
+	 * records the target chunk count, then dispatches GPU mesh generation
+	 * for the currently loaded chunks.
+	 */
+	public void drainInitialChunksAndBlockForGpu() {
+		if (this.activeLevel == null || this.renderPipeline == null) {
+			return;
+		}
+
+		// Only drain once — the target count is fixed at first call
+		if (!this.initialChunksDrained) {
+			this.initialChunksDrained = true;
+
+			// Drain all pending chunk loads at once (no per-tick limit)
+			int drained = 0;
+			while (this.chunkLoader.loadQueueSize() > 0) {
+				this.chunkLoader.drainQueues(this.activeLevel, this.renderPipeline, this.worldChangeTracker.tickIndex());
+				drained++;
+			}
+
+			int residentCount = this.chunkManager.size();
+			this.renderPipeline.setTargetInitialChunkCount(residentCount);
+
+			if (drained > 0) {
+				PotassiumLogger.logger().info(
+					"Drained {} initial chunk load batches, targetInitialChunks={}.",
+					drained, residentCount
+				);
+			}
+		}
+
+		// Dispatch dirty slots + wait GPU fence (non-blocking, returns when fence signals)
+		this.renderPipeline.blockUntilInitialMeshGenerationComplete();
+	}
+
+	/**
+	 * Returns true if GPU mesh generation for the initial world load is still pending.
+	 * Used by LevelLoadTrackerMixin to delay loading screen closure.
+	 */
+	public boolean isInitialMeshGenerationPending() {
+		return this.renderPipeline != null && this.renderPipeline.isInitialMeshGenerationPending();
+	}
+
+	/**
+	 * Returns the progress of initial GPU mesh generation (0.0 to 1.0).
+	 * Used by LevelLoadingScreenMixin to display GPU loading progress.
+	 */
+	public float getInitialMeshGenerationProgress() {
+		if (this.renderPipeline == null) {
+			return 1.0f;
+		}
+		return this.renderPipeline.getInitialMeshGenerationProgress();
 	}
 
 	public void onRenderLevelStart() {

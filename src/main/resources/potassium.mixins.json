@@ -8,7 +8,9 @@
 		"ChunkLifecycleMixin",
 		"BlockChangeMixin",
 		"WorldRenderMixin",
-		"MinecraftClientMixin"
+		"MinecraftClientMixin",
+		"LevelLoadTrackerMixin",
+		"LevelLoadingScreenMixin"
 	],
 	"injectors": {
 		"defaultRequire": 1

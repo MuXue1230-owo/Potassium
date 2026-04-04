@@ -8,7 +8,7 @@ import net.minecraft.client.renderer.block.BlockStateModelSet;
 import net.minecraft.client.renderer.block.dispatch.BlockStateModel;
 import net.minecraft.client.renderer.block.dispatch.BlockStateModelPart;
 import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
-import net.minecraft.client.renderer.texture.TextureAtlas;
+import net.minecraft.data.AtlasIds;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 import net.minecraft.client.resources.model.ModelManager;
 import net.minecraft.client.resources.model.geometry.BakedQuad;
@@ -76,9 +76,10 @@ public final class BlockMaterialTable {
 		try {
 			stateModels = modelManager.getBlockStateModelSet();
 		} catch (RuntimeException exception) {
-			PotassiumLogger.logger().debug(
+			PotassiumLogger.logger().warn(
 				"Skipping block material table rebuild because block models are not ready yet: {}",
-				exception.getMessage()
+				exception.getMessage(),
+				exception
 			);
 			return empty();
 		}
@@ -90,12 +91,13 @@ public final class BlockMaterialTable {
 		TextureAtlasSprite missingSprite;
 		try {
 			missingSprite = minecraft.getAtlasManager()
-				.getAtlasOrThrow(TextureAtlas.LOCATION_BLOCKS)
+				.getAtlasOrThrow(AtlasIds.BLOCKS)
 				.missingSprite();
 		} catch (RuntimeException exception) {
-			PotassiumLogger.logger().debug(
+			PotassiumLogger.logger().warn(
 				"Skipping block material table rebuild because the block atlas is not ready yet: {}",
-				exception.getMessage()
+				exception.getMessage(),
+				exception
 			);
 			return empty();
 		}

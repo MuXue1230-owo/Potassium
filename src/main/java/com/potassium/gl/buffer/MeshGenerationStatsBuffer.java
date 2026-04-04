@@ -25,6 +25,13 @@ public final class MeshGenerationStatsBuffer implements AutoCloseable {
 		GL30C.glBindBufferBase(GL43C.GL_SHADER_STORAGE_BUFFER, binding, this.handle);
 	}
 
+	public void clear() {
+		this.readbackBuffer.clear();
+		this.readbackBuffer.putInt(0).putInt(0).putInt(0).putInt(0);
+		this.readbackBuffer.flip();
+		GL45C.glNamedBufferSubData(this.handle, 0L, this.readbackBuffer);
+	}
+
 	public Stats read() {
 		ByteBuffer readback = this.readbackBuffer.duplicate().order(ByteOrder.nativeOrder());
 		readback.clear();

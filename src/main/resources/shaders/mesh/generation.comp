@@ -38,22 +38,22 @@ struct PotassiumMeshGenerationJob {
     int neighborPosZResidentSlot;
 };
 
-layout(std430, binding = 5) buffer PotassiumResidentChunkStateBuffer {
+layout(std430, binding = 9) buffer PotassiumResidentChunkStateBuffer {
     int residentChunkState[];
 } potassium_resident_chunk_state;
 
-layout(std430, binding = 6) buffer PotassiumMeshGenerationStatsBuffer {
+layout(std430, binding = 10) buffer PotassiumMeshGenerationStatsBuffer {
     uint processedJobs;
     uint generatedVertices;
     uint clippedJobs;
     uint lastSampledPackedBlock;
 } potassium_mesh_generation_stats;
 
-layout(std430, binding = 7) buffer PotassiumGeneratedMeshMetadataBuffer {
+layout(std430, binding = 11) buffer PotassiumGeneratedMeshMetadataBuffer {
     int meshMetadata[];
 } potassium_mesh_metadata;
 
-layout(std430, binding = 8) buffer PotassiumGeneratedMeshVertexBuffer {
+layout(std430, binding = 12) buffer PotassiumGeneratedMeshVertexBuffer {
     int generatedVertexWords[];
 } potassium_mesh_vertices;
 

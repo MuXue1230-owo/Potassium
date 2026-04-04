@@ -41,6 +41,7 @@ import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.List;
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.DynamicUniforms;
 import net.minecraft.client.renderer.SubmitNodeStorage;
@@ -66,6 +67,7 @@ import org.lwjgl.opengl.GL11C;
 import org.lwjgl.opengl.GL14C;
 import org.lwjgl.opengl.GL20C;
 import org.lwjgl.opengl.GL30C;
+import org.lwjgl.opengl.GL32C;
 import org.lwjgl.opengl.GL40C;
 import org.lwjgl.opengl.GL45C;
 import org.lwjgl.opengl.GL46C;
@@ -109,7 +111,9 @@ public final class RenderPipeline implements AutoCloseable {
 	private static final int DEPTH_COPY_LOCAL_SIZE_X = 8;
 	private static final int DEPTH_COPY_LOCAL_SIZE_Y = 8;
 	private static final int MESH_GENERATION_LOCAL_SIZE_X = 64;
-	private static final int MESH_GENERATION_REQUIRED_SSBO_BINDINGS = MATERIAL_TABLE_BINDING + 1;
+	// Material table binding for mesh generation — matches binding = 13 in material_table.glsl
+	private static final int MESH_MATERIAL_TABLE_BINDING = 13;
+	private static final int MESH_GENERATION_REQUIRED_SSBO_BINDINGS = MESH_MATERIAL_TABLE_BINDING + 1;
 	private static final int FRUSTUM_CULLING_REQUIRED_SSBO_BINDINGS = DRAW_COMMAND_COUNT_BINDING + 1;
 	private static final int APPLY_CHANGES_REQUIRED_SSBO_BINDINGS = CHANGE_QUEUE_BINDING + 1;
 
@@ -119,7 +123,9 @@ public final class RenderPipeline implements AutoCloseable {
 	private final FrustumCuller frustumCuller;
 	private final OcclusionCuller occlusionCuller;
 	private final MemoryManager memoryManager = new MemoryManager();
+	private final IntOpenHashSet dirtyMeshSlots = new IntOpenHashSet();
 	private final HashMap<Integer, TerrainSubmissionCacheEntry> opaqueTerrainSubmissionCache = new HashMap<>();
+	private int[] lastCpuMetadataSnapshot; // CPU snapshot of mesh metadata, updated when mesh generation fence signals
 	private final HashMap<Integer, BridgeMeshCacheEntry> bridgeMeshCache = new HashMap<>();
 	private final HashMap<Integer, BridgeMeshCacheEntry> bridgeTranslucentMeshCache = new HashMap<>();
 	private final HashMap<Integer, BridgeMaterial> bridgeMaterialCache = new HashMap<>();
@@ -159,6 +165,7 @@ public final class RenderPipeline implements AutoCloseable {
 	private int lastMeshGenerationGeneratedVertices;
 	private int lastMeshGenerationClippedJobs;
 	private int lastMeshGenerationSampledPackedBlock;
+	private long meshGenerationSync = 0; // GL sync object handle for mesh generation fence
 	private int worldDataBufferFullFailures;
 	private int worldDataBufferExpansionFailures;
 	private int worldDataEvictions;
@@ -168,9 +175,14 @@ public final class RenderPipeline implements AutoCloseable {
 	private int lastVisibleTranslucentMeshChunks;
 	private int pendingGpuChangeCount;
 	private boolean terrainMeshReady;
-	private boolean forceCpuTerrainDrawThisFrame;
-	private boolean loggedCustomGeometryTerrainDraw;
+	private boolean pendingInitialMeshGeneration = true;
+	private int dispatchedSlotCount;
+	private int targetInitialChunkCount;
+	private boolean initialMeshGpuDone;
+	private int lastCheckedResidentCount;
 	private boolean loggedExperimentalTerrainReplacementDisabled;
+	private boolean loggedTerrainSubmissionFailure;
+	private boolean loggedTerrainSubmissionCount;
 	private boolean loggedBridgeMaterialFallback;
 	private boolean loggedVertexConsumerProbe;
 	private boolean loggedVertexConsumerTerrainBridge;
@@ -369,7 +381,6 @@ public final class RenderPipeline implements AutoCloseable {
 		if (this.drawCommandCountBuffer != null) {
 			this.drawCommandCountBuffer.beginFrame();
 		}
-		this.forceCpuTerrainDrawThisFrame = false;
 		if (this.residentChunkStateBuffer != null) {
 			this.residentChunkStateBuffer.beginFrame();
 			this.resetGpuFrameStateBuffers();
@@ -563,15 +574,21 @@ public final class RenderPipeline implements AutoCloseable {
 		this.lastVisibleTranslucentMeshChunks = 0;
 		this.pendingGpuChangeCount = 0;
 		this.terrainMeshReady = false;
+		this.pendingInitialMeshGeneration = true;
+		this.dispatchedSlotCount = 0;
+		this.targetInitialChunkCount = 0;
+		this.initialMeshGpuDone = false;
 		this.worldDataBufferFullFailures = 0;
 		this.worldDataBufferExpansionFailures = 0;
 		this.worldDataEvictions = 0;
 		this.pendingGpuWorldChanges.clear();
 		this.opaqueTerrainSubmissionCache.clear();
+		this.lastCpuMetadataSnapshot = null;
 		this.bridgeMeshCache.clear();
 		this.bridgeTranslucentMeshCache.clear();
 		this.bridgeMaterialCache.clear();
 		this.loggedExperimentalTerrainReplacementDisabled = false;
+		this.loggedTerrainSubmissionCount = false;
 		this.loggedVertexConsumerTerrainBridge = false;
 		this.loggedVertexConsumerTranslucentTerrainBridge = false;
 		this.loggedBridgeMaterialFallback = false;
@@ -635,9 +652,11 @@ public final class RenderPipeline implements AutoCloseable {
 		this.lastUploadedWorldBytes = snapshot.byteSize();
 		chunkData.markResident(residentSlot, this.worldDataBuffer.chunkOffsetBytes(residentSlot), tickIndex);
 		this.clearMeshSlot(residentSlot);
+		this.dirtyMeshSlots.add(residentSlot);
 		this.syncResidentChunkNeighborhood(snapshot.chunkPos(), true);
 		this.worldDataBufferFullFailures = 0;
 		this.worldDataBufferExpansionFailures = 0;
+
 		return true;
 	}
 
@@ -650,6 +669,7 @@ public final class RenderPipeline implements AutoCloseable {
 		int residentSlot = chunkData.residentSlot();
 		this.purgePendingGpuChangesForSlot(residentSlot);
 		this.clearMeshSlot(residentSlot);
+		this.dirtyMeshSlots.remove(residentSlot);
 		if (this.residentChunkStateBuffer != null) {
 			this.residentChunkStateBuffer.clearSlot(residentSlot);
 		}
@@ -688,16 +708,6 @@ public final class RenderPipeline implements AutoCloseable {
 		}
 	}
 
-	public void renderDebugMeshes(CameraRenderState cameraState, Matrix4fc modelViewMatrixState) {
-		CameraFrameState cameraFrameState = this.captureCameraFrameState(cameraState);
-		if (cameraFrameState == null) {
-			return;
-		}
-
-		this.renderOpaqueTerrainNow(cameraFrameState);
-		this.renderTranslucentTerrainNow(cameraFrameState);
-	}
-
 	public boolean renderOpaqueTerrain(
 		CameraRenderState cameraState,
 		Matrix4fc modelViewMatrix,
@@ -719,13 +729,27 @@ public final class RenderPipeline implements AutoCloseable {
 		}
 
 		if (!this.canBuildMinecraftTerrainSubmission()) {
+			this.logTerrainSubmissionFailureOnce();
 			return false;
 		}
 
 		try {
 			ChunkSectionsToRender potassiumTerrain = this.buildOpaqueChunkSectionsToRender(modelViewMatrix, vanillaChunkSectionsToRender.textureView());
 			if (potassiumTerrain == null) {
+				PotassiumLogger.logger().warn("Falling back to vanilla opaque terrain because buildOpaqueChunkSectionsToRender returned null.");
 				return false;
+			}
+
+			if (!this.loggedTerrainSubmissionCount) {
+				PotassiumLogger.logger().info(
+					"[Potassium GPU render] residentChunks={}, terrainMeshReady={}, renderedChunks={}, lastProcessedJobs={}, lastGeneratedVerts={}",
+					this.memoryManager.residentChunks(),
+					this.terrainMeshReady,
+					this.lastVisibleOpaqueMeshChunks,
+					this.lastMeshGenerationProcessedJobs,
+					this.lastMeshGenerationGeneratedVertices
+				);
+				this.loggedTerrainSubmissionCount = true;
 			}
 
 			potassiumTerrain.renderGroup(chunkSectionLayerGroup, gpuSampler);
@@ -995,25 +1019,37 @@ public final class RenderPipeline implements AutoCloseable {
 
 	private TerrainSubmissionCacheEntry resolveTerrainSubmissionEntry(ChunkData chunkData, int vertexCountOffset, int firstVertexOffset) {
 		int residentSlot = chunkData.residentSlot();
-		if (residentSlot < 0 || this.residentChunkStateBuffer == null || this.meshMetadataBuffer == null) {
+		if (residentSlot < 0) {
+			return null;
+		}
+		if (this.lastCpuMetadataSnapshot == null) {
+			return null;
+		}
+		if (this.meshMetadataBuffer == null) {
 			return null;
 		}
 
-		int expectedMeshRevision = this.residentChunkStateBuffer.meshRevision(residentSlot);
+		int slotMeshRevision = this.residentChunkStateBuffer.meshRevision(residentSlot);
 		int cacheKey = (residentSlot << 4) | vertexCountOffset;
 		TerrainSubmissionCacheEntry cachedEntry = this.opaqueTerrainSubmissionCache.get(cacheKey);
-		if (cachedEntry != null && cachedEntry.meshRevision() == expectedMeshRevision && cachedEntry.vertexCountOffset() == vertexCountOffset) {
+		if (cachedEntry != null && cachedEntry.meshRevision() == slotMeshRevision && cachedEntry.vertexCountOffset() == vertexCountOffset) {
 			return cachedEntry.vertexCount() > 0 ? cachedEntry : null;
 		}
 
-		int[] metadataEntry = this.meshMetadataBuffer.readEntry(residentSlot);
-		int vertexCount = Math.max(metadataEntry[vertexCountOffset], 0);
+		// Read from CPU snapshot (no GPU readback)
+		int metadataOffset = residentSlot * MeshMetadataBuffer.INTS_PER_ENTRY;
+		if (metadataOffset + MeshMetadataBuffer.INTS_PER_ENTRY > this.lastCpuMetadataSnapshot.length) {
+			return null;
+		}
+
+		int vertexCount = Math.max(this.lastCpuMetadataSnapshot[metadataOffset + vertexCountOffset], 0);
 		vertexCount -= vertexCount % MeshVertexBuffer.VERTICES_PER_FACE;
-		int firstVertex = Math.max(metadataEntry[firstVertexOffset], 0);
+		int firstVertex = Math.max(this.lastCpuMetadataSnapshot[metadataOffset + firstVertexOffset], 0);
+		int metadataMeshRevision = this.lastCpuMetadataSnapshot[metadataOffset + MESH_METADATA_MESH_REVISION_OFFSET];
 		TerrainSubmissionCacheEntry refreshedEntry = new TerrainSubmissionCacheEntry(
 			firstVertex,
 			vertexCount,
-			expectedMeshRevision,
+			metadataMeshRevision,
 			vertexCountOffset
 		);
 		if (vertexCount > 0) {
@@ -1044,76 +1080,12 @@ public final class RenderPipeline implements AutoCloseable {
 	}
 
 	private boolean submitVertexConsumerTerrainBridge(SubmitNodeStorage submitNodeStorage, CameraFrameState cameraFrameState) {
-		// 暂时禁用桥接渲染：
-		// 1. Minecraft 26.1 的模型系统已完全重构，无法获取纹理
-		// 2. 桥接渲染是 CPU fallback 路径，与架构原则不符
-		// 3. 应尽快启用 GPU 渲染路径 (ENABLE_GPU_TERRAIN_SUBMISSION = true)
+		// 桥接路径已废弃：Minecraft 26.1 的模型系统已完全重构，且 CPU fallback 路径与架构原则不符
 		return false;
-		
-		/* 原代码保留以供参考
-		if (!this.canRenderTerrainPass() || this.meshVertexBuffer == null) {
-			return false;
-		}
-
-		ArrayList<BridgeChunkDraw> visibleDraws = this.collectVisibleBridgeDraws(
-			cameraFrameState,
-			this.bridgeMeshCache,
-			MESH_METADATA_OPAQUE_VERTEX_COUNT_OFFSET,
-			MESH_METADATA_OPAQUE_FIRST_VERTEX_OFFSET,
-			false
-		);
-		if (visibleDraws.isEmpty()) {
-			return false;
-		}
-
-		if (!this.loggedVertexConsumerTerrainBridge) {
-			PotassiumLogger.logger().info("Potassium terrain bridge is replacing vanilla opaque terrain with cached opaque mesh faces.");
-			this.loggedVertexConsumerTerrainBridge = true;
-		}
-
-		PoseStack poseStack = new PoseStack();
-		submitNodeStorage.submitCustomGeometry(
-			poseStack,
-			RenderTypes.solidMovingBlock(),
-			(pose, vertexConsumer) -> this.emitVertexConsumerTerrainBridge(pose, vertexConsumer, cameraFrameState, visibleDraws, false)
-		);
-		return true;
-		*/
 	}
 
 	private boolean submitVertexConsumerTranslucentTerrainBridge(SubmitNodeStorage submitNodeStorage, CameraFrameState cameraFrameState) {
-		// 暂时禁用桥接渲染（原因同不透明桥接）
 		return false;
-		
-		/* 原代码保留以供参考
-		if (!this.canRenderTerrainPass() || this.meshVertexBuffer == null) {
-			return false;
-		}
-
-		ArrayList<BridgeChunkDraw> visibleDraws = this.collectVisibleBridgeDraws(
-			cameraFrameState,
-			this.bridgeTranslucentMeshCache,
-			MESH_METADATA_TRANSLUCENT_VERTEX_COUNT_OFFSET,
-			MESH_METADATA_TRANSLUCENT_FIRST_VERTEX_OFFSET,
-			true
-		);
-		if (visibleDraws.isEmpty()) {
-			return false;
-		}
-
-		if (!this.loggedVertexConsumerTranslucentTerrainBridge) {
-			PotassiumLogger.logger().info("Potassium terrain bridge is replacing vanilla translucent terrain with cached translucent mesh faces.");
-			this.loggedVertexConsumerTranslucentTerrainBridge = true;
-		}
-
-		PoseStack poseStack = new PoseStack();
-		submitNodeStorage.submitCustomGeometry(
-			poseStack,
-			RenderTypes.translucentMovingBlock(),
-			(pose, vertexConsumer) -> this.emitVertexConsumerTerrainBridge(pose, vertexConsumer, cameraFrameState, visibleDraws, true)
-		);
-		return true;
-		*/
 	}
 
 	private void submitVertexConsumerProbe(SubmitNodeStorage submitNodeStorage, CameraFrameState cameraFrameState) {
@@ -1592,6 +1564,28 @@ public final class RenderPipeline implements AutoCloseable {
 		this.loggedExperimentalTerrainReplacementDisabled = true;
 	}
 
+	private void logTerrainSubmissionFailureOnce() {
+		if (this.loggedTerrainSubmissionFailure) {
+			return;
+		}
+
+		PotassiumLogger.logger().warn(
+			"Falling back to vanilla opaque terrain because canBuildMinecraftTerrainSubmission() returned false. " +
+			"initialized={}, worldDataConfigured={}, materialTable={}, materialTableEmpty={}, meshMetadata={}, " +
+			"meshVertex={}, meshVertexBuffer={}, residentChunks={}, terrainMeshReady={}",
+			this.initialized,
+			this.worldDataBuffer != null && this.worldDataBuffer.isConfigured(),
+			this.materialTableBuffer != null && this.blockMaterialTable != null,
+			this.blockMaterialTable == null || this.blockMaterialTable.isEmpty(),
+			this.meshMetadataBuffer != null,
+			this.meshVertexBuffer != null,
+			this.meshVertexBuffer != null && this.meshVertexBuffer.gpuBuffer() != null,
+			this.memoryManager != null && this.memoryManager.residentChunks() > 0,
+			this.terrainMeshReady
+		);
+		this.loggedTerrainSubmissionFailure = true;
+	}
+
 	private BridgeMeshCacheEntry resolveBridgeMeshCacheEntry(
 		HashMap<Integer, BridgeMeshCacheEntry> cache,
 		int residentSlot,
@@ -1662,200 +1656,6 @@ public final class RenderPipeline implements AutoCloseable {
 		return 176;
 	}
 
-	private void renderOpaqueTerrainNow(CameraFrameState cameraFrameState) {
-		if (!this.canRenderTerrainPass() || cameraFrameState == null) {
-			if (!this.canRenderTerrainPass()) {
-				PotassiumLogger.logger().warn("renderOpaqueTerrainNow: canRenderTerrainPass() returned false. initialized={}, worldDataConfigured={}, meshMetadata={}, meshVertex={}, chunkProgram={}, debugMeshVA={}, residentChunks={}, terrainMeshReady={}",
-					this.initialized,
-					this.worldDataBuffer != null && this.worldDataBuffer.isConfigured(),
-					this.meshMetadataBuffer != null,
-					this.meshVertexBuffer != null,
-					this.chunkProgram != null,
-					this.debugMeshVertexArray != 0,
-					this.memoryManager != null ? this.memoryManager.residentChunks() : -1,
-					this.terrainMeshReady);
-			}
-			return;
-		}
-
-		if (!this.loggedCustomGeometryTerrainDraw) {
-			PotassiumLogger.logger().info("Potassium terrain draw is executing through SubmitNodeStorage custom geometry.");
-			this.loggedCustomGeometryTerrainDraw = true;
-		}
-
-		PotassiumLogger.logger().info("renderOpaqueTerrainNow: ENABLE_GPU_TERRAIN_SUBMISSION={}, hasGpuDrivenDrawPath={}",
-			ENABLE_GPU_TERRAIN_SUBMISSION, this.hasGpuDrivenDrawPath());
-
-		if (ENABLE_SCREEN_PROBE) {
-			this.drawTerrainScreenProbe();
-		}
-
-		this.lastRenderedMeshChunks = 0;
-		this.lastRenderedMeshVertices = 0;
-		this.lastVisibleOpaqueMeshChunks = 0;
-		this.lastVisibleTranslucentMeshChunks = 0;
-
-		Matrix4f modelViewMatrix = new Matrix4f(cameraFrameState.modelViewMatrix());
-		Matrix4f projectionMatrix = new Matrix4f(cameraFrameState.projectionMatrix());
-		this.bindMeshDrawState();
-		this.useChunkProgram(this.chunkProgram, this.chunkModelViewUniform, this.chunkProjectionUniform, modelViewMatrix, projectionMatrix);
-
-		if (ENABLE_GPU_TERRAIN_SUBMISSION && this.hasGpuDrivenDrawPath()) {
-			SceneFramebufferState sceneFramebufferState = this.captureSceneFramebufferState();
-			this.resetGpuFrameStateBuffers();
-			int commandCount = this.dispatchGpuDrivenVisibilityCulling(
-				sceneFramebufferState.drawFramebuffer(),
-				sceneFramebufferState.viewportX(),
-				sceneFramebufferState.viewportY(),
-				sceneFramebufferState.viewportWidth(),
-				sceneFramebufferState.viewportHeight(),
-				projectionMatrix,
-				modelViewMatrix
-			);
-			PotassiumLogger.logger().info("GPU culling completed. commandCount={}", commandCount);
-			DrawCommandCountBuffer.Counts counts = this.drawCommandCountBuffer != null ? this.drawCommandCountBuffer.read() : null;
-			if (counts != null) {
-				PotassiumLogger.logger().info("Draw command counts: opaque={}, translucent={}", counts.opaqueCount(), counts.translucentCount());
-			}
-			if (counts != null && counts.opaqueCount() <= 0 && this.terrainMeshReady) {
-				this.forceCpuTerrainDrawThisFrame = true;
-				PotassiumLogger.logger().warn("GPU generated 0 opaque commands, falling back to CPU draw.");
-				this.useChunkProgram(this.chunkProgram, this.chunkModelViewUniform, this.chunkProjectionUniform, modelViewMatrix, projectionMatrix);
-				IntBuffer metadata = this.meshMetadataBuffer.readEntries();
-				this.drawOpaqueMetadataFallback(metadata, false);
-				this.finishMeshDrawState();
-				return;
-			}
-			GL11C.glDisable(GL11C.GL_BLEND);
-			GL11C.glEnable(GL11C.GL_DEPTH_TEST);
-			GL11C.glDepthMask(true);
-			GL11C.glDisable(GL11C.GL_CULL_FACE);
-			PotassiumLogger.logger().info("Drawing GPU opaque meshes. commandCount={}", commandCount);
-			this.drawGpuDrivenOpaqueMeshes(commandCount);
-			this.lastVisibleOpaqueMeshChunks = -1;
-			this.lastVisibleTranslucentMeshChunks = -1;
-			this.lastRenderedMeshChunks = -1;
-			this.lastRenderedMeshVertices = -1;
-		} else {
-			PotassiumLogger.logger().warn("GPU terrain submission disabled or path unavailable. ENABLE_GPU_TERRAIN_SUBMISSION={}, hasGpuDrivenDrawPath={}",
-				ENABLE_GPU_TERRAIN_SUBMISSION, this.hasGpuDrivenDrawPath());
-			IntBuffer metadata = this.meshMetadataBuffer.readEntries();
-			if (metadata.remaining() < this.meshMetadataBuffer.capacityEntries() * MeshMetadataBuffer.INTS_PER_ENTRY) {
-				this.finishMeshDrawState();
-				return;
-			}
-
-			this.populateOpaqueDraws(metadata, false);
-
-			GL11C.glDisable(GL11C.GL_BLEND);
-			GL11C.glEnable(GL11C.GL_DEPTH_TEST);
-			GL11C.glDepthMask(true);
-			GL11C.glDisable(GL11C.GL_CULL_FACE);
-			this.drawOpaqueDebugMeshes();
-		}
-
-		this.finishMeshDrawState();
-	}
-
-	private void drawTerrainScreenProbe() {
-		if (this.terrainProbeProgram == null || this.oitCompositeVertexArray == 0) {
-			return;
-		}
-
-		GL30C.glBindVertexArray(this.oitCompositeVertexArray);
-		GL20C.glUseProgram(this.terrainProbeProgram.handle());
-		GL11C.glDisable(GL11C.GL_DEPTH_TEST);
-		GL11C.glDepthMask(false);
-		GL11C.glDisable(GL11C.GL_CULL_FACE);
-		GL11C.glDisable(GL11C.GL_BLEND);
-		GL11C.glDrawArrays(GL11C.GL_TRIANGLES, 0, 3);
-		GL20C.glUseProgram(0);
-		GL30C.glBindVertexArray(0);
-	}
-
-	private void renderTranslucentTerrainNow(CameraFrameState cameraFrameState) {
-		if (!this.canRenderTerrainPass() || cameraFrameState == null) {
-			return;
-		}
-
-		Matrix4f modelViewMatrix = new Matrix4f(cameraFrameState.modelViewMatrix());
-		Matrix4f projectionMatrix = new Matrix4f(cameraFrameState.projectionMatrix());
-		this.bindMeshDrawState();
-
-		if (this.forceCpuTerrainDrawThisFrame) {
-			this.useChunkProgram(this.chunkProgram, this.chunkModelViewUniform, this.chunkProjectionUniform, modelViewMatrix, projectionMatrix);
-			IntBuffer metadata = this.meshMetadataBuffer.readEntries();
-			if (metadata.remaining() >= this.meshMetadataBuffer.capacityEntries() * MeshMetadataBuffer.INTS_PER_ENTRY) {
-				this.drawTranslucentMetadataFallback(metadata, cameraFrameState, false);
-			}
-			this.finishMeshDrawState();
-			return;
-		}
-
-		if (ENABLE_GPU_TERRAIN_SUBMISSION && this.hasGpuDrivenDrawPath()) {
-			SceneFramebufferState sceneFramebufferState = this.captureSceneFramebufferState();
-			this.resetGpuFrameStateBuffers();
-			int commandCount = this.dispatchGpuDrivenVisibilityCulling(
-				sceneFramebufferState.drawFramebuffer(),
-				sceneFramebufferState.viewportX(),
-				sceneFramebufferState.viewportY(),
-				sceneFramebufferState.viewportWidth(),
-				sceneFramebufferState.viewportHeight(),
-				projectionMatrix,
-				modelViewMatrix
-			);
-			DrawCommandCountBuffer.Counts counts = this.drawCommandCountBuffer != null ? this.drawCommandCountBuffer.read() : null;
-			if (counts != null && counts.translucentCount() <= 0 && this.terrainMeshReady) {
-				this.useChunkProgram(this.chunkProgram, this.chunkModelViewUniform, this.chunkProjectionUniform, modelViewMatrix, projectionMatrix);
-				IntBuffer metadata = this.meshMetadataBuffer.readEntries();
-				this.drawTranslucentMetadataFallback(metadata, cameraFrameState, false);
-				this.finishMeshDrawState();
-				return;
-			}
-			if (this.hasGpuDrivenTranslucentOitPath() && this.renderGpuDrivenTranslucentOit(
-				commandCount,
-				sceneFramebufferState.drawFramebuffer(),
-				sceneFramebufferState.viewportX(),
-				sceneFramebufferState.viewportY(),
-				sceneFramebufferState.viewportWidth(),
-				sceneFramebufferState.viewportHeight(),
-				modelViewMatrix,
-				projectionMatrix
-			)) {
-				// Translucent meshes were rendered through the OIT path.
-			} else {
-				this.useChunkProgram(this.chunkProgram, this.chunkModelViewUniform, this.chunkProjectionUniform, modelViewMatrix, projectionMatrix);
-				GL11C.glEnable(GL11C.GL_BLEND);
-				GL11C.glEnable(GL11C.GL_DEPTH_TEST);
-				GL11C.glBlendFunc(GL11C.GL_SRC_ALPHA, GL11C.GL_ONE_MINUS_SRC_ALPHA);
-				GL11C.glDepthMask(false);
-				GL11C.glDisable(GL11C.GL_CULL_FACE);
-				this.drawGpuDrivenTranslucentMeshes(commandCount);
-			}
-			this.lastVisibleOpaqueMeshChunks = -1;
-			this.lastVisibleTranslucentMeshChunks = -1;
-			this.lastRenderedMeshChunks = -1;
-			this.lastRenderedMeshVertices = -1;
-		} else {
-			this.useChunkProgram(this.chunkProgram, this.chunkModelViewUniform, this.chunkProjectionUniform, modelViewMatrix, projectionMatrix);
-			IntBuffer metadata = this.meshMetadataBuffer.readEntries();
-			if (metadata.remaining() < this.meshMetadataBuffer.capacityEntries() * MeshMetadataBuffer.INTS_PER_ENTRY) {
-				this.finishMeshDrawState();
-				return;
-			}
-
-			ArrayList<TranslucentDraw> translucentDraws = this.collectTranslucentDraws(metadata, cameraFrameState, false);
-			GL11C.glEnable(GL11C.GL_BLEND);
-			GL11C.glEnable(GL11C.GL_DEPTH_TEST);
-			GL11C.glBlendFunc(GL11C.GL_SRC_ALPHA, GL11C.GL_ONE_MINUS_SRC_ALPHA);
-			GL11C.glDepthMask(false);
-			GL11C.glDisable(GL11C.GL_CULL_FACE);
-			this.drawTranslucentDebugMeshes(translucentDraws);
-		}
-
-		this.finishMeshDrawState();
-	}
-
 	public boolean canRenderTerrainPass() {
 		return this.initialized
 			&& this.worldDataBuffer != null
@@ -1875,7 +1675,7 @@ public final class RenderPipeline implements AutoCloseable {
 		GL30C.glBindVertexArray(this.debugMeshVertexArray);
 		this.meshVertexBuffer.bindArrayBuffer();
 		if (this.materialTableBuffer != null) {
-			this.materialTableBuffer.bind(MATERIAL_TABLE_BINDING);
+			this.materialTableBuffer.bind(MESH_MATERIAL_TABLE_BINDING);
 		}
 		GL30C.glEnableVertexAttribArray(0);
 		GL30C.glVertexAttribIPointer(0, 4, GL11C.GL_INT, MeshVertexBuffer.BYTES_PER_VERTEX, 0L);
@@ -1943,6 +1743,10 @@ public final class RenderPipeline implements AutoCloseable {
 		closeQuietly(this.meshGenerationShader);
 		closeQuietly(this.applyChangesShader);
 		closeQuietly(this.meshGenerationStatsBuffer);
+		if (this.meshGenerationSync != 0) {
+			GL32C.glDeleteSync(this.meshGenerationSync);
+			this.meshGenerationSync = 0;
+		}
 		closeQuietly(this.residentChunkStateBuffer);
 		closeQuietly(this.changeQueueBuffer);
 		closeQuietly(this.drawCommandCountBuffer);
@@ -2009,12 +1813,18 @@ public final class RenderPipeline implements AutoCloseable {
 		this.pendingGpuWorldChanges.clear();
 		this.blockMaterialTable = BlockMaterialTable.empty();
 		this.opaqueTerrainSubmissionCache.clear();
+		this.lastCpuMetadataSnapshot = null;
 		this.bridgeMeshCache.clear();
 		this.bridgeTranslucentMeshCache.clear();
 		this.bridgeMaterialCache.clear();
 		this.terrainMeshReady = false;
-		this.loggedCustomGeometryTerrainDraw = false;
+		this.pendingInitialMeshGeneration = true;
+		this.dispatchedSlotCount = 0;
+		this.targetInitialChunkCount = 0;
+		this.initialMeshGpuDone = false;
 		this.loggedExperimentalTerrainReplacementDisabled = false;
+		this.loggedTerrainSubmissionCount = false;
+		this.loggedTerrainSubmissionFailure = false;
 		this.loggedBridgeMaterialFallback = false;
 		this.loggedVertexConsumerProbe = false;
 		this.loggedVertexConsumerTerrainBridge = false;
@@ -2109,7 +1919,12 @@ public final class RenderPipeline implements AutoCloseable {
 			return false;
 		}
 
-		int requestedBudgetMiB = Math.max(currentBudgetMiB * 2, currentBudgetMiB + WORLD_DATA_GROWTH_MIN_MIB);
+		// 渐进式增长：每次增加 50% 或至少 WORLD_DATA_GROWTH_MIN_MIB，避免
+		// 翻倍增长导致的内存峰值（*2 会从 1031 直接跳到 2063 MiB）
+		int requestedBudgetMiB = Math.max(
+			currentBudgetMiB + currentBudgetMiB / 2,
+			currentBudgetMiB + WORLD_DATA_GROWTH_MIN_MIB
+		);
 		requestedBudgetMiB = Math.min(requestedBudgetMiB, currentBudgetMiB + usableGrowthMiB);
 		requestedBudgetMiB = Math.min(requestedBudgetMiB, effectiveMaxMiB);
 		if (requestedBudgetMiB <= currentBudgetMiB) {
@@ -2210,6 +2025,10 @@ public final class RenderPipeline implements AutoCloseable {
 		this.lastMeshGenerationClippedJobs = 0;
 		this.lastMeshGenerationSampledPackedBlock = 0;
 
+		if (this.dirtyMeshSlots.isEmpty()) {
+			return;
+		}
+
 		int shaderVisibleChunkCapacity = this.worldDataBuffer.shaderVisibleChunkCapacity(WORLD_DATA_BINDING);
 		if (shaderVisibleChunkCapacity <= 0) {
 			return;
@@ -2217,15 +2036,18 @@ public final class RenderPipeline implements AutoCloseable {
 
 		int residentSlotCapacity = Math.max(this.residentChunkStateBuffer.capacityEntries(), 1);
 		this.lastMeshGenerationJobs = residentSlotCapacity;
-		this.lastMeshGenerationDirtyCandidates = this.memoryManager.residentChunks();
+		this.lastMeshGenerationDirtyCandidates = this.dirtyMeshSlots.size();
+
 		this.worldDataBuffer.bind(WORLD_DATA_BINDING);
 		this.residentChunkStateBuffer.bind(RESIDENT_CHUNK_STATE_BINDING);
-		this.meshGenerationStatsBuffer.bind(MESH_STATS_BINDING);
 		this.meshMetadataBuffer.bind(MESH_METADATA_BINDING);
 		this.meshVertexBuffer.bindStorage(MESH_VERTEX_BINDING);
 		if (this.materialTableBuffer != null) {
-			this.materialTableBuffer.bind(MATERIAL_TABLE_BINDING);
+			this.materialTableBuffer.bind(MESH_MATERIAL_TABLE_BINDING);
 		}
+
+		this.meshGenerationStatsBuffer.clear();
+		this.meshGenerationStatsBuffer.bind(MESH_STATS_BINDING);
 		this.meshGenerationShader.use();
 		if (this.meshFacesPerChunkUniform >= 0) {
 			GL30C.glUniform1ui(this.meshFacesPerChunkUniform, this.meshVertexBuffer.facesPerChunk());
@@ -2236,11 +2058,21 @@ public final class RenderPipeline implements AutoCloseable {
 
 		int groupCountX = (residentSlotCapacity + (MESH_GENERATION_LOCAL_SIZE_X - 1)) / MESH_GENERATION_LOCAL_SIZE_X;
 		GL43C.glDispatchCompute(groupCountX, 1, 1);
+
+		if (this.meshGenerationSync != 0) {
+			GL32C.glDeleteSync(this.meshGenerationSync);
+		}
+		this.meshGenerationSync = GL32C.glFenceSync(GL32C.GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+
 		GL43C.glMemoryBarrier(
 			GL43C.GL_SHADER_STORAGE_BARRIER_BIT
 				| GL43C.GL_BUFFER_UPDATE_BARRIER_BIT
 				| GL43C.GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT
 		);
+
+		this.dispatchedSlotCount += this.dirtyMeshSlots.size();
+		this.dirtyMeshSlots.clear();
+
 		this.lastMeshGenerationProcessedJobs = -1;
 		this.lastMeshGenerationGeneratedVertices = -1;
 		this.lastMeshGenerationClippedJobs = -1;
@@ -2248,34 +2080,171 @@ public final class RenderPipeline implements AutoCloseable {
 	}
 
 	private void refreshTerrainMeshReadiness() {
-		if (this.meshMetadataBuffer == null || this.memoryManager.residentChunks() <= 0) {
+		int residentChunks = this.memoryManager.residentChunks();
+		if (this.meshMetadataBuffer == null || residentChunks <= 0) {
 			this.terrainMeshReady = false;
+			return;
+		}
+
+		// Reset tracking when resident chunk count changes (new chunks loaded or evicted)
+		if (residentChunks != this.dispatchedSlotCount) {
+			this.terrainMeshReady = false;
+		}
+
+		// 非阻塞轮询 fence — GPU 未完成则跳过本次检查，下一帧重试
+		this.waitForMeshGenerationSync();
+		if (this.meshGenerationSync != 0) {
+			// fence 尚未完成，terrain mesh readiness 保持上一次状态
 			return;
 		}
 
 		IntBuffer metadata = this.meshMetadataBuffer.readEntries();
 		int entries = this.meshMetadataBuffer.capacityEntries();
+		int totalInts = entries * MeshMetadataBuffer.INTS_PER_ENTRY;
+
+		// Save CPU snapshot of metadata for use during rendering (avoids per-chunk GPU readbacks)
+		if (this.lastCpuMetadataSnapshot == null || this.lastCpuMetadataSnapshot.length < totalInts) {
+			this.lastCpuMetadataSnapshot = new int[totalInts];
+		}
+		metadata.get(this.lastCpuMetadataSnapshot, 0, totalInts);
+
 		boolean hasGeometry = false;
 		for (int entryIndex = 0; entryIndex < entries; entryIndex++) {
 			int metadataOffset = entryIndex * MeshMetadataBuffer.INTS_PER_ENTRY;
-			int opaqueVertexCount = metadata.get(metadataOffset + MESH_METADATA_OPAQUE_VERTEX_COUNT_OFFSET);
-			int cutoutVertexCount = metadata.get(metadataOffset + MESH_METADATA_CUTOUT_VERTEX_COUNT_OFFSET);
-			int translucentVertexCount = metadata.get(metadataOffset + MESH_METADATA_TRANSLUCENT_VERTEX_COUNT_OFFSET);
+			int opaqueVertexCount = this.lastCpuMetadataSnapshot[metadataOffset + MESH_METADATA_OPAQUE_VERTEX_COUNT_OFFSET];
+			int cutoutVertexCount = this.lastCpuMetadataSnapshot[metadataOffset + MESH_METADATA_CUTOUT_VERTEX_COUNT_OFFSET];
+			int translucentVertexCount = this.lastCpuMetadataSnapshot[metadataOffset + MESH_METADATA_TRANSLUCENT_VERTEX_COUNT_OFFSET];
 			if (opaqueVertexCount > 0 || cutoutVertexCount > 0 || translucentVertexCount > 0) {
 				hasGeometry = true;
 				break;
 			}
 		}
 
-		if (hasGeometry && !this.terrainMeshReady) {
+		if (hasGeometry && !this.terrainMeshReady && this.dispatchedSlotCount >= residentChunks) {
 			PotassiumLogger.logger().info(
 				"Potassium terrain mesh is ready. Resident chunks={}, meshCapacity={}, pages={}.",
-				this.memoryManager.residentChunks(),
+				residentChunks,
 				this.meshMetadataBuffer.capacityEntries(),
 				this.worldDataBuffer.pageCount()
 			);
 		}
-		this.terrainMeshReady = hasGeometry;
+
+		this.terrainMeshReady = hasGeometry && this.dispatchedSlotCount >= residentChunks;
+	}
+
+	private void waitForMeshGenerationSync() {
+		if (this.meshGenerationSync == 0) {
+			return;
+		}
+
+		// 非阻塞检查 GPU 是否已完成
+		int result = GL32C.glClientWaitSync(this.meshGenerationSync, 0, 0);
+		if (result == GL32C.GL_ALREADY_SIGNALED || result == GL32C.GL_CONDITION_SATISFIED) {
+			GL32C.glDeleteSync(this.meshGenerationSync);
+			this.meshGenerationSync = 0;
+		}
+		// 未完成时不阻塞，保留 fence 到下一帧继续轮询
+	}
+
+	/**
+	 * Records the target number of chunks that must be dispatched before
+	 * initial mesh generation is considered complete. Called once during
+	 * the initial chunk drain phase.
+	 */
+	public void setTargetInitialChunkCount(int count) {
+		this.targetInitialChunkCount = count;
+		this.pendingInitialMeshGeneration = count > 0;
+		this.initialMeshGpuDone = false;
+	}
+
+	/**
+	 * Dispatches dirty mesh slots and blocks with glFinish() until GPU
+	 * mesh generation completes. Updates CPU metadata snapshot.
+	 * Clears pendingInitialMeshGeneration once done, regardless of
+	 * whether any geometry was generated (empty chunks are valid).
+	 */
+	public void blockUntilInitialMeshGenerationComplete() {
+		if (this.meshGenerationShader == null || this.residentChunkStateBuffer == null
+			|| this.meshGenerationStatsBuffer == null || this.worldDataBuffer == null) {
+			this.pendingInitialMeshGeneration = false;
+			return;
+		}
+		if (this.initialMeshGpuDone || !this.pendingInitialMeshGeneration) {
+			return;
+		}
+
+		// Keep dispatching and waiting until all target chunks are processed
+		int maxIterations = 30;
+		for (int i = 0; i < maxIterations && this.dispatchedSlotCount < this.targetInitialChunkCount; i++) {
+			// Dispatch any currently dirty slots
+			this.dispatchDirtyMeshGeneration();
+
+			// Use glFinish() to truly block until all GPU work completes
+			GL11C.glFinish();
+			this.meshGenerationSync = 0;
+		}
+
+		// Read back metadata into CPU snapshot
+		if (this.meshMetadataBuffer != null) {
+			IntBuffer metadata = this.meshMetadataBuffer.readEntries();
+			int entries = this.meshMetadataBuffer.capacityEntries();
+			int totalInts = entries * MeshMetadataBuffer.INTS_PER_ENTRY;
+
+			if (this.lastCpuMetadataSnapshot == null || this.lastCpuMetadataSnapshot.length < totalInts) {
+				this.lastCpuMetadataSnapshot = new int[totalInts];
+			}
+			metadata.get(this.lastCpuMetadataSnapshot, 0, totalInts);
+		}
+
+		// Check if any chunk produced geometry (for terrainMeshReady)
+		boolean hasGeometry = false;
+		if (this.lastCpuMetadataSnapshot != null) {
+			for (int entryIndex = 0; entryIndex < this.targetInitialChunkCount; entryIndex++) {
+				int metadataOffset = entryIndex * MeshMetadataBuffer.INTS_PER_ENTRY;
+				if (metadataOffset + MESH_METADATA_TRANSLUCENT_VERTEX_COUNT_OFFSET >= this.lastCpuMetadataSnapshot.length) {
+					break;
+				}
+				int opaqueVC = this.lastCpuMetadataSnapshot[metadataOffset + MESH_METADATA_OPAQUE_VERTEX_COUNT_OFFSET];
+				int cutoutVC = this.lastCpuMetadataSnapshot[metadataOffset + MESH_METADATA_CUTOUT_VERTEX_COUNT_OFFSET];
+				int translucentVC = this.lastCpuMetadataSnapshot[metadataOffset + MESH_METADATA_TRANSLUCENT_VERTEX_COUNT_OFFSET];
+				if (opaqueVC > 0 || cutoutVC > 0 || translucentVC > 0) {
+					hasGeometry = true;
+					break;
+				}
+			}
+		}
+
+		this.initialMeshGpuDone = true;
+		this.pendingInitialMeshGeneration = false;
+
+		if (hasGeometry) {
+			this.terrainMeshReady = true;
+			PotassiumLogger.logger().info(
+				"Potassium initial mesh generation complete. Dispatched={}, resident={}.",
+				this.dispatchedSlotCount, this.memoryManager.residentChunks()
+			);
+		} else {
+			this.terrainMeshReady = false;
+			PotassiumLogger.logger().warn(
+				"Potassium initial mesh GPU done but no geometry found. Dispatched={}, resident={}. GPU rendering disabled.",
+				this.dispatchedSlotCount, this.memoryManager.residentChunks()
+			);
+		}
+	}
+
+	/**
+	 * Returns the progress of initial GPU mesh generation as a value between 0.0 and 1.0.
+	 * Used by the loading screen to display GPU mesh generation progress.
+	 */
+	public float getInitialMeshGenerationProgress() {
+		if (!this.pendingInitialMeshGeneration || this.targetInitialChunkCount <= 0) {
+			return 1.0f;
+		}
+		return Math.min(1.0f, (float) this.dispatchedSlotCount / (float) this.targetInitialChunkCount);
+	}
+
+	public boolean isInitialMeshGenerationPending() {
+		return this.pendingInitialMeshGeneration;
 	}
 
 	private boolean hasMeshGenerationBindingBudget() {
@@ -2657,7 +2626,9 @@ public final class RenderPipeline implements AutoCloseable {
 	private void markChunkMeshDirty(ChunkData chunkData, long tickIndex) {
 		chunkData.markDirty(tickIndex);
 		if (this.residentChunkStateBuffer != null && chunkData.isResident()) {
-			this.residentChunkStateBuffer.markDirty(chunkData.residentSlot());
+			int slot = chunkData.residentSlot();
+			this.residentChunkStateBuffer.markDirty(slot);
+			this.dirtyMeshSlots.add(slot);
 		}
 	}
 

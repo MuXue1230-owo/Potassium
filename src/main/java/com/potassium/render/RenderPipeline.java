@@ -8,6 +8,7 @@ import com.potassium.gl.buffer.DrawCommandCountBuffer;
 import com.potassium.gl.GLCapabilities;
 import com.potassium.gl.OitFramebuffer;
 import com.potassium.gl.buffer.IndirectCommandBuffer;
+import com.potassium.gl.buffer.MaterialTableBuffer;
 import com.potassium.gl.buffer.MeshGenerationStatsBuffer;
 import com.potassium.gl.buffer.MeshMetadataBuffer;
 import com.potassium.gl.buffer.MeshVertexBuffer;
@@ -16,27 +17,48 @@ import com.potassium.gl.buffer.VertexBuffer;
 import com.potassium.gl.buffer.WorldDataBuffer;
 import com.potassium.render.culling.FrustumCuller;
 import com.potassium.render.culling.OcclusionCuller;
+import com.potassium.render.material.BlockMaterialTable;
 import com.potassium.render.shader.ComputeShader;
 import com.potassium.render.shader.ShaderProgram;
 import com.potassium.world.ChunkManager;
 import com.potassium.world.MemoryManager;
 import com.potassium.world.WorldChangeTracker;
 import com.potassium.world.data.BlockData;
+import com.mojang.blaze3d.buffers.GpuBufferSlice;
+import com.mojang.blaze3d.systems.RenderPass;
+import com.mojang.blaze3d.systems.RenderSystem;
+import com.mojang.blaze3d.textures.GpuSampler;
+import com.mojang.blaze3d.textures.GpuTextureView;
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.List;
+import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.renderer.DynamicUniforms;
 import net.minecraft.client.renderer.SubmitNodeStorage;
+import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
+import net.minecraft.client.renderer.chunk.ChunkSectionLayerGroup;
+import net.minecraft.client.renderer.chunk.ChunkSectionsToRender;
 import net.minecraft.client.renderer.rendertype.RenderTypes;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
+import net.minecraft.client.renderer.texture.OverlayTexture;
+import net.minecraft.client.renderer.texture.TextureAtlasSprite;
+import net.minecraft.client.Minecraft;
+import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.LightLayer;
 import com.potassium.world.data.ChunkData;
 import com.potassium.world.data.ChunkSnapshot;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
 import org.joml.Matrix4f;
 import org.joml.Matrix4fc;
 import org.joml.Vector3f;
@@ -52,19 +74,20 @@ import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 
 public final class RenderPipeline implements AutoCloseable {
-	private static final boolean ENABLE_GPU_TERRAIN_SUBMISSION = false;
+	private static final boolean ENABLE_EXPERIMENTAL_GPU_TERRAIN_REPLACEMENT = true;
+	private static final boolean ENABLE_GPU_TERRAIN_SUBMISSION = true;
 	private static final boolean ENABLE_SCREEN_PROBE = false;
-	private static final boolean ENABLE_VERTEX_CONSUMER_PROBE = false;
-	private static final boolean ENABLE_VERTEX_CONSUMER_TERRAIN_BRIDGE = true;
-	private static final boolean ENABLE_VERTEX_CONSUMER_TRANSLUCENT_BRIDGE = true;
 	private static final int VERTEX_CONSUMER_TERRAIN_BRIDGE_MAX_CHUNKS = 96;
+	private static final int BRIDGE_FULL_BRIGHT_LIGHT = 0x00F000F0;
 	private static final long MEBIBYTE_BYTES = 1024L * 1024L;
 	private static final int INVALID_RESIDENT_SLOT = -1;
 	private static final int MESH_METADATA_OPAQUE_VERTEX_COUNT_OFFSET = 0;
 	private static final int MESH_METADATA_OPAQUE_FIRST_VERTEX_OFFSET = 1;
-	private static final int MESH_METADATA_TRANSLUCENT_VERTEX_COUNT_OFFSET = 2;
-	private static final int MESH_METADATA_TRANSLUCENT_FIRST_VERTEX_OFFSET = 3;
-	private static final int MESH_METADATA_MESH_REVISION_OFFSET = 6;
+	private static final int MESH_METADATA_CUTOUT_VERTEX_COUNT_OFFSET = 2;
+	private static final int MESH_METADATA_CUTOUT_FIRST_VERTEX_OFFSET = 3;
+	private static final int MESH_METADATA_TRANSLUCENT_VERTEX_COUNT_OFFSET = 4;
+	private static final int MESH_METADATA_TRANSLUCENT_FIRST_VERTEX_OFFSET = 5;
+	private static final int MESH_METADATA_MESH_REVISION_OFFSET = 8;
 	private static final int WORLD_DATA_BINDING = 0;
 	private static final int RESIDENT_CHUNK_STATE_BINDING = WORLD_DATA_BINDING + 1 + WorldDataBuffer.MAX_SHADER_PAGES;
 	private static final int MESH_STATS_BINDING = RESIDENT_CHUNK_STATE_BINDING + 1;
@@ -74,6 +97,7 @@ public final class RenderPipeline implements AutoCloseable {
 	private static final int TRANSLUCENT_COMMAND_BINDING = OPAQUE_COMMAND_BINDING + 1;
 	private static final int DRAW_COMMAND_COUNT_BINDING = TRANSLUCENT_COMMAND_BINDING + 1;
 	private static final int CHANGE_QUEUE_BINDING = DRAW_COMMAND_COUNT_BINDING + 1;
+	private static final int MATERIAL_TABLE_BINDING = CHANGE_QUEUE_BINDING + 1;
 	private static final int WORLD_DATA_GROWTH_MIN_MIB = 128;
 	private static final int WORLD_DATA_GROWTH_RESERVE_MIB = 512;
 	private static final int WORLD_DATA_FULL_WARN_INTERVAL = 64;
@@ -85,7 +109,7 @@ public final class RenderPipeline implements AutoCloseable {
 	private static final int DEPTH_COPY_LOCAL_SIZE_X = 8;
 	private static final int DEPTH_COPY_LOCAL_SIZE_Y = 8;
 	private static final int MESH_GENERATION_LOCAL_SIZE_X = 64;
-	private static final int MESH_GENERATION_REQUIRED_SSBO_BINDINGS = MESH_VERTEX_BINDING + 1;
+	private static final int MESH_GENERATION_REQUIRED_SSBO_BINDINGS = MATERIAL_TABLE_BINDING + 1;
 	private static final int FRUSTUM_CULLING_REQUIRED_SSBO_BINDINGS = DRAW_COMMAND_COUNT_BINDING + 1;
 	private static final int APPLY_CHANGES_REQUIRED_SSBO_BINDINGS = CHANGE_QUEUE_BINDING + 1;
 
@@ -95,8 +119,10 @@ public final class RenderPipeline implements AutoCloseable {
 	private final FrustumCuller frustumCuller;
 	private final OcclusionCuller occlusionCuller;
 	private final MemoryManager memoryManager = new MemoryManager();
+	private final HashMap<Integer, TerrainSubmissionCacheEntry> opaqueTerrainSubmissionCache = new HashMap<>();
 	private final HashMap<Integer, BridgeMeshCacheEntry> bridgeMeshCache = new HashMap<>();
 	private final HashMap<Integer, BridgeMeshCacheEntry> bridgeTranslucentMeshCache = new HashMap<>();
+	private final HashMap<Integer, BridgeMaterial> bridgeMaterialCache = new HashMap<>();
 
 	private WorldDataBuffer worldDataBuffer;
 	private IndirectCommandBuffer indirectCommandBuffer;
@@ -107,6 +133,7 @@ public final class RenderPipeline implements AutoCloseable {
 	private MeshGenerationStatsBuffer meshGenerationStatsBuffer;
 	private MeshMetadataBuffer meshMetadataBuffer;
 	private MeshVertexBuffer meshVertexBuffer;
+	private MaterialTableBuffer materialTableBuffer;
 	private VertexBuffer vertexBuffer;
 	private ShaderProgram chunkProgram;
 	private ShaderProgram chunkTranslucentProgram;
@@ -123,6 +150,7 @@ public final class RenderPipeline implements AutoCloseable {
 	private OitFramebuffer translucentOitFramebuffer;
 	private boolean initialized;
 	private ClientLevel activeLevel;
+	private BlockMaterialTable blockMaterialTable = BlockMaterialTable.empty();
 	private long lastUploadedWorldBytes;
 	private int lastSyncedChangeCount;
 	private int lastMeshGenerationJobs;
@@ -142,6 +170,8 @@ public final class RenderPipeline implements AutoCloseable {
 	private boolean terrainMeshReady;
 	private boolean forceCpuTerrainDrawThisFrame;
 	private boolean loggedCustomGeometryTerrainDraw;
+	private boolean loggedExperimentalTerrainReplacementDisabled;
+	private boolean loggedBridgeMaterialFallback;
 	private boolean loggedVertexConsumerProbe;
 	private boolean loggedVertexConsumerTerrainBridge;
 	private boolean loggedVertexConsumerTranslucentTerrainBridge;
@@ -170,16 +200,69 @@ public final class RenderPipeline implements AutoCloseable {
 		this.occlusionCuller = new OcclusionCuller(GLCapabilities.hasComputeShader());
 	}
 
+	private int dynamicVramBudgetMiB = 0; // 存储动态预算上限
+
+	/**
+	 * 根据显存大小动态计算预算上限
+	 * 策略：<8G 全占满，8G~16G 占75%，16G+ 占50%
+	 */
+	private int calculateDynamicVramBudget(int availableVramMiB) {
+		if (availableVramMiB <= 0) {
+			return 0;
+		}
+
+		int budgetMiB;
+		if (availableVramMiB < 8192) {
+			// <8G: 全占满（仅留 1G 给驱动/系统）
+			budgetMiB = Math.max(availableVramMiB - 1024, 256);
+		} else if (availableVramMiB < 16384) {
+			// 8G~16G: 占75%
+			budgetMiB = (int) (availableVramMiB * 0.75);
+		} else {
+			// 16G+: 占50%
+			budgetMiB = (int) (availableVramMiB * 0.5);
+		}
+
+		PotassiumLogger.logger().info(
+			"Dynamic VRAM budget calculated: {} MiB (available={} MiB, rule={})",
+			budgetMiB,
+			availableVramMiB,
+			availableVramMiB < 8192 ? "<8G full" : (availableVramMiB < 16384 ? "8-16G 75%" : "16G+ 50%")
+		);
+
+		return budgetMiB;
+	}
+
 	public void initialize() {
 		if (this.initialized) {
 			return;
 		}
 
+		// 计算动态预算上限（但不立即分配）
+		int availableVramMiB = GLCapabilities.getEstimatedAvailableVideoMemoryMiB();
+		if (availableVramMiB > 0) {
+			this.dynamicVramBudgetMiB = calculateDynamicVramBudget(availableVramMiB);
+
+			// 自动更新 maxResidentWorldMiB，避免配置值限制动态预算
+			if (this.dynamicVramBudgetMiB > this.config.memory.maxResidentWorldMiB) {
+				PotassiumLogger.logger().info(
+					"Auto-adjusting maxResidentWorldMiB from {} to {} to match GPU VRAM ({} MiB)",
+					this.config.memory.maxResidentWorldMiB,
+					this.dynamicVramBudgetMiB,
+					availableVramMiB
+				);
+				this.config.memory.maxResidentWorldMiB = this.dynamicVramBudgetMiB;
+			}
+		}
+
+		// 初始分配较小值（256MB），按需扩展
+		int initialBudgetMiB = 256;
 		boolean usePersistentMapping = this.config.general.enablePersistentMapping && GLCapabilities.hasPersistentMapping();
-		this.worldDataBuffer = new WorldDataBuffer(toBytes(worldDataBudgetMiB()), usePersistentMapping);
+		this.worldDataBuffer = new WorldDataBuffer(toBytes(initialBudgetMiB), usePersistentMapping);
 		this.indirectCommandBuffer = new IndirectCommandBuffer(this.config.memory.indirectCommandCapacity, false);
 		this.translucentIndirectCommandBuffer = new IndirectCommandBuffer(this.config.memory.indirectCommandCapacity, false);
 		this.vertexBuffer = new VertexBuffer();
+		this.materialTableBuffer = new MaterialTableBuffer(1, false);
 		this.chunkProgram = ShaderProgram.graphics(
 			"chunk",
 			"shaders/render/chunk.vert",
@@ -208,6 +291,7 @@ public final class RenderPipeline implements AutoCloseable {
 		this.chunkProjectionUniform = GL20C.glGetUniformLocation(this.chunkProgram.handle(), "uProjectionMatrix");
 		this.chunkTranslucentModelViewUniform = GL20C.glGetUniformLocation(this.chunkTranslucentProgram.handle(), "uModelViewMatrix");
 		this.chunkTranslucentProjectionUniform = GL20C.glGetUniformLocation(this.chunkTranslucentProgram.handle(), "uProjectionMatrix");
+		this.materialTableBuffer.upload(this.blockMaterialTable);
 
 		if (GLCapabilities.hasComputeShader()) {
 			if (this.hasGpuFrameStateResetBindingBudget()) {
@@ -331,6 +415,22 @@ public final class RenderPipeline implements AutoCloseable {
 		return this.hasGpuChangeApplyPath();
 	}
 
+	private int packWorldBlock(BlockPos position, BlockState state) {
+		if (state == null || state.isAir()) {
+			return BlockData.AIR_PACKED;
+		}
+
+		if (this.activeLevel == null) {
+			return BlockData.fromState(state).packed();
+		}
+
+		return BlockData.fromState(
+			state,
+			this.activeLevel.getBrightness(LightLayer.BLOCK, position),
+			this.activeLevel.getBrightness(LightLayer.SKY, position)
+		).packed();
+	}
+
 	private void flushPendingChangesCpu(List<WorldChangeTracker.BlockChange> changes) {
 		long uploadedBytes = 0L;
 		int appliedChanges = 0;
@@ -347,7 +447,7 @@ public final class RenderPipeline implements AutoCloseable {
 				continue;
 			}
 
-			int packedBlock = BlockData.fromState(change.newState()).packed();
+			int packedBlock = this.packWorldBlock(change.position(), change.newState());
 			if (this.worldDataBuffer.applyPackedBlockChange(chunkData.residentSlot(), localBlockIndex, packedBlock)) {
 				uploadedBytes += this.worldDataBuffer.lastUploadBytes();
 				appliedChanges++;
@@ -380,7 +480,7 @@ public final class RenderPipeline implements AutoCloseable {
 				new ChangeQueueBuffer.Entry(
 					chunkData.residentSlot(),
 					localBlockIndex,
-					BlockData.fromState(change.newState()).packed(),
+					this.packWorldBlock(change.position(), change.newState()),
 					boundaryMask(change.position())
 				)
 			);
@@ -429,6 +529,15 @@ public final class RenderPipeline implements AutoCloseable {
 		);
 	}
 
+	public void updateBlockMaterialTable(BlockMaterialTable blockMaterialTable) {
+		this.blockMaterialTable = blockMaterialTable == null ? BlockMaterialTable.empty() : blockMaterialTable;
+		if (!this.initialized || this.materialTableBuffer == null) {
+			return;
+		}
+
+		this.materialTableBuffer.upload(this.blockMaterialTable);
+	}
+
 	public void setLevel(ClientLevel level) {
 		if (!this.initialized) {
 			return;
@@ -458,10 +567,14 @@ public final class RenderPipeline implements AutoCloseable {
 		this.worldDataBufferExpansionFailures = 0;
 		this.worldDataEvictions = 0;
 		this.pendingGpuWorldChanges.clear();
+		this.opaqueTerrainSubmissionCache.clear();
 		this.bridgeMeshCache.clear();
 		this.bridgeTranslucentMeshCache.clear();
+		this.bridgeMaterialCache.clear();
+		this.loggedExperimentalTerrainReplacementDisabled = false;
 		this.loggedVertexConsumerTerrainBridge = false;
 		this.loggedVertexConsumerTranslucentTerrainBridge = false;
+		this.loggedBridgeMaterialFallback = false;
 
 		if (level == null) {
 			return;
@@ -470,15 +583,16 @@ public final class RenderPipeline implements AutoCloseable {
 		int minSectionY = level.getMinSectionY();
 		int sectionsCount = level.getSectionsCount();
 		this.worldDataBuffer.configure(minSectionY, sectionsCount);
-		this.memoryManager.configure(this.worldDataBuffer.capacityBytes(), this.worldDataBuffer.bytesPerChunk());
+		this.memoryManager.configure(this.effectiveResidentWorldBudgetBytes(), this.worldDataBuffer.bytesPerChunk());
 		this.ensureMeshOutputCapacity(true);
 		this.ensureIndirectCommandCapacity();
 
 		PotassiumLogger.logger().info(
-			"Configured world data buffer for level layout: minSectionY={}, sections={}, bytesPerChunk={}, residentChunkCapacity={}, pages={}, targetPageBytes={}",
+			"Configured world data buffer for level layout: minSectionY={}, sections={}, bytesPerChunk={}, residentChunkCapacity={}, meshResidentChunkCapacity={}, pages={}, targetPageBytes={}",
 			minSectionY,
 			sectionsCount,
 			this.worldDataBuffer.bytesPerChunk(),
+			this.worldDataBuffer.capacityBytes() / Math.max(this.worldDataBuffer.bytesPerChunk(), 1L),
 			this.memoryManager.capacityChunks(),
 			this.worldDataBuffer.pageCount(),
 			this.worldDataBuffer.targetPageCapacityBytes()
@@ -584,62 +698,359 @@ public final class RenderPipeline implements AutoCloseable {
 		this.renderTranslucentTerrainNow(cameraFrameState);
 	}
 
-	public boolean submitOpaqueTerrain(CameraRenderState cameraState, SubmitNodeStorage submitNodeStorage) {
-		CameraFrameState cameraFrameState = this.captureCameraFrameState(cameraState);
-		if (submitNodeStorage == null || cameraFrameState == null) {
+	public boolean renderOpaqueTerrain(
+		CameraRenderState cameraState,
+		Matrix4fc modelViewMatrix,
+		ChunkSectionsToRender vanillaChunkSectionsToRender,
+		ChunkSectionLayerGroup chunkSectionLayerGroup,
+		GpuSampler gpuSampler
+	) {
+		if (cameraState == null || modelViewMatrix == null || vanillaChunkSectionsToRender == null || gpuSampler == null) {
 			return false;
 		}
 
-		if (ENABLE_VERTEX_CONSUMER_TERRAIN_BRIDGE) {
-			return this.submitVertexConsumerTerrainBridge(submitNodeStorage, cameraFrameState);
-		}
-
-		if (ENABLE_VERTEX_CONSUMER_PROBE) {
-			this.submitVertexConsumerProbe(submitNodeStorage, cameraFrameState);
+		if (!ENABLE_EXPERIMENTAL_GPU_TERRAIN_REPLACEMENT) {
+			this.logExperimentalTerrainReplacementDisabledOnce();
 			return false;
 		}
 
-		if (!this.canRenderTerrainPass()) {
+		if (chunkSectionLayerGroup != ChunkSectionLayerGroup.OPAQUE) {
 			return false;
 		}
 
-		PoseStack poseStack = new PoseStack();
-		submitNodeStorage.submitCustomGeometry(
-			poseStack,
-			RenderTypes.debugQuads(),
-			(pose, vertexConsumer) -> this.renderOpaqueTerrainNow(cameraFrameState)
-		);
-		return true;
+		if (!this.canBuildMinecraftTerrainSubmission()) {
+			return false;
+		}
+
+		try {
+			ChunkSectionsToRender potassiumTerrain = this.buildOpaqueChunkSectionsToRender(modelViewMatrix, vanillaChunkSectionsToRender.textureView());
+			if (potassiumTerrain == null) {
+				return false;
+			}
+
+			potassiumTerrain.renderGroup(chunkSectionLayerGroup, gpuSampler);
+			return true;
+		} catch (RuntimeException exception) {
+			PotassiumLogger.logger().warn(
+				"Falling back to vanilla opaque terrain because Minecraft terrain submission failed: {}",
+				exception.getMessage()
+			);
+			return false;
+		}
 	}
 
-	public boolean submitTranslucentTerrain(CameraRenderState cameraState, SubmitNodeStorage submitNodeStorage) {
-		CameraFrameState cameraFrameState = this.captureCameraFrameState(cameraState);
-		if (submitNodeStorage == null || cameraFrameState == null) {
+	public boolean renderTranslucentTerrain(
+		CameraRenderState cameraState,
+		Matrix4fc modelViewMatrix,
+		ChunkSectionsToRender vanillaChunkSectionsToRender,
+		ChunkSectionLayerGroup chunkSectionLayerGroup,
+		GpuSampler gpuSampler
+	) {
+		if (cameraState == null || modelViewMatrix == null || vanillaChunkSectionsToRender == null || gpuSampler == null) {
 			return false;
 		}
 
-		if (ENABLE_VERTEX_CONSUMER_TERRAIN_BRIDGE && ENABLE_VERTEX_CONSUMER_TRANSLUCENT_BRIDGE) {
-			return this.submitVertexConsumerTranslucentTerrainBridge(submitNodeStorage, cameraFrameState);
-		}
-
-		if (ENABLE_VERTEX_CONSUMER_PROBE) {
+		if (!ENABLE_EXPERIMENTAL_GPU_TERRAIN_REPLACEMENT) {
 			return false;
 		}
 
-		if (!this.canRenderTerrainPass()) {
+		if (chunkSectionLayerGroup != ChunkSectionLayerGroup.TRANSLUCENT) {
 			return false;
 		}
 
-		PoseStack poseStack = new PoseStack();
-		submitNodeStorage.submitCustomGeometry(
-			poseStack,
-			RenderTypes.linesTranslucent(),
-			(pose, vertexConsumer) -> this.renderTranslucentTerrainNow(cameraFrameState)
+		if (!this.canBuildMinecraftTerrainSubmission()) {
+			return false;
+		}
+
+		try {
+			ChunkSectionsToRender potassiumTerrain = this.buildTranslucentChunkSectionsToRender(
+				cameraState,
+				modelViewMatrix,
+				vanillaChunkSectionsToRender.textureView()
+			);
+			if (potassiumTerrain == null) {
+				return false;
+			}
+
+			potassiumTerrain.renderGroup(chunkSectionLayerGroup, gpuSampler);
+			return true;
+		} catch (RuntimeException exception) {
+			PotassiumLogger.logger().warn(
+				"Falling back to vanilla translucent terrain because Minecraft terrain submission failed: {}",
+				exception.getMessage()
+			);
+			return false;
+		}
+	}
+
+	private boolean canBuildMinecraftTerrainSubmission() {
+		return this.initialized
+			&& this.worldDataBuffer != null
+			&& this.worldDataBuffer.isConfigured()
+			&& this.materialTableBuffer != null
+			&& this.blockMaterialTable != null
+			&& !this.blockMaterialTable.isEmpty()
+			&& this.meshMetadataBuffer != null
+			&& this.meshVertexBuffer != null
+			&& this.meshVertexBuffer.gpuBuffer() != null
+			&& this.memoryManager.residentChunks() > 0
+			&& this.terrainMeshReady;
+	}
+
+	private ChunkSectionsToRender buildOpaqueChunkSectionsToRender(Matrix4fc terrainModelViewMatrix, GpuTextureView textureView) {
+		if (textureView == null || RenderSystem.getDynamicUniforms() == null) {
+			return null;
+		}
+
+		EnumMap<ChunkSectionLayer, Int2ObjectOpenHashMap<List<RenderPass.Draw<GpuBufferSlice[]>>>> drawGroupsPerLayer =
+			new EnumMap<>(ChunkSectionLayer.class);
+		for (ChunkSectionLayer layer : ChunkSectionLayer.values()) {
+			drawGroupsPerLayer.put(layer, new Int2ObjectOpenHashMap<>());
+		}
+
+		Int2ObjectOpenHashMap<List<RenderPass.Draw<GpuBufferSlice[]>>> solidDrawGroups = drawGroupsPerLayer.get(ChunkSectionLayer.SOLID);
+		Int2ObjectOpenHashMap<List<RenderPass.Draw<GpuBufferSlice[]>>> cutoutDrawGroups = drawGroupsPerLayer.get(ChunkSectionLayer.CUTOUT);
+		ArrayList<DynamicUniforms.ChunkSectionInfo> chunkSectionInfos = new ArrayList<>();
+		int atlasWidth = textureView.getWidth(0);
+		int atlasHeight = textureView.getHeight(0);
+		int minBlockY = this.worldDataBuffer.minSectionY() << 4;
+		int maxIndicesRequired = 0;
+		int baseDrawGroupKey = 173;
+		if (this.meshVertexBuffer.gpuBuffer() != null) {
+			baseDrawGroupKey = (31 * baseDrawGroupKey) + this.meshVertexBuffer.gpuBuffer().hashCode();
+		}
+
+		for (ChunkData chunkData : this.chunkManager.chunks()) {
+			if (!chunkData.isResident()) {
+				continue;
+			}
+
+			TerrainSubmissionCacheEntry solidEntry = this.resolveTerrainSubmissionEntry(
+				chunkData,
+				MESH_METADATA_OPAQUE_VERTEX_COUNT_OFFSET,
+				MESH_METADATA_OPAQUE_FIRST_VERTEX_OFFSET
+			);
+			TerrainSubmissionCacheEntry cutoutEntry = this.resolveTerrainSubmissionEntry(
+				chunkData,
+				MESH_METADATA_CUTOUT_VERTEX_COUNT_OFFSET,
+				MESH_METADATA_CUTOUT_FIRST_VERTEX_OFFSET
+			);
+			if (solidEntry == null && cutoutEntry == null) {
+				continue;
+			}
+
+			int chunkInfoIndex = chunkSectionInfos.size();
+			chunkSectionInfos.add(
+				this.createChunkSectionInfo(chunkData, terrainModelViewMatrix, atlasWidth, atlasHeight, minBlockY)
+			);
+			if (solidEntry != null) {
+				maxIndicesRequired = Math.max(maxIndicesRequired, solidEntry.indexCount());
+			}
+			if (cutoutEntry != null) {
+				maxIndicesRequired = Math.max(maxIndicesRequired, cutoutEntry.indexCount());
+			}
+			final int uploaderChunkInfoIndex = chunkInfoIndex;
+			if (solidEntry != null) {
+				solidDrawGroups.computeIfAbsent(baseDrawGroupKey, ignored -> new ArrayList<>())
+					.add(
+						new RenderPass.Draw<>(
+							0,
+							this.meshVertexBuffer.gpuBuffer(),
+							null,
+							null,
+							0,
+							solidEntry.indexCount(),
+							solidEntry.firstVertex(),
+							(slices, uploader) -> uploader.upload("ChunkSection", slices[uploaderChunkInfoIndex])
+						)
+					);
+			}
+			if (cutoutEntry != null) {
+				cutoutDrawGroups.computeIfAbsent(baseDrawGroupKey, ignored -> new ArrayList<>())
+					.add(
+						new RenderPass.Draw<>(
+							0,
+							this.meshVertexBuffer.gpuBuffer(),
+							null,
+							null,
+							0,
+							cutoutEntry.indexCount(),
+							cutoutEntry.firstVertex(),
+							(slices, uploader) -> uploader.upload("ChunkSection", slices[uploaderChunkInfoIndex])
+						)
+					);
+			}
+		}
+
+		if (chunkSectionInfos.isEmpty()) {
+			return null;
+		}
+
+		GpuBufferSlice[] chunkInfoSlices = RenderSystem.getDynamicUniforms().writeChunkSections(
+			chunkSectionInfos.toArray(DynamicUniforms.ChunkSectionInfo[]::new)
 		);
-		return true;
+		return new ChunkSectionsToRender(textureView, drawGroupsPerLayer, maxIndicesRequired, chunkInfoSlices);
+	}
+
+	private ChunkSectionsToRender buildTranslucentChunkSectionsToRender(
+		CameraRenderState cameraState,
+		Matrix4fc terrainModelViewMatrix,
+		GpuTextureView textureView
+	) {
+		if (cameraState == null || textureView == null || RenderSystem.getDynamicUniforms() == null) {
+			return null;
+		}
+
+		EnumMap<ChunkSectionLayer, Int2ObjectOpenHashMap<List<RenderPass.Draw<GpuBufferSlice[]>>>> drawGroupsPerLayer =
+			new EnumMap<>(ChunkSectionLayer.class);
+		for (ChunkSectionLayer layer : ChunkSectionLayer.values()) {
+			drawGroupsPerLayer.put(layer, new Int2ObjectOpenHashMap<>());
+		}
+
+		Int2ObjectOpenHashMap<List<RenderPass.Draw<GpuBufferSlice[]>>> translucentDrawGroups =
+			drawGroupsPerLayer.get(ChunkSectionLayer.TRANSLUCENT);
+		ArrayList<SortedTerrainSubmission> translucentSubmissions = new ArrayList<>();
+		int atlasWidth = textureView.getWidth(0);
+		int atlasHeight = textureView.getHeight(0);
+		int minBlockY = this.worldDataBuffer.minSectionY() << 4;
+		int maxIndicesRequired = 0;
+		int baseDrawGroupKey = 173;
+		if (this.meshVertexBuffer.gpuBuffer() != null) {
+			baseDrawGroupKey = (31 * baseDrawGroupKey) + this.meshVertexBuffer.gpuBuffer().hashCode();
+		}
+
+		double cameraX = cameraState.pos.x;
+		double cameraY = cameraState.pos.y;
+		double cameraZ = cameraState.pos.z;
+		int visibleMinSectionY = this.worldDataBuffer.minSectionY();
+		int visibleSectionsCount = this.worldDataBuffer.sectionsCount();
+
+		for (ChunkData chunkData : this.chunkManager.chunks()) {
+			if (!chunkData.isResident()) {
+				continue;
+			}
+
+			TerrainSubmissionCacheEntry translucentEntry = this.resolveTerrainSubmissionEntry(
+				chunkData,
+				MESH_METADATA_TRANSLUCENT_VERTEX_COUNT_OFFSET,
+				MESH_METADATA_TRANSLUCENT_FIRST_VERTEX_OFFSET
+			);
+			if (translucentEntry == null) {
+				continue;
+			}
+
+			double distanceSquared = squaredDistanceToChunkCenter(
+				chunkData.chunkPos(),
+				visibleMinSectionY,
+				visibleSectionsCount,
+				cameraX,
+				cameraY,
+				cameraZ
+			);
+			maxIndicesRequired = Math.max(maxIndicesRequired, translucentEntry.indexCount());
+			translucentSubmissions.add(
+				new SortedTerrainSubmission(
+					translucentEntry,
+					distanceSquared,
+					this.createChunkSectionInfo(chunkData, terrainModelViewMatrix, atlasWidth, atlasHeight, minBlockY)
+				)
+			);
+		}
+
+		if (translucentSubmissions.isEmpty()) {
+			return null;
+		}
+
+		translucentSubmissions.sort(Comparator.comparingDouble(SortedTerrainSubmission::distanceSquared));
+
+		ArrayList<DynamicUniforms.ChunkSectionInfo> chunkSectionInfos = new ArrayList<>(translucentSubmissions.size());
+		List<RenderPass.Draw<GpuBufferSlice[]>> translucentDraws = translucentDrawGroups.computeIfAbsent(
+			baseDrawGroupKey,
+			ignored -> new ArrayList<>()
+		);
+		for (SortedTerrainSubmission submission : translucentSubmissions) {
+			int chunkInfoIndex = chunkSectionInfos.size();
+			chunkSectionInfos.add(submission.chunkSectionInfo());
+			TerrainSubmissionCacheEntry entry = submission.entry();
+			final int uploaderChunkInfoIndex = chunkInfoIndex;
+			translucentDraws.add(
+				new RenderPass.Draw<>(
+					0,
+					this.meshVertexBuffer.gpuBuffer(),
+					null,
+					null,
+					0,
+					entry.indexCount(),
+					entry.firstVertex(),
+					(slices, uploader) -> uploader.upload("ChunkSection", slices[uploaderChunkInfoIndex])
+				)
+			);
+		}
+
+		GpuBufferSlice[] chunkInfoSlices = RenderSystem.getDynamicUniforms().writeChunkSections(
+			chunkSectionInfos.toArray(DynamicUniforms.ChunkSectionInfo[]::new)
+		);
+		return new ChunkSectionsToRender(textureView, drawGroupsPerLayer, maxIndicesRequired, chunkInfoSlices);
+	}
+
+	private TerrainSubmissionCacheEntry resolveTerrainSubmissionEntry(ChunkData chunkData, int vertexCountOffset, int firstVertexOffset) {
+		int residentSlot = chunkData.residentSlot();
+		if (residentSlot < 0 || this.residentChunkStateBuffer == null || this.meshMetadataBuffer == null) {
+			return null;
+		}
+
+		int expectedMeshRevision = this.residentChunkStateBuffer.meshRevision(residentSlot);
+		int cacheKey = (residentSlot << 4) | vertexCountOffset;
+		TerrainSubmissionCacheEntry cachedEntry = this.opaqueTerrainSubmissionCache.get(cacheKey);
+		if (cachedEntry != null && cachedEntry.meshRevision() == expectedMeshRevision && cachedEntry.vertexCountOffset() == vertexCountOffset) {
+			return cachedEntry.vertexCount() > 0 ? cachedEntry : null;
+		}
+
+		int[] metadataEntry = this.meshMetadataBuffer.readEntry(residentSlot);
+		int vertexCount = Math.max(metadataEntry[vertexCountOffset], 0);
+		vertexCount -= vertexCount % MeshVertexBuffer.VERTICES_PER_FACE;
+		int firstVertex = Math.max(metadataEntry[firstVertexOffset], 0);
+		TerrainSubmissionCacheEntry refreshedEntry = new TerrainSubmissionCacheEntry(
+			firstVertex,
+			vertexCount,
+			expectedMeshRevision,
+			vertexCountOffset
+		);
+		if (vertexCount > 0) {
+			this.opaqueTerrainSubmissionCache.put(cacheKey, refreshedEntry);
+			return refreshedEntry;
+		}
+
+		this.opaqueTerrainSubmissionCache.remove(cacheKey);
+		return null;
+	}
+
+	private DynamicUniforms.ChunkSectionInfo createChunkSectionInfo(
+		ChunkData chunkData,
+		Matrix4fc terrainModelViewMatrix,
+		int atlasWidth,
+		int atlasHeight,
+		int minBlockY
+	) {
+		return new DynamicUniforms.ChunkSectionInfo(
+			new Matrix4f(terrainModelViewMatrix),
+			chunkData.chunkPos().x() << 4,
+			minBlockY,
+			chunkData.chunkPos().z() << 4,
+			1.0f,
+			atlasWidth,
+			atlasHeight
+		);
 	}
 
 	private boolean submitVertexConsumerTerrainBridge(SubmitNodeStorage submitNodeStorage, CameraFrameState cameraFrameState) {
+		// 暂时禁用桥接渲染：
+		// 1. Minecraft 26.1 的模型系统已完全重构，无法获取纹理
+		// 2. 桥接渲染是 CPU fallback 路径，与架构原则不符
+		// 3. 应尽快启用 GPU 渲染路径 (ENABLE_GPU_TERRAIN_SUBMISSION = true)
+		return false;
+		
+		/* 原代码保留以供参考
 		if (!this.canRenderTerrainPass() || this.meshVertexBuffer == null) {
 			return false;
 		}
@@ -663,13 +1074,18 @@ public final class RenderPipeline implements AutoCloseable {
 		PoseStack poseStack = new PoseStack();
 		submitNodeStorage.submitCustomGeometry(
 			poseStack,
-			RenderTypes.debugQuads(),
+			RenderTypes.solidMovingBlock(),
 			(pose, vertexConsumer) -> this.emitVertexConsumerTerrainBridge(pose, vertexConsumer, cameraFrameState, visibleDraws, false)
 		);
 		return true;
+		*/
 	}
 
 	private boolean submitVertexConsumerTranslucentTerrainBridge(SubmitNodeStorage submitNodeStorage, CameraFrameState cameraFrameState) {
+		// 暂时禁用桥接渲染（原因同不透明桥接）
+		return false;
+		
+		/* 原代码保留以供参考
 		if (!this.canRenderTerrainPass() || this.meshVertexBuffer == null) {
 			return false;
 		}
@@ -693,10 +1109,11 @@ public final class RenderPipeline implements AutoCloseable {
 		PoseStack poseStack = new PoseStack();
 		submitNodeStorage.submitCustomGeometry(
 			poseStack,
-			RenderTypes.debugQuads(),
+			RenderTypes.translucentMovingBlock(),
 			(pose, vertexConsumer) -> this.emitVertexConsumerTerrainBridge(pose, vertexConsumer, cameraFrameState, visibleDraws, true)
 		);
 		return true;
+		*/
 	}
 
 	private void submitVertexConsumerProbe(SubmitNodeStorage submitNodeStorage, CameraFrameState cameraFrameState) {
@@ -856,12 +1273,13 @@ public final class RenderPipeline implements AutoCloseable {
 		int intsPerFace = MeshVertexBuffer.VERTICES_PER_FACE * MeshVertexBuffer.UINTS_PER_VERTEX;
 		for (int faceBase = 0; faceBase + intsPerFace <= chunkVertices.length; faceBase += intsPerFace) {
 			int packedBlock = chunkVertices[faceBase + 3];
-			int color = debugColorArgb(packedBlock, translucent);
+			int color = bridgeColorArgb(packedBlock, translucent);
+			BridgeMaterial material = this.resolveBridgeMaterial(packedBlock);
 
 			VertexPoint a = readVertexPoint(chunkVertices, faceBase, cameraFrameState);
-			VertexPoint b = readVertexPoint(chunkVertices, faceBase + 4, cameraFrameState);
-			VertexPoint c = readVertexPoint(chunkVertices, faceBase + 8, cameraFrameState);
-			VertexPoint d = readVertexPoint(chunkVertices, faceBase + 20, cameraFrameState);
+			VertexPoint b = readVertexPoint(chunkVertices, faceBase + MeshVertexBuffer.UINTS_PER_VERTEX, cameraFrameState);
+			VertexPoint c = readVertexPoint(chunkVertices, faceBase + (MeshVertexBuffer.UINTS_PER_VERTEX * 2), cameraFrameState);
+			VertexPoint d = readVertexPoint(chunkVertices, faceBase + (MeshVertexBuffer.UINTS_PER_VERTEX * 5), cameraFrameState);
 
 			Vector3f ab = new Vector3f(b.x() - a.x(), b.y() - a.y(), b.z() - a.z());
 			Vector3f ac = new Vector3f(c.x() - a.x(), c.y() - a.y(), c.z() - a.z());
@@ -872,11 +1290,306 @@ public final class RenderPipeline implements AutoCloseable {
 				normal.normalize();
 			}
 
-			this.emitQuadVertex(vertexConsumer, pose, a, color, normal);
-			this.emitQuadVertex(vertexConsumer, pose, b, color, normal);
-			this.emitQuadVertex(vertexConsumer, pose, c, color, normal);
-			this.emitQuadVertex(vertexConsumer, pose, d, color, normal);
+			this.emitQuadVertex(vertexConsumer, pose, a, color, material.u0(), material.v1(), normal);
+			this.emitQuadVertex(vertexConsumer, pose, b, color, material.u0(), material.v0(), normal);
+			this.emitQuadVertex(vertexConsumer, pose, c, color, material.u1(), material.v0(), normal);
+			this.emitQuadVertex(vertexConsumer, pose, d, color, material.u1(), material.v1(), normal);
 		}
+	}
+
+	private BridgeMaterial resolveBridgeMaterial(int packedBlock) {
+		int stateId = BlockData.stateId(packedBlock);
+		BridgeMaterial cachedMaterial = this.bridgeMaterialCache.get(stateId);
+		if (cachedMaterial != null) {
+			return cachedMaterial;
+		}
+
+		BlockState state = Block.stateById(stateId);
+		TextureAtlasSprite sprite = this.resolveBridgeParticleSprite(state);
+		BridgeMaterial material = new BridgeMaterial(
+			sprite.getU0(),
+			sprite.getU1(),
+			sprite.getV0(),
+			sprite.getV1()
+		);
+		this.bridgeMaterialCache.put(stateId, material);
+		return material;
+	}
+
+	private TextureAtlasSprite resolveBridgeParticleSprite(BlockState state) {
+		try {
+			TextureAtlasSprite sprite = this.tryGetParticleSprite(state);
+			if (sprite != null) {
+				return sprite;
+			}
+		} catch (Exception exception) {
+			PotassiumLogger.logger().debug("Failed to get particle sprite for block state {}: {}", state, exception.getMessage());
+		}
+		
+		TextureAtlasSprite fallbackSprite = this.resolveMissingBridgeParticleSprite();
+		if (fallbackSprite != null) {
+			if (!this.loggedBridgeMaterialFallback) {
+				PotassiumLogger.logger().warn(
+					"Failed to resolve textured bridge sprite for block state {}; falling back to missing texture sprite.",
+					state
+				);
+				this.loggedBridgeMaterialFallback = true;
+			}
+			return fallbackSprite;
+		}
+		
+		// 最后的回退：使用 stone 的默认材质
+		if (!this.loggedBridgeMaterialFallback) {
+			PotassiumLogger.logger().warn("Failed to resolve any texture sprite for block state {}; using default stone texture.", state);
+			this.loggedBridgeMaterialFallback = true;
+		}
+		return this.getDefaultStoneSprite();
+	}
+
+	private TextureAtlasSprite getDefaultStoneSprite() {
+		// 尝试获取 stone 的粒子纹理作为默认值
+		try {
+			BlockState stoneState = net.minecraft.world.level.block.Blocks.STONE.defaultBlockState();
+			TextureAtlasSprite stoneSprite = this.tryGetParticleSprite(stoneState);
+			if (stoneSprite != null) {
+				return stoneSprite;
+			}
+		} catch (Exception e) {
+			PotassiumLogger.logger().debug("Failed to get default stone sprite: {}", e.getMessage());
+		}
+		
+		// 如果连 stone 都获取不到，抛出错误
+		throw new IllegalStateException("Failed to resolve any texture sprite. The model system is completely unavailable.");
+	}
+
+	private TextureAtlasSprite tryGetParticleSprite(BlockState state) {
+		try {
+			Object modelManager = Minecraft.getInstance().getModelManager();
+			if (modelManager == null) {
+				return null;
+			}
+
+			// 尝试方法 1: 通过 BlockModelShaper (旧版本 Minecraft)
+			Object blockModelShaper = this.resolveMemberByType(modelManager, "getBlockModelShaper", "BlockModelShaper");
+			if (blockModelShaper != null) {
+				Method getParticleIcon = this.findMatchingMethodOrNull(
+					blockModelShaper.getClass(),
+					"getParticleIcon",
+					"TextureAtlasSprite",
+					state.getClass()
+				);
+				if (getParticleIcon != null) {
+					getParticleIcon.setAccessible(true);
+					return (TextureAtlasSprite) getParticleIcon.invoke(blockModelShaper, state);
+				}
+			}
+
+			// 尝试方法 2: 通过 ModelManager.getModel(state) 获取 BakedModel
+			Method getModelMethod = this.findMatchingMethodOrNull(modelManager.getClass(), "getModel", "BakedModel", state.getClass());
+			if (getModelMethod != null) {
+				getModelMethod.setAccessible(true);
+				Object bakedModel = getModelMethod.invoke(modelManager, state);
+				if (bakedModel != null) {
+					Method getParticleIconMethod = this.findMatchingMethodOrNull(bakedModel.getClass(), "getParticleIcon", "TextureAtlasSprite");
+					if (getParticleIconMethod != null) {
+						getParticleIconMethod.setAccessible(true);
+						return (TextureAtlasSprite) getParticleIconMethod.invoke(bakedModel);
+					}
+				}
+			}
+
+			// 尝试方法 3: 直接通过 BlockState 获取 (如果存在)
+			Method stateParticleMethod = this.findMatchingMethodOrNull(state.getClass(), "getParticleIcon", "TextureAtlasSprite");
+			if (stateParticleMethod != null) {
+				stateParticleMethod.setAccessible(true);
+				return (TextureAtlasSprite) stateParticleMethod.invoke(state);
+			}
+		} catch (Exception e) {
+			PotassiumLogger.logger().debug("Exception while trying to get particle sprite: {}", e.getMessage());
+		}
+		return null;
+	}
+
+	private TextureAtlasSprite resolveMissingBridgeParticleSprite() {
+		// 尝试通过 ModelManager 获取 missing model
+		try {
+			Object modelManager = Minecraft.getInstance().getModelManager();
+			if (modelManager != null) {
+				// 尝试方法 1: getMissingBlockStateModel
+				Object missingBlockStateModel = this.resolveMemberByType(modelManager, "getMissingBlockStateModel", "BlockStateModel");
+				if (missingBlockStateModel != null) {
+					Method particleIcon = this.findMatchingMethodOrNull(missingBlockStateModel.getClass(), "particleIcon", "TextureAtlasSprite");
+					if (particleIcon != null) {
+						particleIcon.setAccessible(true);
+						return (TextureAtlasSprite) particleIcon.invoke(missingBlockStateModel);
+					}
+				}
+
+				// 尝试方法 2: getMissingModel -> BakedModel.getParticleIcon
+				Method getMissingModelMethod = this.findMatchingMethodOrNull(modelManager.getClass(), "getMissingModel", "BakedModel");
+				if (getMissingModelMethod != null) {
+					getMissingModelMethod.setAccessible(true);
+					Object missingModel = getMissingModelMethod.invoke(modelManager);
+					if (missingModel != null) {
+						Method getParticleIconMethod = this.findMatchingMethodOrNull(missingModel.getClass(), "getParticleIcon", "TextureAtlasSprite");
+						if (getParticleIconMethod != null) {
+							getParticleIconMethod.setAccessible(true);
+							return (TextureAtlasSprite) getParticleIconMethod.invoke(missingModel);
+						}
+					}
+				}
+			}
+		} catch (Exception e) {
+			PotassiumLogger.logger().debug("Exception while trying to get missing texture sprite from ModelManager: {}", e.getMessage());
+		}
+
+		// 最终回退：创建一个默认的 TextureAtlasSprite
+		// 使用 Minecraft 的 atlas 纹理中的默认缺失纹理
+		PotassiumLogger.logger().warn("Using programmatic fallback for missing texture sprite. Textures may appear incorrect.");
+		return this.createFallbackSprite();
+	}
+
+	private TextureAtlasSprite createFallbackSprite() {
+		// 尝试通过反射获取任意可用的 TextureAtlasSprite
+		try {
+			// 通过 Block registry 获取任意 block 的 particle icon
+			net.minecraft.core.Registry<net.minecraft.world.level.block.Block> blockRegistry = net.minecraft.core.registries.BuiltInRegistries.BLOCK;
+			for (net.minecraft.world.level.block.Block block : blockRegistry) {
+				try {
+					net.minecraft.world.level.block.state.BlockState defaultState = block.defaultBlockState();
+					TextureAtlasSprite sprite = this.tryGetParticleSprite(defaultState);
+					if (sprite != null) {
+						PotassiumLogger.logger().debug("Successfully got fallback sprite from block: {}", block);
+						return sprite;
+					}
+				} catch (Exception e) {
+					// 继续尝试下一个 block
+				}
+			}
+		} catch (Exception e) {
+			PotassiumLogger.logger().debug("Failed to get fallback sprite from blocks: {}", e.getMessage());
+		}
+
+		// 如果所有方法都失败，记录错误
+		PotassiumLogger.logger().error("All texture sprite resolution methods failed. Rendering may appear incorrect.");
+		return null;
+	}
+
+	private Object resolveMemberByType(Object target, String preferredName, String typeSimpleName) throws ReflectiveOperationException {
+		Method method = this.findMatchingMethodOrNull(target.getClass(), preferredName, typeSimpleName);
+		if (method != null) {
+			return method.invoke(target);
+		}
+
+		Field field = this.findFieldByType(target.getClass(), preferredName, typeSimpleName);
+		return field.get(target);
+	}
+
+	private Method findMatchingMethod(Class<?> owner, String preferredName, String returnTypeSimpleName, Class<?>... parameterTypes) throws NoSuchMethodException {
+		Method method = this.findMatchingMethodOrNull(owner, preferredName, returnTypeSimpleName, parameterTypes);
+		if (method != null) {
+			return method;
+		}
+		throw new NoSuchMethodException("No matching method on " + owner.getName() + " returns " + returnTypeSimpleName);
+	}
+
+	private Method findMatchingMethodOrNull(Class<?> owner, String preferredName, String returnTypeSimpleName, Class<?>... parameterTypes) {
+		Method namedMethod = this.findMethodByName(owner, preferredName, returnTypeSimpleName, parameterTypes);
+		if (namedMethod != null) {
+			return namedMethod;
+		}
+
+		for (Method method : owner.getMethods()) {
+			if (this.matchesMethodSignature(method, returnTypeSimpleName, parameterTypes)) {
+				return method;
+			}
+		}
+		for (Method method : owner.getDeclaredMethods()) {
+			if (this.matchesMethodSignature(method, returnTypeSimpleName, parameterTypes)) {
+				method.setAccessible(true);
+				return method;
+			}
+		}
+		return null;
+	}
+
+	private Method findMethodByName(Class<?> owner, String preferredName, String returnTypeSimpleName, Class<?>... parameterTypes) {
+		for (Method method : owner.getMethods()) {
+			if (method.getName().equals(preferredName) && this.matchesMethodSignature(method, returnTypeSimpleName, parameterTypes)) {
+				return method;
+			}
+		}
+		for (Method method : owner.getDeclaredMethods()) {
+			if (method.getName().equals(preferredName) && this.matchesMethodSignature(method, returnTypeSimpleName, parameterTypes)) {
+				method.setAccessible(true);
+				return method;
+			}
+		}
+		return null;
+	}
+
+	private Field findFieldByType(Class<?> owner, String preferredName, String typeSimpleName) throws NoSuchFieldException {
+		Field namedField = this.findFieldByName(owner, preferredName, typeSimpleName);
+		if (namedField != null) {
+			return namedField;
+		}
+
+		for (Field field : owner.getFields()) {
+			if (field.getType().getSimpleName().equals(typeSimpleName)) {
+				return field;
+			}
+		}
+		for (Field field : owner.getDeclaredFields()) {
+			if (field.getType().getSimpleName().equals(typeSimpleName)) {
+				field.setAccessible(true);
+				return field;
+			}
+		}
+		throw new NoSuchFieldException("No field on " + owner.getName() + " uses type " + typeSimpleName);
+	}
+
+	private Field findFieldByName(Class<?> owner, String preferredName, String typeSimpleName) {
+		for (Field field : owner.getFields()) {
+			if (field.getName().equals(preferredName) && field.getType().getSimpleName().equals(typeSimpleName)) {
+				return field;
+			}
+		}
+		for (Field field : owner.getDeclaredFields()) {
+			if (field.getName().equals(preferredName) && field.getType().getSimpleName().equals(typeSimpleName)) {
+				field.setAccessible(true);
+				return field;
+			}
+		}
+		return null;
+	}
+
+	private boolean matchesMethodSignature(Method method, String returnTypeSimpleName, Class<?>... parameterTypes) {
+		return method.getReturnType().getSimpleName().equals(returnTypeSimpleName)
+			&& this.matchesParameters(method.getParameterTypes(), parameterTypes);
+	}
+
+	private boolean matchesParameters(Class<?>[] actualParameterTypes, Class<?>[] expectedParameterTypes) {
+		if (actualParameterTypes.length != expectedParameterTypes.length) {
+			return false;
+		}
+		for (int index = 0; index < actualParameterTypes.length; index++) {
+			if (!actualParameterTypes[index].isAssignableFrom(expectedParameterTypes[index])
+				&& !actualParameterTypes[index].getSimpleName().equals(expectedParameterTypes[index].getSimpleName())) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	private void logExperimentalTerrainReplacementDisabledOnce() {
+		if (this.loggedExperimentalTerrainReplacementDisabled) {
+			return;
+		}
+
+		PotassiumLogger.logger().warn(
+			"Experimental Potassium terrain replacement is disabled. Vanilla terrain remains active until the GPU path has correct scene integration, materials, and lighting."
+		);
+		this.loggedExperimentalTerrainReplacementDisabled = true;
 	}
 
 	private BridgeMeshCacheEntry resolveBridgeMeshCacheEntry(
@@ -923,26 +1636,18 @@ public final class RenderPipeline implements AutoCloseable {
 		);
 	}
 
-	private void emitQuadVertex(
-		VertexConsumer vertexConsumer,
-		PoseStack.Pose pose,
-		VertexPoint point,
-		int color,
-		Vector3f normal
-	) {
+	private void emitQuadVertex(VertexConsumer vertexConsumer, PoseStack.Pose pose, VertexPoint point, int color, float u, float v, Vector3f normal) {
 		vertexConsumer.addVertex(pose, point.x(), point.y(), point.z())
 			.setColor(color)
+			.setUv(u, v)
+			.setOverlay(OverlayTexture.NO_OVERLAY)
+			.setLight(BRIDGE_FULL_BRIGHT_LIGHT)
 			.setNormal(pose, normal);
 	}
 
-	private static int debugColorArgb(int packedBlock, boolean translucent) {
-		int stateId = BlockData.stateId(packedBlock);
-		int hash = (stateId * 1664525) + 1013904223;
-		int red = 89 + (((hash) & 0xFF) * 166 / 255);
-		int green = 89 + (((hash >>> 8) & 0xFF) * 166 / 255);
-		int blue = 89 + (((hash >>> 16) & 0xFF) * 166 / 255);
+	private static int bridgeColorArgb(int packedBlock, boolean translucent) {
 		int alpha = translucent ? translucentAlpha(packedBlock) : 0xFF;
-		return (alpha << 24) | (red << 16) | (green << 8) | blue;
+		return (alpha << 24) | 0x00FFFFFF;
 	}
 
 	private static int translucentAlpha(int packedBlock) {
@@ -959,6 +1664,17 @@ public final class RenderPipeline implements AutoCloseable {
 
 	private void renderOpaqueTerrainNow(CameraFrameState cameraFrameState) {
 		if (!this.canRenderTerrainPass() || cameraFrameState == null) {
+			if (!this.canRenderTerrainPass()) {
+				PotassiumLogger.logger().warn("renderOpaqueTerrainNow: canRenderTerrainPass() returned false. initialized={}, worldDataConfigured={}, meshMetadata={}, meshVertex={}, chunkProgram={}, debugMeshVA={}, residentChunks={}, terrainMeshReady={}",
+					this.initialized,
+					this.worldDataBuffer != null && this.worldDataBuffer.isConfigured(),
+					this.meshMetadataBuffer != null,
+					this.meshVertexBuffer != null,
+					this.chunkProgram != null,
+					this.debugMeshVertexArray != 0,
+					this.memoryManager != null ? this.memoryManager.residentChunks() : -1,
+					this.terrainMeshReady);
+			}
 			return;
 		}
 
@@ -966,6 +1682,9 @@ public final class RenderPipeline implements AutoCloseable {
 			PotassiumLogger.logger().info("Potassium terrain draw is executing through SubmitNodeStorage custom geometry.");
 			this.loggedCustomGeometryTerrainDraw = true;
 		}
+
+		PotassiumLogger.logger().info("renderOpaqueTerrainNow: ENABLE_GPU_TERRAIN_SUBMISSION={}, hasGpuDrivenDrawPath={}",
+			ENABLE_GPU_TERRAIN_SUBMISSION, this.hasGpuDrivenDrawPath());
 
 		if (ENABLE_SCREEN_PROBE) {
 			this.drawTerrainScreenProbe();
@@ -993,9 +1712,14 @@ public final class RenderPipeline implements AutoCloseable {
 				projectionMatrix,
 				modelViewMatrix
 			);
+			PotassiumLogger.logger().info("GPU culling completed. commandCount={}", commandCount);
 			DrawCommandCountBuffer.Counts counts = this.drawCommandCountBuffer != null ? this.drawCommandCountBuffer.read() : null;
+			if (counts != null) {
+				PotassiumLogger.logger().info("Draw command counts: opaque={}, translucent={}", counts.opaqueCount(), counts.translucentCount());
+			}
 			if (counts != null && counts.opaqueCount() <= 0 && this.terrainMeshReady) {
 				this.forceCpuTerrainDrawThisFrame = true;
+				PotassiumLogger.logger().warn("GPU generated 0 opaque commands, falling back to CPU draw.");
 				this.useChunkProgram(this.chunkProgram, this.chunkModelViewUniform, this.chunkProjectionUniform, modelViewMatrix, projectionMatrix);
 				IntBuffer metadata = this.meshMetadataBuffer.readEntries();
 				this.drawOpaqueMetadataFallback(metadata, false);
@@ -1006,12 +1730,15 @@ public final class RenderPipeline implements AutoCloseable {
 			GL11C.glEnable(GL11C.GL_DEPTH_TEST);
 			GL11C.glDepthMask(true);
 			GL11C.glDisable(GL11C.GL_CULL_FACE);
+			PotassiumLogger.logger().info("Drawing GPU opaque meshes. commandCount={}", commandCount);
 			this.drawGpuDrivenOpaqueMeshes(commandCount);
 			this.lastVisibleOpaqueMeshChunks = -1;
 			this.lastVisibleTranslucentMeshChunks = -1;
 			this.lastRenderedMeshChunks = -1;
 			this.lastRenderedMeshVertices = -1;
 		} else {
+			PotassiumLogger.logger().warn("GPU terrain submission disabled or path unavailable. ENABLE_GPU_TERRAIN_SUBMISSION={}, hasGpuDrivenDrawPath={}",
+				ENABLE_GPU_TERRAIN_SUBMISSION, this.hasGpuDrivenDrawPath());
 			IntBuffer metadata = this.meshMetadataBuffer.readEntries();
 			if (metadata.remaining() < this.meshMetadataBuffer.capacityEntries() * MeshMetadataBuffer.INTS_PER_ENTRY) {
 				this.finishMeshDrawState();
@@ -1133,6 +1860,9 @@ public final class RenderPipeline implements AutoCloseable {
 		return this.initialized
 			&& this.worldDataBuffer != null
 			&& this.worldDataBuffer.isConfigured()
+			&& this.materialTableBuffer != null
+			&& this.blockMaterialTable != null
+			&& !this.blockMaterialTable.isEmpty()
 			&& this.meshMetadataBuffer != null
 			&& this.meshVertexBuffer != null
 			&& this.chunkProgram != null
@@ -1144,8 +1874,13 @@ public final class RenderPipeline implements AutoCloseable {
 	private void bindMeshDrawState() {
 		GL30C.glBindVertexArray(this.debugMeshVertexArray);
 		this.meshVertexBuffer.bindArrayBuffer();
+		if (this.materialTableBuffer != null) {
+			this.materialTableBuffer.bind(MATERIAL_TABLE_BINDING);
+		}
 		GL30C.glEnableVertexAttribArray(0);
 		GL30C.glVertexAttribIPointer(0, 4, GL11C.GL_INT, MeshVertexBuffer.BYTES_PER_VERTEX, 0L);
+		GL30C.glEnableVertexAttribArray(1);
+		GL30C.glVertexAttribIPointer(1, 2, GL11C.GL_UNSIGNED_INT, MeshVertexBuffer.BYTES_PER_VERTEX, 16L);
 	}
 
 	private void finishMeshDrawState() {
@@ -1153,6 +1888,7 @@ public final class RenderPipeline implements AutoCloseable {
 		GL11C.glEnable(GL11C.GL_DEPTH_TEST);
 		GL11C.glEnable(GL11C.GL_CULL_FACE);
 		GL11C.glDisable(GL11C.GL_BLEND);
+		GL30C.glDisableVertexAttribArray(1);
 		GL30C.glDisableVertexAttribArray(0);
 		GL30C.glBindVertexArray(0);
 		GL20C.glUseProgram(0);
@@ -1212,6 +1948,7 @@ public final class RenderPipeline implements AutoCloseable {
 		closeQuietly(this.drawCommandCountBuffer);
 		closeQuietly(this.meshVertexBuffer);
 		closeQuietly(this.meshMetadataBuffer);
+		closeQuietly(this.materialTableBuffer);
 		closeQuietly(this.terrainProbeProgram);
 		closeQuietly(this.oitCompositeProgram);
 		closeQuietly(this.chunkTranslucentProgram);
@@ -1236,6 +1973,7 @@ public final class RenderPipeline implements AutoCloseable {
 		this.drawCommandCountBuffer = null;
 		this.meshVertexBuffer = null;
 		this.meshMetadataBuffer = null;
+		this.materialTableBuffer = null;
 		this.terrainProbeProgram = null;
 		this.oitCompositeProgram = null;
 		this.chunkTranslucentProgram = null;
@@ -1269,10 +2007,15 @@ public final class RenderPipeline implements AutoCloseable {
 		this.lastVisibleTranslucentMeshChunks = 0;
 		this.pendingGpuChangeCount = 0;
 		this.pendingGpuWorldChanges.clear();
+		this.blockMaterialTable = BlockMaterialTable.empty();
+		this.opaqueTerrainSubmissionCache.clear();
 		this.bridgeMeshCache.clear();
 		this.bridgeTranslucentMeshCache.clear();
+		this.bridgeMaterialCache.clear();
 		this.terrainMeshReady = false;
 		this.loggedCustomGeometryTerrainDraw = false;
+		this.loggedExperimentalTerrainReplacementDisabled = false;
+		this.loggedBridgeMaterialFallback = false;
 		this.loggedVertexConsumerProbe = false;
 		this.loggedVertexConsumerTerrainBridge = false;
 		this.loggedVertexConsumerTranslucentTerrainBridge = false;
@@ -1299,13 +2042,55 @@ public final class RenderPipeline implements AutoCloseable {
 	}
 
 	private int worldDataBudgetMiB() {
+		// 返回动态预算上限（用于扩展限制），不是当前分配大小
+		if (this.dynamicVramBudgetMiB > 0) {
+			return this.dynamicVramBudgetMiB;
+		}
+		
+		// 无法检测显存，使用配置值
 		return Math.max(64, Math.min(this.config.memory.worldDataBufferMiB, this.config.memory.maxResidentWorldMiB));
+	}
+
+	private long effectiveResidentWorldBudgetBytes() {
+		if (this.worldDataBuffer == null) {
+			return 0L;
+		}
+
+		return this.effectiveResidentWorldBudgetBytes(this.worldDataBuffer.capacityBytes());
+	}
+
+	private long effectiveResidentWorldBudgetBytes(long worldBudgetBytes) {
+		if (this.worldDataBuffer == null) {
+			return 0L;
+		}
+
+		long bytesPerChunk = Math.max(this.worldDataBuffer.bytesPerChunk(), 1L);
+		long meshBudgetBytes = maxResidentMeshWorldBudgetBytes(bytesPerChunk);
+		return Math.min(worldBudgetBytes, meshBudgetBytes);
+	}
+
+	private long maxResidentMeshWorldBudgetBytes(long worldBytesPerChunk) {
+		// 网格缓冲区会自动扩展以匹配世界数据缓冲区容量（ensureMeshOutputCapacity），
+		// 因此这里不施加人工限制。真实约束由 GPU 显存可用性决定。
+		return Long.MAX_VALUE;
+	}
+
+	private long perChunkMeshBudgetBytes() {
+		long meshVertexBytes = (long) Math.max(this.config.memory.meshFacesPerChunk, 1)
+			* MeshVertexBuffer.VERTICES_PER_FACE
+			* MeshVertexBuffer.BYTES_PER_VERTEX;
+		long metadataBytes = MeshMetadataBuffer.BYTES_PER_ENTRY;
+		long residentStateBytes = ResidentChunkStateBuffer.BYTES_PER_ENTRY;
+		long indirectBytes = (long) IndirectCommandBuffer.COMMAND_STRIDE_BYTES * 2L;
+		return meshVertexBytes + metadataBytes + residentStateBytes + indirectBytes;
 	}
 
 	private boolean tryExpandWorldDataBuffer() {
 		int currentBudgetMiB = toMebibytesCeil(this.worldDataBuffer.capacityBytes());
-		int maxBudgetMiB = Math.max(currentBudgetMiB, this.config.memory.maxResidentWorldMiB);
-		if (currentBudgetMiB >= maxBudgetMiB) {
+
+		// 使用动态预算和配置预算的较大值作为上限，允许扩展超出原始配置
+		int effectiveMaxMiB = Math.max(this.dynamicVramBudgetMiB, this.config.memory.maxResidentWorldMiB);
+		if (effectiveMaxMiB <= 0) {
 			return false;
 		}
 
@@ -1314,37 +2099,52 @@ public final class RenderPipeline implements AutoCloseable {
 			return false;
 		}
 
-		int usableGrowthMiB = availableVideoMemoryMiB - WORLD_DATA_GROWTH_RESERVE_MIB;
+		// 动态预留值：当前预算越小，预留值越小（允许渐进式扩展）
+		int dynamicReserveMiB = Math.max(64, Math.min(WORLD_DATA_GROWTH_RESERVE_MIB, currentBudgetMiB / 4));
+		// 可用增长空间：取动态预算余量和硬件可用余量的较大值
+		int budgetHeadroomMiB = effectiveMaxMiB - currentBudgetMiB;
+		int hardwareHeadroomMiB = availableVideoMemoryMiB - dynamicReserveMiB - currentBudgetMiB;
+		int usableGrowthMiB = Math.max(budgetHeadroomMiB, hardwareHeadroomMiB);
 		if (usableGrowthMiB <= 0) {
 			return false;
 		}
 
 		int requestedBudgetMiB = Math.max(currentBudgetMiB * 2, currentBudgetMiB + WORLD_DATA_GROWTH_MIN_MIB);
 		requestedBudgetMiB = Math.min(requestedBudgetMiB, currentBudgetMiB + usableGrowthMiB);
-		requestedBudgetMiB = Math.min(requestedBudgetMiB, maxBudgetMiB);
+		requestedBudgetMiB = Math.min(requestedBudgetMiB, effectiveMaxMiB);
 		if (requestedBudgetMiB <= currentBudgetMiB) {
 			return false;
 		}
 
+		long requestedWorldBudgetBytes = toBytes(requestedBudgetMiB);
+		long currentResidentBudgetBytes = this.memoryManager.budgetBytes();
+		long requestedResidentBudgetBytes = this.effectiveResidentWorldBudgetBytes(requestedWorldBudgetBytes);
+		if (requestedResidentBudgetBytes <= currentResidentBudgetBytes) {
+			return false;
+		}
+
 		try {
-			boolean expanded = this.worldDataBuffer.ensureCapacity(toBytes(requestedBudgetMiB));
+			boolean expanded = this.worldDataBuffer.ensureCapacity(requestedWorldBudgetBytes);
 			if (!expanded) {
 				return false;
 			}
 
-			boolean slotBudgetExpanded = this.memoryManager.expandBudget(this.worldDataBuffer.capacityBytes());
+			long effectiveResidentBudgetBytes = this.effectiveResidentWorldBudgetBytes();
+			boolean slotBudgetExpanded = this.memoryManager.expandBudget(effectiveResidentBudgetBytes);
 			this.ensureMeshOutputCapacity(false);
 			this.ensureIndirectCommandCapacity();
 			int newBudgetMiB = toMebibytesCeil(this.worldDataBuffer.capacityBytes());
+			int effectiveResidentBudgetMiB = toMebibytesCeil(effectiveResidentBudgetBytes);
 			this.worldDataBufferExpansionFailures = 0;
 			PotassiumLogger.logger().info(
-				"Expanded world data buffer from {} MiB to {} MiB after reaching capacity. Estimated available VRAM={} MiB, resident chunk capacity={}, pages={}{}.",
+				"Expanded world data buffer from {} MiB to {} MiB after reaching capacity. Estimated available VRAM={} MiB, resident chunk capacity={}, meshResidentBudget={} MiB, pages={}{}.",
 				currentBudgetMiB,
 				newBudgetMiB,
 				availableVideoMemoryMiB,
 				this.memoryManager.capacityChunks(),
+				effectiveResidentBudgetMiB,
 				this.worldDataBuffer.pageCount(),
-				slotBudgetExpanded ? "" : " (slot budget unchanged)"
+				slotBudgetExpanded ? "" : " (resident slot budget unchanged; mesh budget capped)"
 			);
 			return true;
 		} catch (RuntimeException exception) {
@@ -1364,7 +2164,11 @@ public final class RenderPipeline implements AutoCloseable {
 	}
 
 	private int tryRecycleResidentSlot(ChunkPos incomingChunkPos, long tickIndex) {
-		ChunkData evictionCandidate = this.chunkManager.findEvictionCandidate();
+		ChunkData evictionCandidate = this.chunkManager.findEvictionCandidate(
+			incomingChunkPos.x(),
+			incomingChunkPos.z(),
+			tickIndex
+		);
 		if (evictionCandidate == null) {
 			return -1;
 		}
@@ -1419,6 +2223,9 @@ public final class RenderPipeline implements AutoCloseable {
 		this.meshGenerationStatsBuffer.bind(MESH_STATS_BINDING);
 		this.meshMetadataBuffer.bind(MESH_METADATA_BINDING);
 		this.meshVertexBuffer.bindStorage(MESH_VERTEX_BINDING);
+		if (this.materialTableBuffer != null) {
+			this.materialTableBuffer.bind(MATERIAL_TABLE_BINDING);
+		}
 		this.meshGenerationShader.use();
 		if (this.meshFacesPerChunkUniform >= 0) {
 			GL30C.glUniform1ui(this.meshFacesPerChunkUniform, this.meshVertexBuffer.facesPerChunk());
@@ -1452,8 +2259,9 @@ public final class RenderPipeline implements AutoCloseable {
 		for (int entryIndex = 0; entryIndex < entries; entryIndex++) {
 			int metadataOffset = entryIndex * MeshMetadataBuffer.INTS_PER_ENTRY;
 			int opaqueVertexCount = metadata.get(metadataOffset + MESH_METADATA_OPAQUE_VERTEX_COUNT_OFFSET);
+			int cutoutVertexCount = metadata.get(metadataOffset + MESH_METADATA_CUTOUT_VERTEX_COUNT_OFFSET);
 			int translucentVertexCount = metadata.get(metadataOffset + MESH_METADATA_TRANSLUCENT_VERTEX_COUNT_OFFSET);
-			if (opaqueVertexCount > 0 || translucentVertexCount > 0) {
+			if (opaqueVertexCount > 0 || cutoutVertexCount > 0 || translucentVertexCount > 0) {
 				hasGeometry = true;
 				break;
 			}
@@ -1822,6 +2630,9 @@ public final class RenderPipeline implements AutoCloseable {
 		}
 
 		this.meshMetadataBuffer.clearSlot(residentSlot);
+		this.opaqueTerrainSubmissionCache.remove((residentSlot << 4) | MESH_METADATA_OPAQUE_VERTEX_COUNT_OFFSET);
+		this.opaqueTerrainSubmissionCache.remove((residentSlot << 4) | MESH_METADATA_CUTOUT_VERTEX_COUNT_OFFSET);
+		this.opaqueTerrainSubmissionCache.remove((residentSlot << 4) | MESH_METADATA_TRANSLUCENT_VERTEX_COUNT_OFFSET);
 		this.bridgeMeshCache.remove(residentSlot);
 		this.bridgeTranslucentMeshCache.remove(residentSlot);
 	}
@@ -2252,7 +3063,23 @@ public final class RenderPipeline implements AutoCloseable {
 	private record VertexPoint(float x, float y, float z) {
 	}
 
+	private record TerrainSubmissionCacheEntry(int firstVertex, int vertexCount, int meshRevision, int vertexCountOffset) {
+		private int indexCount() {
+			return (this.vertexCount / MeshVertexBuffer.VERTICES_PER_FACE) * 6;
+		}
+	}
+
+	private record SortedTerrainSubmission(
+		TerrainSubmissionCacheEntry entry,
+		double distanceSquared,
+		DynamicUniforms.ChunkSectionInfo chunkSectionInfo
+	) {
+	}
+
 	private record BridgeMeshCacheEntry(int firstVertex, int vertexCount, int meshRevision, int[] packedVertices) {
+	}
+
+	private record BridgeMaterial(float u0, float u1, float v0, float v1) {
 	}
 
 	private record BridgeChunkDraw(BridgeMeshCacheEntry cacheEntry, double distanceSquared) {

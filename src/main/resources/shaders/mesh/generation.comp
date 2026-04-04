@@ -1,13 +1,15 @@
 #version 450 core
 
 #include "../common/world_data.glsl"
+#include "../common/material_table.glsl"
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(location = 0) uniform uint uMeshFacesPerChunk;
 layout(location = 1) uniform uint uResidentSlotCapacity;
 
-const uint POTASSIUM_MESH_VERTICES_PER_FACE = 6u;
+const uint POTASSIUM_MESH_VERTICES_PER_FACE = 4u;
+const uint POTASSIUM_MESH_VERTEX_WORDS = 7u;
 const uint POTASSIUM_FACE_POS_Y = 0u;
 const uint POTASSIUM_FACE_NEG_Y = 1u;
 const uint POTASSIUM_FACE_POS_X = 2u;
@@ -52,29 +54,19 @@ layout(std430, binding = 7) buffer PotassiumGeneratedMeshMetadataBuffer {
 } potassium_mesh_metadata;
 
 layout(std430, binding = 8) buffer PotassiumGeneratedMeshVertexBuffer {
-    ivec4 generatedVertices[];
+    int generatedVertexWords[];
 } potassium_mesh_vertices;
 
-const int POTASSIUM_MESH_METADATA_INTS_PER_ENTRY = 8;
+const int POTASSIUM_MESH_METADATA_INTS_PER_ENTRY = 9;
 const int POTASSIUM_MESH_METADATA_OPAQUE_VERTEX_COUNT_OFFSET = 0;
 const int POTASSIUM_MESH_METADATA_OPAQUE_FIRST_VERTEX_OFFSET = 1;
-const int POTASSIUM_MESH_METADATA_TRANSLUCENT_VERTEX_COUNT_OFFSET = 2;
-const int POTASSIUM_MESH_METADATA_TRANSLUCENT_FIRST_VERTEX_OFFSET = 3;
-const int POTASSIUM_MESH_METADATA_CHUNK_X_OFFSET = 4;
-const int POTASSIUM_MESH_METADATA_CHUNK_Z_OFFSET = 5;
-const int POTASSIUM_MESH_METADATA_MESH_REVISION_OFFSET = 6;
-
-uint potassium_section_block_index_to_x(uint sectionBlockIndex) {
-    return sectionBlockIndex & 15u;
-}
-
-uint potassium_section_block_index_to_z(uint sectionBlockIndex) {
-    return (sectionBlockIndex >> 4u) & 15u;
-}
-
-uint potassium_section_block_index_to_y(uint sectionBlockIndex) {
-    return sectionBlockIndex >> 8u;
-}
+const int POTASSIUM_MESH_METADATA_CUTOUT_VERTEX_COUNT_OFFSET = 2;
+const int POTASSIUM_MESH_METADATA_CUTOUT_FIRST_VERTEX_OFFSET = 3;
+const int POTASSIUM_MESH_METADATA_TRANSLUCENT_VERTEX_COUNT_OFFSET = 4;
+const int POTASSIUM_MESH_METADATA_TRANSLUCENT_FIRST_VERTEX_OFFSET = 5;
+const int POTASSIUM_MESH_METADATA_CHUNK_X_OFFSET = 6;
+const int POTASSIUM_MESH_METADATA_CHUNK_Z_OFFSET = 7;
+const int POTASSIUM_MESH_METADATA_MESH_REVISION_OFFSET = 8;
 
 uint potassium_chunk_height_blocks() {
     return potassium_world_blocks_per_chunk() >> 8u;
@@ -156,74 +148,122 @@ void potassium_clear_mesh_metadata(uint residentSlot) {
     }
 }
 
-void potassium_write_face_vertex(uint vertexIndex, int worldX, int worldY, int worldZ, uint packedBlock) {
-    potassium_mesh_vertices.generatedVertices[vertexIndex] = ivec4(worldX, worldY, worldZ, int(packedBlock));
+uint potassium_pack_lightmap_coord(uint lightLevel) {
+    return (min(lightLevel, 15u) << 4u) & 0xFFFFu;
+}
+
+uint potassium_pack_lightmap_uv(uint packedBlock) {
+    uint blockCoord = potassium_pack_lightmap_coord(potassium_block_block_light(packedBlock));
+    uint skyCoord = potassium_pack_lightmap_coord(potassium_block_sky_light(packedBlock));
+    return blockCoord | (skyCoord << 16u);
+}
+
+uint potassium_face_shade_byte(uint faceDirection, uint stateId) {
+    if (!potassium_material_shade(stateId, faceDirection)) {
+        return 255u;
+    }
+
+    switch (faceDirection) {
+        case POTASSIUM_FACE_POS_Y:
+            return 255u;
+        case POTASSIUM_FACE_NEG_Y:
+            return 153u;
+        case POTASSIUM_FACE_POS_X:
+        case POTASSIUM_FACE_NEG_X:
+            return 204u;
+        default:
+            return 230u;
+    }
+}
+
+uint potassium_pack_rgba(uint red, uint green, uint blue, uint alpha) {
+    return (red & 0xFFu)
+        | ((green & 0xFFu) << 8u)
+        | ((blue & 0xFFu) << 16u)
+        | ((alpha & 0xFFu) << 24u);
+}
+
+void potassium_write_face_vertex(
+    uint vertexIndex,
+    float localX,
+    float localY,
+    float localZ,
+    uint color,
+    vec2 uv,
+    uint lightmapUv
+) {
+    uint wordBase = vertexIndex * POTASSIUM_MESH_VERTEX_WORDS;
+    potassium_mesh_vertices.generatedVertexWords[wordBase + 0u] = floatBitsToInt(localX);
+    potassium_mesh_vertices.generatedVertexWords[wordBase + 1u] = floatBitsToInt(localY);
+    potassium_mesh_vertices.generatedVertexWords[wordBase + 2u] = floatBitsToInt(localZ);
+    potassium_mesh_vertices.generatedVertexWords[wordBase + 3u] = int(color);
+    potassium_mesh_vertices.generatedVertexWords[wordBase + 4u] = floatBitsToInt(uv.x);
+    potassium_mesh_vertices.generatedVertexWords[wordBase + 5u] = floatBitsToInt(uv.y);
+    potassium_mesh_vertices.generatedVertexWords[wordBase + 6u] = int(lightmapUv);
 }
 
 void potassium_emit_face(PotassiumMeshGenerationJob job, uint faceDirection, uint blockX, uint blockY, uint blockZ, uint packedBlock, uint faceIndex) {
     uint firstVertex = ((job.residentSlot * uMeshFacesPerChunk) + faceIndex) * POTASSIUM_MESH_VERTICES_PER_FACE;
-    int worldX = (job.chunkX << 4) + int(blockX);
-    int worldY = (potassium_world_min_section_y() << 4) + int(blockY);
-    int worldZ = (job.chunkZ << 4) + int(blockZ);
+    float localX = float(blockX);
+    float localY = float(blockY);
+    float localZ = float(blockZ);
+    uint stateId = potassium_block_state_id(packedBlock);
+    vec4 uvRect = potassium_material_uv_rect(stateId, faceDirection);
+    uint shade = potassium_face_shade_byte(faceDirection, stateId);
+    uint color = potassium_pack_rgba(shade, shade, shade, 255u);
+    uint lightmapUv = potassium_pack_lightmap_uv(packedBlock);
 
     switch (faceDirection) {
         case POTASSIUM_FACE_POS_Y:
-            potassium_write_face_vertex(firstVertex + 0u, worldX, worldY + 1, worldZ, packedBlock);
-            potassium_write_face_vertex(firstVertex + 1u, worldX, worldY + 1, worldZ + 1, packedBlock);
-            potassium_write_face_vertex(firstVertex + 2u, worldX + 1, worldY + 1, worldZ + 1, packedBlock);
-            potassium_write_face_vertex(firstVertex + 3u, worldX, worldY + 1, worldZ, packedBlock);
-            potassium_write_face_vertex(firstVertex + 4u, worldX + 1, worldY + 1, worldZ + 1, packedBlock);
-            potassium_write_face_vertex(firstVertex + 5u, worldX + 1, worldY + 1, worldZ, packedBlock);
+            potassium_write_face_vertex(firstVertex + 0u, localX, localY + 1.0, localZ, color, potassium_material_corner_uv(uvRect, 0u), lightmapUv);
+            potassium_write_face_vertex(firstVertex + 1u, localX, localY + 1.0, localZ + 1.0, color, potassium_material_corner_uv(uvRect, 1u), lightmapUv);
+            potassium_write_face_vertex(firstVertex + 2u, localX + 1.0, localY + 1.0, localZ + 1.0, color, potassium_material_corner_uv(uvRect, 2u), lightmapUv);
+            potassium_write_face_vertex(firstVertex + 3u, localX + 1.0, localY + 1.0, localZ, color, potassium_material_corner_uv(uvRect, 3u), lightmapUv);
             break;
         case POTASSIUM_FACE_NEG_Y:
-            potassium_write_face_vertex(firstVertex + 0u, worldX, worldY, worldZ, packedBlock);
-            potassium_write_face_vertex(firstVertex + 1u, worldX + 1, worldY, worldZ, packedBlock);
-            potassium_write_face_vertex(firstVertex + 2u, worldX + 1, worldY, worldZ + 1, packedBlock);
-            potassium_write_face_vertex(firstVertex + 3u, worldX, worldY, worldZ, packedBlock);
-            potassium_write_face_vertex(firstVertex + 4u, worldX + 1, worldY, worldZ + 1, packedBlock);
-            potassium_write_face_vertex(firstVertex + 5u, worldX, worldY, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 0u, localX, localY, localZ, color, potassium_material_corner_uv(uvRect, 0u), lightmapUv);
+            potassium_write_face_vertex(firstVertex + 1u, localX + 1.0, localY, localZ, color, potassium_material_corner_uv(uvRect, 1u), lightmapUv);
+            potassium_write_face_vertex(firstVertex + 2u, localX + 1.0, localY, localZ + 1.0, color, potassium_material_corner_uv(uvRect, 2u), lightmapUv);
+            potassium_write_face_vertex(firstVertex + 3u, localX, localY, localZ + 1.0, color, potassium_material_corner_uv(uvRect, 3u), lightmapUv);
             break;
         case POTASSIUM_FACE_POS_X:
-            potassium_write_face_vertex(firstVertex + 0u, worldX + 1, worldY, worldZ, packedBlock);
-            potassium_write_face_vertex(firstVertex + 1u, worldX + 1, worldY + 1, worldZ, packedBlock);
-            potassium_write_face_vertex(firstVertex + 2u, worldX + 1, worldY + 1, worldZ + 1, packedBlock);
-            potassium_write_face_vertex(firstVertex + 3u, worldX + 1, worldY, worldZ, packedBlock);
-            potassium_write_face_vertex(firstVertex + 4u, worldX + 1, worldY + 1, worldZ + 1, packedBlock);
-            potassium_write_face_vertex(firstVertex + 5u, worldX + 1, worldY, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 0u, localX + 1.0, localY, localZ, color, potassium_material_corner_uv(uvRect, 0u), lightmapUv);
+            potassium_write_face_vertex(firstVertex + 1u, localX + 1.0, localY + 1.0, localZ, color, potassium_material_corner_uv(uvRect, 1u), lightmapUv);
+            potassium_write_face_vertex(firstVertex + 2u, localX + 1.0, localY + 1.0, localZ + 1.0, color, potassium_material_corner_uv(uvRect, 2u), lightmapUv);
+            potassium_write_face_vertex(firstVertex + 3u, localX + 1.0, localY, localZ + 1.0, color, potassium_material_corner_uv(uvRect, 3u), lightmapUv);
             break;
         case POTASSIUM_FACE_NEG_X:
-            potassium_write_face_vertex(firstVertex + 0u, worldX, worldY, worldZ, packedBlock);
-            potassium_write_face_vertex(firstVertex + 1u, worldX, worldY, worldZ + 1, packedBlock);
-            potassium_write_face_vertex(firstVertex + 2u, worldX, worldY + 1, worldZ + 1, packedBlock);
-            potassium_write_face_vertex(firstVertex + 3u, worldX, worldY, worldZ, packedBlock);
-            potassium_write_face_vertex(firstVertex + 4u, worldX, worldY + 1, worldZ + 1, packedBlock);
-            potassium_write_face_vertex(firstVertex + 5u, worldX, worldY + 1, worldZ, packedBlock);
+            potassium_write_face_vertex(firstVertex + 0u, localX, localY, localZ, color, potassium_material_corner_uv(uvRect, 0u), lightmapUv);
+            potassium_write_face_vertex(firstVertex + 1u, localX, localY, localZ + 1.0, color, potassium_material_corner_uv(uvRect, 1u), lightmapUv);
+            potassium_write_face_vertex(firstVertex + 2u, localX, localY + 1.0, localZ + 1.0, color, potassium_material_corner_uv(uvRect, 2u), lightmapUv);
+            potassium_write_face_vertex(firstVertex + 3u, localX, localY + 1.0, localZ, color, potassium_material_corner_uv(uvRect, 3u), lightmapUv);
             break;
         case POTASSIUM_FACE_POS_Z:
-            potassium_write_face_vertex(firstVertex + 0u, worldX, worldY, worldZ + 1, packedBlock);
-            potassium_write_face_vertex(firstVertex + 1u, worldX + 1, worldY, worldZ + 1, packedBlock);
-            potassium_write_face_vertex(firstVertex + 2u, worldX + 1, worldY + 1, worldZ + 1, packedBlock);
-            potassium_write_face_vertex(firstVertex + 3u, worldX, worldY, worldZ + 1, packedBlock);
-            potassium_write_face_vertex(firstVertex + 4u, worldX + 1, worldY + 1, worldZ + 1, packedBlock);
-            potassium_write_face_vertex(firstVertex + 5u, worldX, worldY + 1, worldZ + 1, packedBlock);
+            potassium_write_face_vertex(firstVertex + 0u, localX, localY, localZ + 1.0, color, potassium_material_corner_uv(uvRect, 0u), lightmapUv);
+            potassium_write_face_vertex(firstVertex + 1u, localX + 1.0, localY, localZ + 1.0, color, potassium_material_corner_uv(uvRect, 1u), lightmapUv);
+            potassium_write_face_vertex(firstVertex + 2u, localX + 1.0, localY + 1.0, localZ + 1.0, color, potassium_material_corner_uv(uvRect, 2u), lightmapUv);
+            potassium_write_face_vertex(firstVertex + 3u, localX, localY + 1.0, localZ + 1.0, color, potassium_material_corner_uv(uvRect, 3u), lightmapUv);
             break;
         default:
-            potassium_write_face_vertex(firstVertex + 0u, worldX, worldY, worldZ, packedBlock);
-            potassium_write_face_vertex(firstVertex + 1u, worldX, worldY + 1, worldZ, packedBlock);
-            potassium_write_face_vertex(firstVertex + 2u, worldX + 1, worldY + 1, worldZ, packedBlock);
-            potassium_write_face_vertex(firstVertex + 3u, worldX, worldY, worldZ, packedBlock);
-            potassium_write_face_vertex(firstVertex + 4u, worldX + 1, worldY + 1, worldZ, packedBlock);
-            potassium_write_face_vertex(firstVertex + 5u, worldX + 1, worldY, worldZ, packedBlock);
+            potassium_write_face_vertex(firstVertex + 0u, localX, localY, localZ, color, potassium_material_corner_uv(uvRect, 0u), lightmapUv);
+            potassium_write_face_vertex(firstVertex + 1u, localX, localY + 1.0, localZ, color, potassium_material_corner_uv(uvRect, 1u), lightmapUv);
+            potassium_write_face_vertex(firstVertex + 2u, localX + 1.0, localY + 1.0, localZ, color, potassium_material_corner_uv(uvRect, 2u), lightmapUv);
+            potassium_write_face_vertex(firstVertex + 3u, localX + 1.0, localY, localZ, color, potassium_material_corner_uv(uvRect, 3u), lightmapUv);
             break;
     }
 }
 
 bool potassium_try_emit_face(PotassiumMeshGenerationJob job, uint faceDirection, uint blockX, uint blockY, uint blockZ, uint packedBlock, inout uint faceCount) {
-    bool translucentFace = potassium_block_is_translucent(packedBlock) || potassium_block_is_fluid(packedBlock);
+    uint stateId = potassium_block_state_id(packedBlock);
+    bool translucentFace = potassium_block_is_translucent(packedBlock)
+        || potassium_block_is_fluid(packedBlock)
+        || potassium_material_is_translucent(stateId, faceDirection);
+    bool cutoutFace = !translucentFace && potassium_material_is_cutout(stateId, faceDirection);
     int metadataBase = potassium_mesh_metadata_base(int(job.residentSlot));
     uint opaqueFaceCount = uint(max(potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_OPAQUE_VERTEX_COUNT_OFFSET], 0));
+    uint cutoutFaceCount = uint(max(potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_CUTOUT_VERTEX_COUNT_OFFSET], 0));
     uint translucentFaceCount = uint(max(potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_TRANSLUCENT_VERTEX_COUNT_OFFSET], 0));
-    if ((opaqueFaceCount + translucentFaceCount) >= uMeshFacesPerChunk) {
+    if ((opaqueFaceCount + cutoutFaceCount + translucentFaceCount) >= uMeshFacesPerChunk) {
         return false;
     }
 
@@ -232,6 +272,10 @@ bool potassium_try_emit_face(PotassiumMeshGenerationJob job, uint faceDirection,
         translucentFaceCount++;
         faceIndex = uMeshFacesPerChunk - translucentFaceCount;
         potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_TRANSLUCENT_VERTEX_COUNT_OFFSET] = int(translucentFaceCount);
+    } else if (cutoutFace) {
+        cutoutFaceCount++;
+        faceIndex = uMeshFacesPerChunk - translucentFaceCount - cutoutFaceCount;
+        potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_CUTOUT_VERTEX_COUNT_OFFSET] = int(cutoutFaceCount);
     } else {
         faceIndex = opaqueFaceCount;
         opaqueFaceCount++;
@@ -239,7 +283,7 @@ bool potassium_try_emit_face(PotassiumMeshGenerationJob job, uint faceDirection,
     }
 
     potassium_emit_face(job, faceDirection, blockX, blockY, blockZ, packedBlock, faceIndex);
-    faceCount = opaqueFaceCount + translucentFaceCount;
+    faceCount = opaqueFaceCount + cutoutFaceCount + translucentFaceCount;
     return true;
 }
 
@@ -273,6 +317,7 @@ void main() {
     uint chunkHeight = potassium_chunk_height_blocks();
     uint faceCount = 0u;
     uint opaqueFaceCount = 0u;
+    uint cutoutFaceCount = 0u;
     uint translucentFaceCount = 0u;
     uint lastPackedBlock = 0u;
     bool clipped = false;
@@ -324,9 +369,14 @@ void main() {
     uint firstVertex = (job.residentSlot * uMeshFacesPerChunk) * POTASSIUM_MESH_VERTICES_PER_FACE;
     int metadataBase = potassium_mesh_metadata_base(int(job.residentSlot));
     opaqueFaceCount = uint(max(potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_OPAQUE_VERTEX_COUNT_OFFSET], 0));
+    cutoutFaceCount = uint(max(potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_CUTOUT_VERTEX_COUNT_OFFSET], 0));
     translucentFaceCount = uint(max(potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_TRANSLUCENT_VERTEX_COUNT_OFFSET], 0));
     potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_OPAQUE_VERTEX_COUNT_OFFSET] = int(opaqueFaceCount * POTASSIUM_MESH_VERTICES_PER_FACE);
     potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_OPAQUE_FIRST_VERTEX_OFFSET] = int(firstVertex);
+    potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_CUTOUT_VERTEX_COUNT_OFFSET] = int(cutoutFaceCount * POTASSIUM_MESH_VERTICES_PER_FACE);
+    potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_CUTOUT_FIRST_VERTEX_OFFSET] = int(
+        firstVertex + ((uMeshFacesPerChunk - translucentFaceCount - cutoutFaceCount) * POTASSIUM_MESH_VERTICES_PER_FACE)
+    );
     potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_TRANSLUCENT_VERTEX_COUNT_OFFSET] = int(translucentFaceCount * POTASSIUM_MESH_VERTICES_PER_FACE);
     potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_TRANSLUCENT_FIRST_VERTEX_OFFSET] = int(
         firstVertex + ((uMeshFacesPerChunk - translucentFaceCount) * POTASSIUM_MESH_VERTICES_PER_FACE)
@@ -335,10 +385,10 @@ void main() {
     potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_CHUNK_Z_OFFSET] = job.chunkZ;
     potassium_mesh_metadata.meshMetadata[metadataBase + POTASSIUM_MESH_METADATA_MESH_REVISION_OFFSET] =
         potassium_resident_chunk_state.residentChunkState[residentStateBase + POTASSIUM_RESIDENT_CHUNK_MESH_REVISION_OFFSET];
-    if ((opaqueFaceCount + translucentFaceCount) > 0u) {
+    if ((opaqueFaceCount + cutoutFaceCount + translucentFaceCount) > 0u) {
         atomicAdd(
             potassium_mesh_generation_stats.generatedVertices,
-            (opaqueFaceCount + translucentFaceCount) * POTASSIUM_MESH_VERTICES_PER_FACE
+            (opaqueFaceCount + cutoutFaceCount + translucentFaceCount) * POTASSIUM_MESH_VERTICES_PER_FACE
         );
     }
     if (clipped) {

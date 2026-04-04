@@ -3,6 +3,8 @@ package com.potassium.core;
 import com.potassium.gl.GLCapabilities;
 import com.potassium.gl.GLDebug;
 import com.potassium.render.RenderPipeline;
+import com.potassium.render.material.BlockMaterialReloadListener;
+import com.potassium.render.material.BlockMaterialTable;
 import com.potassium.ui.DebugOverlay;
 import com.potassium.world.ChunkLoader;
 import com.potassium.world.ChunkManager;
@@ -11,7 +13,9 @@ import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
-import net.minecraft.client.renderer.SubmitNodeStorage;
+import com.mojang.blaze3d.textures.GpuSampler;
+import net.minecraft.client.renderer.chunk.ChunkSectionLayerGroup;
+import net.minecraft.client.renderer.chunk.ChunkSectionsToRender;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.ChunkPos;
@@ -28,7 +32,9 @@ public final class PotassiumEngine implements ClientModInitializer {
 	private RenderPipeline renderPipeline;
 	private DebugOverlay debugOverlay;
 	private ClientLevel activeLevel;
+	private BlockMaterialTable blockMaterialTable = BlockMaterialTable.empty();
 	private ChunkPos lastBootstrapCenterChunk;
+	private boolean pendingBlockMaterialUpload;
 	private boolean runtimeReady;
 
 	public PotassiumEngine() {
@@ -42,6 +48,7 @@ public final class PotassiumEngine implements ClientModInitializer {
 	@Override
 	public void onInitializeClient() {
 		this.config = PotassiumConfig.load();
+		BlockMaterialReloadListener.register(this::onBlockMaterialTableReloaded);
 
 		ClientLifecycleEvents.CLIENT_STARTED.register(this::startRuntime);
 		ClientLifecycleEvents.CLIENT_STOPPING.register(client -> shutdown());
@@ -69,6 +76,10 @@ public final class PotassiumEngine implements ClientModInitializer {
 
 		this.refreshBootstrapWindow(client);
 		this.chunkLoader.drainQueues(client.level, this.renderPipeline, this.worldChangeTracker.tickIndex());
+		if (this.pendingBlockMaterialUpload) {
+			this.renderPipeline.updateBlockMaterialTable(this.blockMaterialTable);
+			this.pendingBlockMaterialUpload = false;
+		}
 		this.renderPipeline.flushPendingChanges(this.worldChangeTracker.drainChanges());
 		this.worldChangeTracker.advanceTick();
 	}
@@ -79,17 +90,41 @@ public final class PotassiumEngine implements ClientModInitializer {
 		}
 	}
 
-	public boolean onRenderOpaqueTerrain(CameraRenderState cameraState, Matrix4fc modelViewMatrix, SubmitNodeStorage submitNodeStorage) {
+	public boolean onRenderOpaqueTerrain(
+		CameraRenderState cameraState,
+		Matrix4fc modelViewMatrix,
+		ChunkSectionsToRender vanillaChunkSectionsToRender,
+		ChunkSectionLayerGroup chunkSectionLayerGroup,
+		GpuSampler gpuSampler
+	) {
 		if (this.runtimeReady && this.renderPipeline != null) {
-			return this.renderPipeline.submitOpaqueTerrain(cameraState, submitNodeStorage);
+			return this.renderPipeline.renderOpaqueTerrain(
+				cameraState,
+				modelViewMatrix,
+				vanillaChunkSectionsToRender,
+				chunkSectionLayerGroup,
+				gpuSampler
+			);
 		}
 
 		return false;
 	}
 
-	public boolean onRenderTranslucentTerrain(CameraRenderState cameraState, Matrix4fc modelViewMatrix, SubmitNodeStorage submitNodeStorage) {
+	public boolean onRenderTranslucentTerrain(
+		CameraRenderState cameraState,
+		Matrix4fc modelViewMatrix,
+		ChunkSectionsToRender vanillaChunkSectionsToRender,
+		ChunkSectionLayerGroup chunkSectionLayerGroup,
+		GpuSampler gpuSampler
+	) {
 		if (this.runtimeReady && this.renderPipeline != null) {
-			return this.renderPipeline.submitTranslucentTerrain(cameraState, submitNodeStorage);
+			return this.renderPipeline.renderTranslucentTerrain(
+				cameraState,
+				modelViewMatrix,
+				vanillaChunkSectionsToRender,
+				chunkSectionLayerGroup,
+				gpuSampler
+			);
 		}
 
 		return false;
@@ -188,6 +223,8 @@ public final class PotassiumEngine implements ClientModInitializer {
 		this.activeLevel = client.level;
 
 		this.renderPipeline.initialize();
+		this.renderPipeline.updateBlockMaterialTable(this.blockMaterialTable);
+		this.pendingBlockMaterialUpload = false;
 		this.renderPipeline.setLevel(this.activeLevel);
 		this.lastBootstrapCenterChunk = null;
 		this.refreshBootstrapWindow(client);
@@ -229,6 +266,7 @@ public final class PotassiumEngine implements ClientModInitializer {
 
 		this.debugOverlay = null;
 		this.activeLevel = null;
+		this.pendingBlockMaterialUpload = false;
 		this.lastBootstrapCenterChunk = null;
 		this.runtimeReady = false;
 
@@ -252,5 +290,15 @@ public final class PotassiumEngine implements ClientModInitializer {
 		);
 		this.chunkLoader.bootstrapLoadedChunks(this.activeLevel, client.player.blockPosition(), bootstrapRadius);
 		this.lastBootstrapCenterChunk = centerChunk;
+	}
+
+	private void onBlockMaterialTableReloaded(BlockMaterialTable blockMaterialTable) {
+		this.blockMaterialTable = blockMaterialTable;
+		this.pendingBlockMaterialUpload = true;
+		PotassiumLogger.logger().info(
+			"Queued block material table upload: states={}, resolvedStates={}.",
+			blockMaterialTable.stateCount(),
+			blockMaterialTable.resolvedStates()
+		);
 	}
 }

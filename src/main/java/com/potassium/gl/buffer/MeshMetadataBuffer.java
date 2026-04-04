@@ -8,7 +8,7 @@ import org.lwjgl.opengl.GL45C;
 import org.lwjgl.system.MemoryUtil;
 
 public final class MeshMetadataBuffer implements AutoCloseable {
-	public static final int INTS_PER_ENTRY = 8;
+	public static final int INTS_PER_ENTRY = 9;
 	public static final int BYTES_PER_ENTRY = Integer.BYTES * INTS_PER_ENTRY;
 
 	private final PersistentBuffer storage;

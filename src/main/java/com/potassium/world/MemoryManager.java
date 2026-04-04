@@ -29,18 +29,33 @@ public final class MemoryManager {
 
 		int newCapacityChunks = (int) Math.min(Integer.MAX_VALUE, newBudgetBytes / this.bytesPerChunk);
 		if (newCapacityChunks <= this.capacityChunks) {
+			// 预算没有实际增加容量
 			this.budgetBytes = Math.max(this.budgetBytes, newBudgetBytes);
 			return false;
 		}
 
+		// 只添加新的slot，不修改已有的
+		int addedSlots = 0;
 		for (int slot = this.capacityChunks; slot < newCapacityChunks; slot++) {
 			if (!this.usedSlots.contains(slot)) {
 				this.freeSlots.addLast(slot);
+				addedSlots++;
 			}
 		}
 
 		this.budgetBytes = newBudgetBytes;
 		this.capacityChunks = newCapacityChunks;
+		
+		if (addedSlots > 0) {
+			com.potassium.core.PotassiumLogger.logger().info(
+				"MemoryManager expanded budget: {} -> {} chunks ({} new slots, budget={} MiB)",
+				this.capacityChunks - addedSlots,
+				this.capacityChunks,
+				addedSlots,
+				this.budgetBytes / (1024L * 1024L)
+			);
+		}
+		
 		return true;
 	}
 

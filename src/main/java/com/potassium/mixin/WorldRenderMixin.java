@@ -96,7 +96,13 @@ public abstract class WorldRenderMixin {
 		Matrix4fc modelViewMatrix
 	) {
 		PotassiumEngine engine = PotassiumEngine.getNullable();
-		if (engine != null && engine.onRenderOpaqueTerrain(levelRenderState.cameraRenderState, modelViewMatrix, this.submitNodeStorage)) {
+		if (engine != null && engine.onRenderOpaqueTerrain(
+			levelRenderState.cameraRenderState,
+			modelViewMatrix,
+			chunkSectionsToRender,
+			chunkSectionLayerGroup,
+			gpuSampler
+		)) {
 			return;
 		}
 
@@ -128,7 +134,13 @@ public abstract class WorldRenderMixin {
 		Matrix4fc modelViewMatrix
 	) {
 		PotassiumEngine engine = PotassiumEngine.getNullable();
-		if (engine != null && engine.onRenderTranslucentTerrain(levelRenderState.cameraRenderState, modelViewMatrix, this.submitNodeStorage)) {
+		if (engine != null && engine.onRenderTranslucentTerrain(
+			levelRenderState.cameraRenderState,
+			modelViewMatrix,
+			chunkSectionsToRender,
+			chunkSectionLayerGroup,
+			gpuSampler
+		)) {
 			return;
 		}
 

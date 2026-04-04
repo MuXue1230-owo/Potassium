@@ -79,10 +79,13 @@ public final class PotassiumConfig {
 		this.general.targetRenderDistanceChunks = Math.max(this.general.targetRenderDistanceChunks, 2);
 		this.memory.worldDataBufferMiB = Math.max(this.memory.worldDataBufferMiB, 64);
 		this.memory.vertexUploadBufferMiB = Math.max(this.memory.vertexUploadBufferMiB, 16);
-		this.memory.maxResidentWorldMiB = Math.max(this.memory.maxResidentWorldMiB, this.memory.worldDataBufferMiB);
 		this.memory.indirectCommandCapacity = Math.max(this.memory.indirectCommandCapacity, 1024);
 		this.memory.changeQueueCapacity = Math.max(this.memory.changeQueueCapacity, 1024);
 		this.memory.meshFacesPerChunk = Math.max(this.memory.meshFacesPerChunk, 4096);
+		
+		// 动态调整 meshBufferMiB 和 maxResidentWorldMiB，确保它们与 worldDataBufferMiB 一致
+		this.memory.meshBufferMiB = Math.max(this.memory.meshBufferMiB, this.memory.worldDataBufferMiB);
+		this.memory.maxResidentWorldMiB = Math.max(this.memory.maxResidentWorldMiB, this.memory.worldDataBufferMiB);
 	}
 
 	public static final class General {
@@ -101,6 +104,7 @@ public final class PotassiumConfig {
 
 	public static final class Memory {
 		public int worldDataBufferMiB = 256;
+		public int meshBufferMiB = 768;
 		public int vertexUploadBufferMiB = 64;
 		public int maxResidentWorldMiB = 3072;
 		public int indirectCommandCapacity = 32768;

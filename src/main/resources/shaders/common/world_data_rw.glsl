@@ -1,5 +1,5 @@
-const int POTASSIUM_WORLD_DATA_RW_MAX_SHADER_PAGES = 4;
-const uint POTASSIUM_WORLD_DATA_RW_MAX_SHADER_PAGES_U = 4u;
+const int POTASSIUM_WORLD_DATA_RW_MAX_SHADER_PAGES = 8;
+const uint POTASSIUM_WORLD_DATA_RW_MAX_SHADER_PAGES_U = 8u;
 
 layout(std430, binding = 0) readonly buffer PotassiumWorldDataLayoutBuffer {
     uvec4 header;
@@ -22,6 +22,22 @@ layout(std430, binding = 3) buffer PotassiumWorldDataPage2Buffer {
 layout(std430, binding = 4) buffer PotassiumWorldDataPage3Buffer {
     uint blocks[];
 } potassium_world_data_page3;
+
+layout(std430, binding = 5) buffer PotassiumWorldDataPage4Buffer {
+    uint blocks[];
+} potassium_world_data_page4;
+
+layout(std430, binding = 6) buffer PotassiumWorldDataPage5Buffer {
+    uint blocks[];
+} potassium_world_data_page5;
+
+layout(std430, binding = 7) buffer PotassiumWorldDataPage6Buffer {
+    uint blocks[];
+} potassium_world_data_page6;
+
+layout(std430, binding = 8) buffer PotassiumWorldDataPage7Buffer {
+    uint blocks[];
+} potassium_world_data_page7;
 
 uint potassium_world_bytes_per_chunk() {
     return potassium_world_data_layout.header.x;
@@ -82,6 +98,18 @@ bool potassium_world_store_packed_block(uint logicalBlockIndex, uint packedBlock
             return true;
         case 3u:
             potassium_world_data_page3.blocks[localBlockIndex] = packedBlock;
+            return true;
+        case 4u:
+            potassium_world_data_page4.blocks[localBlockIndex] = packedBlock;
+            return true;
+        case 5u:
+            potassium_world_data_page5.blocks[localBlockIndex] = packedBlock;
+            return true;
+        case 6u:
+            potassium_world_data_page6.blocks[localBlockIndex] = packedBlock;
+            return true;
+        case 7u:
+            potassium_world_data_page7.blocks[localBlockIndex] = packedBlock;
             return true;
         default:
             return false;

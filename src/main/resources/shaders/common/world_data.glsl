@@ -1,11 +1,10 @@
-const int POTASSIUM_WORLD_DATA_MAX_SHADER_PAGES = 4;
-const uint POTASSIUM_WORLD_DATA_MAX_SHADER_PAGES_U = 4u;
-const uint POTASSIUM_BLOCK_STATE_ID_MASK = (1u << 20u) - 1u;
-const uint POTASSIUM_BLOCK_FLAGS_MASK = (1u << 4u) - 1u;
-const uint POTASSIUM_BLOCK_FLAGS_SHIFT = 28u;
-const uint POTASSIUM_BLOCK_FLAG_OCCLUDES = 1u << 0u;
-const uint POTASSIUM_BLOCK_FLAG_FLUID = 1u << 1u;
-const uint POTASSIUM_BLOCK_FLAG_TRANSLUCENT = 1u << 2u;
+#ifndef POTASSIUM_WORLD_DATA_GLSL
+#define POTASSIUM_WORLD_DATA_GLSL
+
+#include "block_encoding.glsl"
+
+const int POTASSIUM_WORLD_DATA_MAX_SHADER_PAGES = 8;
+const uint POTASSIUM_WORLD_DATA_MAX_SHADER_PAGES_U = 8u;
 
 layout(std430, binding = 0) readonly buffer PotassiumWorldDataLayoutBuffer {
     uvec4 header;
@@ -28,6 +27,22 @@ layout(std430, binding = 3) readonly buffer PotassiumWorldDataPage2Buffer {
 layout(std430, binding = 4) readonly buffer PotassiumWorldDataPage3Buffer {
     uint blocks[];
 } potassium_world_data_page3;
+
+layout(std430, binding = 5) readonly buffer PotassiumWorldDataPage4Buffer {
+    uint blocks[];
+} potassium_world_data_page4;
+
+layout(std430, binding = 6) readonly buffer PotassiumWorldDataPage5Buffer {
+    uint blocks[];
+} potassium_world_data_page5;
+
+layout(std430, binding = 7) readonly buffer PotassiumWorldDataPage6Buffer {
+    uint blocks[];
+} potassium_world_data_page6;
+
+layout(std430, binding = 8) readonly buffer PotassiumWorldDataPage7Buffer {
+    uint blocks[];
+} potassium_world_data_page7;
 
 uint potassium_world_bytes_per_chunk() {
     return potassium_world_data_layout.header.x;
@@ -93,6 +108,14 @@ uint potassium_world_load_packed_block(uint logicalBlockIndex) {
             return potassium_world_data_page2.blocks[localBlockIndex];
         case 3u:
             return potassium_world_data_page3.blocks[localBlockIndex];
+        case 4u:
+            return potassium_world_data_page4.blocks[localBlockIndex];
+        case 5u:
+            return potassium_world_data_page5.blocks[localBlockIndex];
+        case 6u:
+            return potassium_world_data_page6.blocks[localBlockIndex];
+        case 7u:
+            return potassium_world_data_page7.blocks[localBlockIndex];
         default:
             return 0u;
     }
@@ -102,26 +125,4 @@ uint potassium_world_chunk_base_block(uint residentSlot) {
     return residentSlot * potassium_world_blocks_per_chunk();
 }
 
-uint potassium_block_state_id(uint packedBlock) {
-    return packedBlock & POTASSIUM_BLOCK_STATE_ID_MASK;
-}
-
-uint potassium_block_flags(uint packedBlock) {
-    return (packedBlock >> POTASSIUM_BLOCK_FLAGS_SHIFT) & POTASSIUM_BLOCK_FLAGS_MASK;
-}
-
-bool potassium_block_is_air(uint packedBlock) {
-    return potassium_block_state_id(packedBlock) == 0u;
-}
-
-bool potassium_block_occludes(uint packedBlock) {
-    return (potassium_block_flags(packedBlock) & POTASSIUM_BLOCK_FLAG_OCCLUDES) != 0u;
-}
-
-bool potassium_block_is_fluid(uint packedBlock) {
-    return (potassium_block_flags(packedBlock) & POTASSIUM_BLOCK_FLAG_FLUID) != 0u;
-}
-
-bool potassium_block_is_translucent(uint packedBlock) {
-    return (potassium_block_flags(packedBlock) & POTASSIUM_BLOCK_FLAG_TRANSLUCENT) != 0u;
-}
+#endif

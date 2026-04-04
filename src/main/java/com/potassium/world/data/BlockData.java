@@ -23,6 +23,10 @@ public record BlockData(int packed) {
 		return new BlockData(pack(state, 0, 0, classifyFlags(state)));
 	}
 
+	public static BlockData fromState(BlockState state, int blockLight, int skyLight) {
+		return new BlockData(pack(state, blockLight, skyLight, classifyFlags(state)));
+	}
+
 	public static int pack(BlockState state, int blockLight, int skyLight, int flags) {
 		if (state == null || state.isAir()) {
 			return AIR_PACKED;
@@ -41,6 +45,14 @@ public record BlockData(int packed) {
 
 	public static int flags(int packedBlock) {
 		return (packedBlock >>> FLAGS_SHIFT) & FLAGS_MASK;
+	}
+
+	public static int blockLight(int packedBlock) {
+		return (packedBlock >>> STATE_ID_BITS) & LIGHT_MASK;
+	}
+
+	public static int skyLight(int packedBlock) {
+		return (packedBlock >>> (STATE_ID_BITS + LIGHT_BITS)) & LIGHT_MASK;
 	}
 
 	private static int classifyFlags(BlockState state) {

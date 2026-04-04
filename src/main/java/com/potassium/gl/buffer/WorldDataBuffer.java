@@ -15,7 +15,9 @@ import org.lwjgl.system.MemoryUtil;
 
 public final class WorldDataBuffer implements AutoCloseable {
 	private static final long MAX_JAVA_MAPPED_VIEW_BYTES = Integer.MAX_VALUE;
-	public static final int MAX_SHADER_PAGES = 4;
+	private static final long MEBIBYTE_BYTES = 1024L * 1024L;
+	private static final long SAFE_PERSISTENT_PAGE_CAPACITY_BYTES = 768L * MEBIBYTE_BYTES;
+	public static final int MAX_SHADER_PAGES = 8;
 	private static final int LAYOUT_HEADER_WORDS = 4;
 	private static final int LAYOUT_WORLD_INFO_WORDS = 4;
 	private static final int LAYOUT_PAGE_INFO_WORDS = 4;
@@ -36,6 +38,7 @@ public final class WorldDataBuffer implements AutoCloseable {
 	private int chunksPerPage;
 	private long bytesPerChunk;
 	private boolean warnedAboutBindingLimit;
+	private boolean warnedAboutPersistentPageFallback;
 	private int lastBoundShaderPageCount = -1;
 	private int lastBoundBaseBinding = -1;
 	private boolean layoutDirty = true;
@@ -266,6 +269,7 @@ public final class WorldDataBuffer implements AutoCloseable {
 		this.chunksPerPage = 0;
 		this.bytesPerChunk = 0L;
 		this.warnedAboutBindingLimit = false;
+		this.warnedAboutPersistentPageFallback = false;
 		this.lastBoundShaderPageCount = -1;
 		this.lastBoundBaseBinding = -1;
 		this.layoutDirty = true;
@@ -275,6 +279,7 @@ public final class WorldDataBuffer implements AutoCloseable {
 		this.releasePages();
 		this.totalCapacityBytes = 0L;
 		this.warnedAboutBindingLimit = false;
+		this.warnedAboutPersistentPageFallback = false;
 		this.layoutDirty = true;
 		this.lastBoundShaderPageCount = -1;
 		this.lastBoundBaseBinding = -1;
@@ -316,7 +321,7 @@ public final class WorldDataBuffer implements AutoCloseable {
 		}
 
 		long startOffsetBytes = this.totalCapacityBytes;
-		PersistentBuffer storage = new PersistentBuffer(GL43C.GL_SHADER_STORAGE_BUFFER, pageCapacityBytes, this.persistentMappingEnabled, 1);
+		PersistentBuffer storage = this.createPageStorage(pageCapacityBytes);
 		this.pages.add(new Page(storage, startOffsetBytes, pageCapacityBytes));
 		this.totalCapacityBytes += pageCapacityBytes;
 		this.layoutDirty = true;
@@ -360,8 +365,36 @@ public final class WorldDataBuffer implements AutoCloseable {
 		if (maxSsboBlockSizeBytes > 0L) {
 			maxPageCapacityBytes = Math.min(maxPageCapacityBytes, maxSsboBlockSizeBytes);
 		}
+		if (this.persistentMappingEnabled) {
+			maxPageCapacityBytes = Math.min(maxPageCapacityBytes, SAFE_PERSISTENT_PAGE_CAPACITY_BYTES);
+		}
 
 		return Math.max(maxPageCapacityBytes, this.bytesPerChunk);
+	}
+
+	private PersistentBuffer createPageStorage(long pageCapacityBytes) {
+		if (!this.persistentMappingEnabled) {
+			return new PersistentBuffer(GL43C.GL_SHADER_STORAGE_BUFFER, pageCapacityBytes, false, 1);
+		}
+
+		try {
+			return new PersistentBuffer(GL43C.GL_SHADER_STORAGE_BUFFER, pageCapacityBytes, true, 1);
+		} catch (RuntimeException persistentFailure) {
+			if (!this.warnedAboutPersistentPageFallback) {
+				PotassiumLogger.logger().warn(
+					"Falling back to non-persistent world-data pages after persistent page allocation failed at {} MiB. Reason={}",
+					Math.max(1L, pageCapacityBytes / MEBIBYTE_BYTES),
+					persistentFailure.getMessage()
+				);
+				this.warnedAboutPersistentPageFallback = true;
+			}
+			try {
+				return new PersistentBuffer(GL43C.GL_SHADER_STORAGE_BUFFER, pageCapacityBytes, false, 1);
+			} catch (RuntimeException fallbackFailure) {
+				fallbackFailure.addSuppressed(persistentFailure);
+				throw fallbackFailure;
+			}
+		}
 	}
 
 	private int resolveShaderVisiblePageCount(int binding) {
